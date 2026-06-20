@@ -607,6 +607,14 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
 
   const handleAddToken = async () => {
     if (!form.accountId) return;
+    if (groupLoading) {
+      toast.error('分组仍在加载，请稍后再创建');
+      return;
+    }
+    if (!form.group.trim()) {
+      toast.error('请选择分组后再创建令牌');
+      return;
+    }
     if (!form.unlimitedQuota) {
       const remainQuota = Number.parseInt(form.remainQuota, 10);
       if (!Number.isFinite(remainQuota) || remainQuota <= 0) {
@@ -1173,7 +1181,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
           <button onClick={handleToggleAdd} className="btn btn-ghost">取消</button>
           <button
             onClick={handleAddToken}
-            disabled={saving || !form.accountId}
+            disabled={saving || !form.accountId || groupLoading || !form.group.trim()}
             className="btn btn-primary"
           >
             {saving ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 创建中...</> : '创建并同步令牌'}
