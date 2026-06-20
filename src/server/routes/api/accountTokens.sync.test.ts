@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { and, eq, sql } from 'drizzle-orm';
 import { mergeAccountExtraConfig } from '../../services/accountExtraConfig.js';
+import { waitForBackgroundTaskToReachTerminalState } from '../../test-fixtures/backgroundTaskTestUtils.js';
 
 const getApiTokensMock = vi.fn();
 const getApiTokenMock = vi.fn();
@@ -13,6 +14,7 @@ const getUserGroupsMock = vi.fn();
 const deleteApiTokenMock = vi.fn();
 
 type AccountTokenServiceModule = typeof import('../../services/accountTokenService.js');
+type BackgroundTaskServiceModule = typeof import('../../services/backgroundTaskService.js');
 
 vi.mock('../../services/platforms/index.js', () => ({
   getAdapter: () => ({
@@ -31,6 +33,8 @@ describe('account tokens sync routes with site status', () => {
   let db: DbModule['db'];
   let schema: DbModule['schema'];
   let maskToken: AccountTokenServiceModule['maskToken'];
+  let getBackgroundTask: BackgroundTaskServiceModule['getBackgroundTask'];
+  let resetBackgroundTasks: BackgroundTaskServiceModule['__resetBackgroundTasksForTests'];
   let dataDir = '';
   let previousDataDir: string | undefined;
   let seedId = 0;
@@ -71,10 +75,13 @@ describe('account tokens sync routes with site status', () => {
     await import('../../db/migrate.js');
     const dbModule = await import('../../db/index.js');
     const accountTokenServiceModule = await import('../../services/accountTokenService.js');
+    const backgroundTaskServiceModule = await import('../../services/backgroundTaskService.js');
     const routesModule = await import('./accountTokens.js');
     db = dbModule.db;
     schema = dbModule.schema;
     maskToken = accountTokenServiceModule.maskToken;
+    getBackgroundTask = backgroundTaskServiceModule.getBackgroundTask;
+    resetBackgroundTasks = backgroundTaskServiceModule.__resetBackgroundTasksForTests;
 
     app = Fastify();
     await app.register(routesModule.accountTokensRoutes);
@@ -86,8 +93,10 @@ describe('account tokens sync routes with site status', () => {
     createApiTokenMock.mockReset();
     getUserGroupsMock.mockReset();
     deleteApiTokenMock.mockReset();
+    resetBackgroundTasks();
     seedId = 0;
 
+    await db.delete(schema.events).run();
     await db.delete(schema.accountTokens).run();
     await db.delete(schema.routeChannels).run();
     await db.delete(schema.tokenRoutes).run();
@@ -801,7 +810,12 @@ describe('account tokens sync routes with site status', () => {
       url: `/api/account-tokens/${token.id}`,
     });
 
-    expect(response.statusCode).toBe(200);
+    expect(response.statusCode).toBe(202);
+    const body = response.json() as { jobId: string; queued: boolean };
+    expect(body.queued).toBe(true);
+
+    const task = await waitForBackgroundTaskToReachTerminalState(getBackgroundTask, body.jobId);
+    expect(task?.status).toBe('succeeded');
     expect(deleteApiTokenMock).toHaveBeenCalledTimes(1);
     expect(deleteApiTokenMock.mock.calls[0][0]).toBe(site.url);
     expect(deleteApiTokenMock.mock.calls[0][1]).toBe(account.accessToken);
@@ -809,6 +823,7 @@ describe('account tokens sync routes with site status', () => {
 
     const removed = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, token.id)).get();
     expect(removed).toBeUndefined();
+    expect(task?.logs.some((entry) => entry.message.includes('原站点删除成功'))).toBe(true);
   });
 
   it('keeps local token when upstream deletion fails', async () => {
@@ -828,11 +843,13 @@ describe('account tokens sync routes with site status', () => {
       url: `/api/account-tokens/${token.id}`,
     });
 
-    expect(response.statusCode).toBe(502);
-    expect(response.json()).toMatchObject({
-      success: false,
-      message: '站点删除令牌失败，本地未删除',
-    });
+    expect(response.statusCode).toBe(202);
+    const body = response.json() as { jobId: string; queued: boolean };
+    expect(body.queued).toBe(true);
+
+    const task = await waitForBackgroundTaskToReachTerminalState(getBackgroundTask, body.jobId);
+    expect(task?.status).toBe('failed');
+    expect(task?.error).toBe('站点删除令牌失败，本地未删除');
 
     const existing = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, token.id)).get();
     expect(existing).toBeDefined();
@@ -1050,9 +1067,15 @@ describe('account tokens sync routes with site status', () => {
       url: `/api/account-tokens/${token.id}`,
     });
 
-    expect(response.statusCode).toBe(200);
+    expect(response.statusCode).toBe(202);
+    const body = response.json() as { jobId: string; queued: boolean };
+    expect(body.queued).toBe(true);
+
+    const task = await waitForBackgroundTaskToReachTerminalState(getBackgroundTask, body.jobId);
+    expect(task?.status).toBe('succeeded');
     expect(deleteApiTokenMock).not.toHaveBeenCalled();
     const removed = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, token.id)).get();
     expect(removed).toBeUndefined();
+    expect(task?.logs.some((entry) => entry.message.includes('跳过原站点删除'))).toBe(true);
   });
 });

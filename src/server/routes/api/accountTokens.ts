@@ -17,7 +17,7 @@ import {
 } from '../../services/accountTokenService.js';
 import { getAdapter } from '../../services/platforms/index.js';
 import { getCredentialModeFromExtraConfig, getProxyUrlFromExtraConfig, resolvePlatformUserId } from '../../services/accountExtraConfig.js';
-import { startBackgroundTask } from '../../services/backgroundTaskService.js';
+import { appendBackgroundTaskLog, startBackgroundTask } from '../../services/backgroundTaskService.js';
 import { withAccountProxyOverride } from '../../services/siteProxy.js';
 import { type ModelRefreshResult } from '../../services/modelService.js';
 import {
@@ -75,6 +75,27 @@ type CoverageRefreshRebuildResult = CoverageBatchRebuildResult;
 
 const TOKEN_SYNC_TIMEOUT_MS = 15_000;
 const SYNC_ALL_BATCH_SIZE = 3;
+const ACCOUNT_TOKEN_UPSTREAM_DELETE_TIMEOUT_MS = 15_000;
+
+type AccountTokenDeleteResult = {
+  tokenId: number;
+  tokenName?: string;
+  accountName?: string;
+  siteName?: string;
+  success: boolean;
+  message?: string;
+  upstreamAttempted: boolean;
+  upstreamDeleted: boolean;
+  upstreamSkippedReason?: string;
+  localDeleted: boolean;
+};
+
+type AccountTokenDeleteTaskResult = {
+  total: number;
+  successIds: number[];
+  failedItems: Array<{ id: number; message: string }>;
+  results: AccountTokenDeleteResult[];
+};
 
 function buildSyncAccountLabel(item: SyncExecutionResult): string {
   const account = (item.accountName || `#${item.accountId}`).trim();
@@ -113,6 +134,43 @@ function buildTokenSyncTaskDetailMessage(results: SyncExecutionResult[]): string
     `失败(${failed.length}): ${failed.length > 0 ? renderRows(failed, true) : '-'}`,
   ];
   return segments.join('\n');
+}
+
+function buildDeleteTokenLabel(result: AccountTokenDeleteResult): string {
+  const token = (result.tokenName || `#${result.tokenId}`).trim();
+  const account = (result.accountName || '').trim();
+  const site = (result.siteName || '').trim();
+  if (account && site) return `${token} (${account} @ ${site})`;
+  if (account) return `${token} (${account})`;
+  if (site) return `${token} (${site})`;
+  return token;
+}
+
+function buildTokenDeleteTaskDetailMessage(results: AccountTokenDeleteResult[]): string {
+  if (!Array.isArray(results) || results.length === 0) return '';
+
+  const succeeded = results.filter((item) => item.success);
+  const failed = results.filter((item) => !item.success);
+  const upstreamDeleted = results.filter((item) => item.upstreamDeleted);
+  const upstreamSkipped = results.filter((item) => item.upstreamSkippedReason);
+
+  const renderRows = (rows: AccountTokenDeleteResult[], withReason = false) => {
+    const sliced = rows.slice(0, 12).map((item) => {
+      const base = buildDeleteTokenLabel(item);
+      if (!withReason) return base;
+      const reason = String(item.message || item.upstreamSkippedReason || '').trim();
+      return reason ? `${base}(${reason})` : base;
+    });
+    if (rows.length > 12) sliced.push(`...等${rows.length}个`);
+    return sliced.join('、');
+  };
+
+  return [
+    `成功(${succeeded.length}): ${succeeded.length > 0 ? renderRows(succeeded) : '-'}`,
+    `失败(${failed.length}): ${failed.length > 0 ? renderRows(failed, true) : '-'}`,
+    `原站点已删除(${upstreamDeleted.length}): ${upstreamDeleted.length > 0 ? renderRows(upstreamDeleted) : '-'}`,
+    `跳过原站点(${upstreamSkipped.length}): ${upstreamSkipped.length > 0 ? renderRows(upstreamSkipped, true) : '-'}`,
+  ].join('\n');
 }
 
 function isSiteDisabled(status?: string | null): boolean {
@@ -642,7 +700,22 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     };
   });
 
-  const deleteAccountTokenById = async (tokenId: number): Promise<{ success: boolean; message?: string }> => {
+  const appendDeleteLog = (taskId: string | null | undefined, message: string) => {
+    if (!taskId) return;
+    appendBackgroundTaskLog(taskId, message);
+  };
+
+  const deleteAccountTokenById = async (
+    tokenId: number,
+    options: { taskId?: string | null } = {},
+  ): Promise<AccountTokenDeleteResult> => {
+    const baseResult: AccountTokenDeleteResult = {
+      tokenId,
+      success: false,
+      upstreamAttempted: false,
+      upstreamDeleted: false,
+      localDeleted: false,
+    };
     const row = await db.select()
       .from(schema.accountTokens)
       .innerJoin(schema.accounts, eq(schema.accountTokens.accountId, schema.accounts.id))
@@ -650,44 +723,156 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       .where(eq(schema.accountTokens.id, tokenId))
       .get();
     if (!row) {
-      return { success: false, message: '令牌不存在' };
-    }
-
-    if (isApiKeyConnection(row.accounts)) {
-      return { success: false, message: 'API Key 连接不支持管理账号令牌' };
+      appendDeleteLog(options.taskId, `令牌 #${tokenId} 删除失败：令牌不存在`);
+      return { ...baseResult, message: '令牌不存在' };
     }
 
     const existing = row.account_tokens;
     const account = row.accounts;
     const site = row.sites;
+    const labeledResult = {
+      ...baseResult,
+      tokenName: existing.name || undefined,
+      accountName: account.username || undefined,
+      siteName: site.name || undefined,
+    };
+    const tokenLabel = buildDeleteTokenLabel(labeledResult);
+    appendDeleteLog(options.taskId, `开始删除账号令牌：${tokenLabel}`);
+
+    if (isApiKeyConnection(row.accounts)) {
+      appendDeleteLog(options.taskId, `${tokenLabel} 删除失败：API Key 连接不支持管理账号令牌`);
+      return { ...labeledResult, message: 'API Key 连接不支持管理账号令牌' };
+    }
+
     const adapter = getAdapter(site.platform);
-    const shouldDeleteUpstream = !isMaskedPendingAccountToken(existing)
-      && !isSiteDisabled(site.status)
-      && !!account.accessToken?.trim()
-      && !!adapter;
+    let upstreamSkippedReason = '';
+    if (isMaskedPendingAccountToken(existing)) {
+      upstreamSkippedReason = '本地仅保存脱敏占位令牌';
+    } else if (isSiteDisabled(site.status)) {
+      upstreamSkippedReason = '站点已禁用';
+    } else if (!account.accessToken?.trim()) {
+      upstreamSkippedReason = '账号缺少访问令牌';
+    } else if (!adapter) {
+      upstreamSkippedReason = `不支持的平台: ${site.platform}`;
+    }
+    const shouldDeleteUpstream = !upstreamSkippedReason;
 
     if (shouldDeleteUpstream) {
       const platformUserId = resolvePlatformUserId(account.extraConfig, account.username);
-      const upstreamDeleted = await withAccountProxyOverride(
-        getProxyUrlFromExtraConfig(account.extraConfig),
-        () => adapter!.deleteApiToken(
-          site.url,
-          account.accessToken,
-          existing.token,
-          platformUserId,
-        ),
-      );
-      if (!upstreamDeleted) {
-        return { success: false, message: '站点删除令牌失败，本地未删除' };
+      appendDeleteLog(options.taskId, `${tokenLabel} 正在删除原站点令牌`);
+      let upstreamDeleted = false;
+      try {
+        upstreamDeleted = await withTimeout(
+          () => withAccountProxyOverride(
+            getProxyUrlFromExtraConfig(account.extraConfig),
+            () => adapter!.deleteApiToken(
+              site.url,
+              account.accessToken,
+              existing.token,
+              platformUserId,
+            ),
+          ),
+          ACCOUNT_TOKEN_UPSTREAM_DELETE_TIMEOUT_MS,
+          `站点删除令牌超时（${Math.round(ACCOUNT_TOKEN_UPSTREAM_DELETE_TIMEOUT_MS / 1000)}s），本地未删除`,
+        );
+      } catch (error: any) {
+        const message = error?.message || '站点删除令牌失败，本地未删除';
+        appendDeleteLog(options.taskId, `${tokenLabel} 原站点删除失败：${message}`);
+        return {
+          ...labeledResult,
+          upstreamAttempted: true,
+          message,
+        };
       }
+      if (!upstreamDeleted) {
+        appendDeleteLog(options.taskId, `${tokenLabel} 原站点删除失败：站点删除令牌失败，本地未删除`);
+        return {
+          ...labeledResult,
+          upstreamAttempted: true,
+          message: '站点删除令牌失败，本地未删除',
+        };
+      }
+      appendDeleteLog(options.taskId, `${tokenLabel} 原站点删除成功`);
+    } else {
+      appendDeleteLog(options.taskId, `${tokenLabel} 跳过原站点删除：${upstreamSkippedReason}`);
     }
 
     await db.delete(schema.accountTokens).where(eq(schema.accountTokens.id, tokenId)).run();
     if (existing.isDefault) {
-      repairDefaultToken(existing.accountId);
+      await repairDefaultToken(existing.accountId);
     }
+    appendDeleteLog(options.taskId, `${tokenLabel} 本地令牌已删除`);
 
-    return { success: true };
+    return {
+      ...labeledResult,
+      success: true,
+      upstreamAttempted: shouldDeleteUpstream,
+      upstreamDeleted: shouldDeleteUpstream,
+      upstreamSkippedReason: upstreamSkippedReason || undefined,
+      localDeleted: true,
+    };
+  };
+
+  const executeDeleteAccountTokens = async (ids: number[], taskId?: string | null): Promise<AccountTokenDeleteTaskResult> => {
+    const results: AccountTokenDeleteResult[] = [];
+    const successIds: number[] = [];
+    const failedItems: Array<{ id: number; message: string }> = [];
+
+    appendDeleteLog(taskId, `删除任务开始，共 ${ids.length} 个账号令牌`);
+    for (const id of ids) {
+      const result = await deleteAccountTokenById(id, { taskId });
+      results.push(result);
+      if (result.success) {
+        successIds.push(id);
+      } else {
+        failedItems.push({ id, message: result.message || '删除失败' });
+      }
+    }
+    appendDeleteLog(taskId, `删除任务完成：成功 ${successIds.length}，失败 ${failedItems.length}`);
+
+    const taskResult = {
+      total: ids.length,
+      successIds,
+      failedItems,
+      results,
+    };
+    if (failedItems.length > 0 && successIds.length === 0) {
+      throw new Error(failedItems[0]?.message || '账号令牌删除失败');
+    }
+    return taskResult;
+  };
+
+  const queueDeleteAccountTokenTask = (ids: number[]) => {
+    let taskId = '';
+    const title = ids.length === 1 ? `删除账号令牌 #${ids[0]}` : `批量删除账号令牌（${ids.length}个）`;
+    const { task, reused } = startBackgroundTask(
+      {
+        type: 'token',
+        title,
+        dedupeKey: `account-token-delete:${ids.join(',')}`,
+        notifyOnFailure: true,
+        successTitle: (currentTask) => {
+          const result = currentTask.result as AccountTokenDeleteTaskResult | null;
+          if (!result) return `${title}已完成`;
+          return `${title}已完成（成功${result.successIds.length}/失败${result.failedItems.length}）`;
+        },
+        failureTitle: () => `${title}失败`,
+        successMessage: (currentTask) => {
+          const result = currentTask.result as AccountTokenDeleteTaskResult | null;
+          if (!result) return `${title}已完成`;
+          const detail = buildTokenDeleteTaskDetailMessage(result.results);
+          const summary = `${title}完成：成功 ${result.successIds.length}，失败 ${result.failedItems.length}`;
+          return detail ? `${summary}\n${detail}` : summary;
+        },
+        failureMessage: (currentTask) => `${title}失败：${currentTask.error || 'unknown error'}`,
+      },
+      async () => {
+        await Promise.resolve();
+        return executeDeleteAccountTokens(ids, taskId);
+      },
+    );
+    taskId = task.id;
+    return { task, reused };
   };
 
   app.post<{ Body: unknown }>('/api/account-tokens/batch', async (request, reply) => {
@@ -703,6 +888,22 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     }
     if (!['enable', 'disable', 'delete'].includes(action)) {
       return reply.code(400).send({ message: 'Invalid action' });
+    }
+
+    if (action === 'delete') {
+      const { task, reused } = queueDeleteAccountTokenTask(ids);
+      return reply.code(202).send({
+        success: true,
+        queued: true,
+        reused,
+        jobId: task.id,
+        status: task.status,
+        successIds: [],
+        failedItems: [],
+        message: reused
+          ? '账号令牌删除任务执行中，请稍后查看程序日志'
+          : '已开始账号令牌删除，请稍后查看程序日志',
+      });
     }
 
     const successIds: number[] = [];
@@ -726,27 +927,19 @@ export async function accountTokensRoutes(app: FastifyInstance) {
           continue;
         }
 
-        if (action === 'delete') {
-          const result = await deleteAccountTokenById(id);
-          if (!result.success) {
-            failedItems.push({ id, message: result.message || 'Batch operation failed' });
-            continue;
-          }
-        } else {
-          if (isMaskedPendingAccountToken(existing)) {
-            failedItems.push({ id, message: '待补全令牌不能修改启用状态，请先补全明文 token' });
-            continue;
-          }
-          await db.update(schema.accountTokens)
-            .set({
-              enabled: action === 'enable',
-              updatedAt: new Date().toISOString(),
-            })
-            .where(eq(schema.accountTokens.id, id))
-            .run();
-          if (existing.isDefault && action === 'disable') {
-            repairDefaultToken(existing.accountId);
-          }
+        if (isMaskedPendingAccountToken(existing)) {
+          failedItems.push({ id, message: '待补全令牌不能修改启用状态，请先补全明文 token' });
+          continue;
+        }
+        await db.update(schema.accountTokens)
+          .set({
+            enabled: action === 'enable',
+            updatedAt: new Date().toISOString(),
+          })
+          .where(eq(schema.accountTokens.id, id))
+          .run();
+        if (existing.isDefault && action === 'disable') {
+          await repairDefaultToken(existing.accountId);
         }
 
         successIds.push(id);
@@ -957,14 +1150,17 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     if (Number.isNaN(tokenId)) {
       return reply.code(400).send({ success: false, message: '令牌 ID 无效' });
     }
-    const result = await deleteAccountTokenById(tokenId);
-    if (!result.success) {
-      const statusCode = result.message === '令牌不存在'
-        ? 404
-        : (result.message === 'API Key 连接不支持管理账号令牌' ? 400 : 502);
-      return reply.code(statusCode).send({ success: false, message: result.message });
-    }
-    return { success: true };
+    const { task, reused } = queueDeleteAccountTokenTask([tokenId]);
+    return reply.code(202).send({
+      success: true,
+      queued: true,
+      reused,
+      jobId: task.id,
+      status: task.status,
+      message: reused
+        ? '账号令牌删除任务执行中，请稍后查看程序日志'
+        : '已开始账号令牌删除，请稍后查看程序日志',
+    });
   });
 
   app.post<{ Params: { accountId: string } }>('/api/account-tokens/sync/:accountId', async (request, reply) => {

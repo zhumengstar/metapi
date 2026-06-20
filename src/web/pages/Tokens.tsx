@@ -444,6 +444,12 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         ids: selectedTokenIds,
         action,
       });
+      if (action === 'delete' && result?.queued) {
+        toast.success(result.message || '已开始批量删除账号令牌，请稍后查看程序日志');
+        setSelectedTokenIds([]);
+        await load();
+        return;
+      }
       const successIds = Array.isArray(result?.successIds) ? result.successIds.map((id: unknown) => Number(id)) : [];
       const failedItems = Array.isArray(result?.failedItems) ? result.failedItems : [];
       if (failedItems.length > 0) {
@@ -467,8 +473,8 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     setDeleteConfirm(null);
     if (target.mode === 'single' && target.tokenId) {
       await withRowLoading(`token-${target.tokenId}-delete`, async () => {
-        await api.deleteAccountToken(target.tokenId!);
-        toast.success('令牌已删除');
+        const result = await api.deleteAccountToken(target.tokenId!);
+        toast.success(result?.message || '已开始删除账号令牌，请稍后查看程序日志');
         await load();
       });
       return;

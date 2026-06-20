@@ -4,6 +4,7 @@ import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { eq } from 'drizzle-orm';
+import { waitForBackgroundTaskToReachTerminalState } from '../../test-fixtures/backgroundTaskTestUtils.js';
 
 const { deleteApiTokenMock } = vi.hoisted(() => ({
   deleteApiTokenMock: vi.fn(),
@@ -16,11 +17,14 @@ vi.mock('../../services/platforms/index.js', () => ({
 }));
 
 type DbModule = typeof import('../../db/index.js');
+type BackgroundTaskServiceModule = typeof import('../../services/backgroundTaskService.js');
 
 describe('account token batch routes', () => {
   let app: FastifyInstance;
   let db: DbModule['db'];
   let schema: DbModule['schema'];
+  let getBackgroundTask: BackgroundTaskServiceModule['getBackgroundTask'];
+  let resetBackgroundTasks: BackgroundTaskServiceModule['__resetBackgroundTasksForTests'];
   let dataDir = '';
 
   beforeAll(async () => {
@@ -29,9 +33,12 @@ describe('account token batch routes', () => {
 
     await import('../../db/migrate.js');
     const dbModule = await import('../../db/index.js');
+    const backgroundTaskServiceModule = await import('../../services/backgroundTaskService.js');
     const routesModule = await import('./accountTokens.js');
     db = dbModule.db;
     schema = dbModule.schema;
+    getBackgroundTask = backgroundTaskServiceModule.getBackgroundTask;
+    resetBackgroundTasks = backgroundTaskServiceModule.__resetBackgroundTasksForTests;
 
     app = Fastify();
     await app.register(routesModule.accountTokensRoutes);
@@ -40,6 +47,8 @@ describe('account token batch routes', () => {
   beforeEach(async () => {
     deleteApiTokenMock.mockReset();
     deleteApiTokenMock.mockResolvedValue(true);
+    resetBackgroundTasks();
+    await db.delete(schema.events).run();
     await db.delete(schema.accountTokens).run();
     await db.delete(schema.accounts).run();
     await db.delete(schema.sites).run();
@@ -153,10 +162,17 @@ describe('account token batch routes', () => {
       },
     });
 
-    expect(response.statusCode).toBe(200);
+    expect(response.statusCode).toBe(202);
+    const body = response.json() as { jobId: string; queued: boolean };
+    expect(body.queued).toBe(true);
+
+    const task = await waitForBackgroundTaskToReachTerminalState(getBackgroundTask, body.jobId);
+    expect(task?.status).toBe('succeeded');
+    expect(task?.message).toContain('成功 1');
     expect(deleteApiTokenMock).toHaveBeenCalledTimes(1);
     const remaining = await db.select().from(schema.accountTokens).all();
     expect(remaining.map((item) => item.id)).toEqual([2]);
+    expect(task?.logs.some((entry) => entry.message.includes('原站点删除成功'))).toBe(true);
   });
 
   it('accepts the edit-panel payload when updating account token metadata without changing token value', async () => {
