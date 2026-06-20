@@ -758,6 +758,69 @@ describe('account tokens sync routes with site status', () => {
     expect(tokenRows[0].source).toBe('sync');
   });
 
+  it('selects the captured upstream-created token as the new default', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'old-default',
+      token: 'sk-old-default-token',
+      source: 'manual',
+      enabled: true,
+      isDefault: true,
+      tokenGroup: 'default',
+      valueStatus: 'ready' as any,
+    }).run();
+    createApiTokenMock.mockImplementation(async (
+      _baseUrl: unknown,
+      _accessToken: unknown,
+      _platformUserId: unknown,
+      options?: { onCreatedToken?: (token: { name: string; key: string; enabled?: boolean; tokenGroup?: string | null }) => void },
+    ) => {
+      options?.onCreatedToken?.({
+        name: 'created-from-upstream',
+        key: 'sk-created-upstream-token',
+        enabled: true,
+        tokenGroup: 'vip',
+      });
+      return true;
+    });
+    getApiTokensMock.mockResolvedValue([]);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/account-tokens',
+      payload: {
+        accountId: account.id,
+        name: 'created-from-upstream',
+        group: 'vip',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      createdViaUpstream: true,
+      token: expect.objectContaining({
+        name: 'created-from-upstream',
+        token: 'sk-created-upstream-token',
+        isDefault: true,
+      }),
+    });
+
+    const tokenRows = await db.select()
+      .from(schema.accountTokens)
+      .where(eq(schema.accountTokens.accountId, account.id))
+      .all();
+    const oldDefault = tokenRows.find((token) => token.name === 'old-default');
+    const created = tokenRows.find((token) => token.name === 'created-from-upstream');
+    expect(oldDefault?.isDefault).toBe(false);
+    expect(created).toMatchObject({
+      token: 'sk-created-upstream-token',
+      tokenGroup: 'vip',
+      isDefault: true,
+    });
+  });
+
   it('passes token creation options to upstream adapter', async () => {
     const { account } = await seedAccount({ siteStatus: 'active' });
     createApiTokenMock.mockResolvedValue(true);

@@ -945,6 +945,18 @@ export async function accountTokensRoutes(app: FastifyInstance) {
         }],
       });
       syncResult = buildCapturedTokenSyncResult(row, convergence.tokenSync);
+      const createdLocalToken = await db.select()
+        .from(schema.accountTokens)
+        .where(and(
+          eq(schema.accountTokens.accountId, account.id),
+          eq(schema.accountTokens.token, capturedToken.key),
+          eq(schema.accountTokens.valueStatus, ACCOUNT_TOKEN_VALUE_STATUS_READY),
+        ))
+        .get();
+      if (createdLocalToken) {
+        await setDefaultToken(createdLocalToken.id);
+        syncResult.defaultTokenId = createdLocalToken.id;
+      }
     } else {
       try {
         syncResult = await executeAccountTokenSync(row);

@@ -573,6 +573,44 @@ describe('Sub2ApiAdapter', () => {
     ]);
   });
 
+  it('captures created api key from sub2api create response', async () => {
+    await startServer((req, res) => {
+      if (req.url === '/api/v1/keys' && req.method === 'POST') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          code: 0,
+          message: 'success',
+          data: {
+            id: 21,
+            key: 'sk-created',
+            name: 'metapi-created',
+            group_id: 2,
+            group_name: '纯pro通道',
+          },
+        }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+
+    const captured: unknown[] = [];
+    const created = await adapter.createApiToken(baseUrl, 'jwt-token', undefined, {
+      name: 'metapi-created',
+      group: '2',
+      onCreatedToken: (token) => captured.push(token),
+    });
+
+    expect(created).toBe(true);
+    expect(captured).toEqual([
+      {
+        key: 'sk-created',
+        name: 'metapi-created',
+        enabled: true,
+        tokenGroup: '纯pro通道',
+      },
+    ]);
+  });
+
   it('fetches user groups from /api/v1/groups', async () => {
     await startServer((req, res) => {
       if (req.url === '/api/v1/groups?page=1&page_size=100') {

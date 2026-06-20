@@ -400,6 +400,60 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
     return Math.round(parsed * 1_000_000) / 1_000_000;
   }
 
+  private resolveCreatedToken(payload: any, options?: CreateApiTokenOptions): ApiTokenInfo | null {
+    const containers = [
+      payload?.data,
+      payload?.token,
+      payload?.api_token,
+      payload?.apiKey,
+      payload,
+    ];
+    for (const item of containers) {
+      if (!item) continue;
+      const keyCandidates = typeof item === 'string'
+        ? [item]
+        : [
+          item?.key,
+          item?.token,
+          item?.api_key,
+          item?.apiKey,
+          item?.access_token,
+        ];
+      for (const candidate of keyCandidates) {
+        if (typeof candidate !== 'string') continue;
+        const key = this.normalizeTokenKeyForCompare(candidate);
+        if (!key || key.includes('*') || key.includes('•')) continue;
+        const name = typeof item?.name === 'string' && item.name.trim()
+          ? item.name.trim()
+          : ((options?.name || '').trim() || 'metapi');
+        const tokenGroup = (() => {
+          const textCandidates = [
+            item?.group_name,
+            item?.groupName,
+            item?.group,
+            item?.token_group,
+            item?.tokenGroup,
+          ];
+          for (const groupCandidate of textCandidates) {
+            if (typeof groupCandidate !== 'string') continue;
+            const normalized = groupCandidate.trim();
+            if (normalized) return normalized;
+          }
+          const numeric = Number.parseInt(String(item?.group_id ?? item?.groupId ?? ''), 10);
+          if (Number.isFinite(numeric) && numeric > 0) return String(numeric);
+          return (options?.group || '').trim() || null;
+        })();
+        return {
+          name,
+          key,
+          enabled: true,
+          tokenGroup,
+        };
+      }
+    }
+    return null;
+  }
+
   private async listGroupDetails(baseUrl: string, accessToken: string): Promise<UserGroupInfo[]> {
     const endpoints = [
       '/api/v1/groups/available',
@@ -911,7 +965,9 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
           headers,
           body: JSON.stringify(payload),
         });
-        this.parseSub2ApiEnvelope<any>(res, endpoint);
+        const data = this.parseSub2ApiEnvelope<any>(res, endpoint);
+        const created = this.resolveCreatedToken(data, options) || this.resolveCreatedToken(res, options);
+        if (created) options?.onCreatedToken?.(created);
         return true;
       } catch {}
     }
