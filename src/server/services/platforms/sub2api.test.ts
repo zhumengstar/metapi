@@ -82,6 +82,47 @@ describe('Sub2ApiAdapter', () => {
     expect(result.message).toContain('not supported');
   });
 
+  it('logs in through /api/v1/auth/login and returns managed JWT credentials', async () => {
+    await startServer((req, res) => {
+      if (req.url === '/api/v1/auth/login' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (chunk) => {
+          body += chunk.toString();
+        });
+        req.on('end', () => {
+          const payload = JSON.parse(body) as { username?: string; password?: string; email?: string };
+          expect(payload).toMatchObject({
+            username: 'user@example.com',
+            password: 'password-1',
+            email: 'user@example.com',
+          });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            code: 0,
+            message: 'success',
+            data: {
+              access_token: 'jwt-access-token',
+              refresh_token: 'jwt-refresh-token',
+              expires_in: 3600,
+            },
+          }));
+        });
+        return;
+      }
+      res.writeHead(404).end();
+    });
+
+    const result = await adapter.login(baseUrl, 'user@example.com', 'password-1');
+
+    expect(result).toMatchObject({
+      success: true,
+      accessToken: 'jwt-access-token',
+      refreshToken: 'jwt-refresh-token',
+      username: 'user@example.com',
+    });
+    expect(result.tokenExpiresAt).toBeGreaterThan(Date.now());
+  });
+
   it('fetches balance from /api/v1/auth/me', async () => {
     await startServer((req, res) => {
       if (req.url === '/api/v1/auth/me') {
@@ -695,6 +736,45 @@ describe('Sub2ApiAdapter', () => {
     expect(groups).toEqual(['7', '9']);
   });
 
+  it('maps token group_id to group name when listing api keys', async () => {
+    await startServer((req, res) => {
+      if (req.url === '/api/v1/keys?page=1&page_size=100') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          code: 0,
+          message: 'success',
+          data: {
+            items: [
+              { id: 21, key: 'sk-pro', name: 'pro-token', group_id: 8, status: 'active' },
+            ],
+          },
+        }));
+        return;
+      }
+      if (req.url === '/api/v1/groups/available') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          code: 0,
+          message: 'success',
+          data: [
+            { id: 8, name: '生图' },
+          ],
+        }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+
+    const tokens = await adapter.getApiTokens(baseUrl, 'jwt-token');
+    expect(tokens).toEqual([
+      expect.objectContaining({
+        key: 'sk-pro',
+        name: 'pro-token',
+        tokenGroup: '生图',
+      }),
+    ]);
+  });
+
   it('creates api key via /api/v1/keys', async () => {
     await startServer((req, res) => {
       if (req.url === '/api/v1/keys' && req.method === 'POST') {
@@ -720,6 +800,95 @@ describe('Sub2ApiAdapter', () => {
     });
 
     const created = await adapter.createApiToken(baseUrl, 'jwt-token', undefined, { name: 'metapi-e2e' });
+    expect(created).toBe(true);
+  });
+
+  it('resolves group name to group_id when creating api key', async () => {
+    await startServer((req, res) => {
+      if (req.url === '/api/v1/groups/available') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          code: 0,
+          message: 'success',
+          data: [
+            { id: 3, name: 'pro' },
+            { id: 8, name: '生图' },
+          ],
+        }));
+        return;
+      }
+      if (req.url === '/api/v1/keys' && req.method === 'POST') {
+        let rawBody = '';
+        req.on('data', (chunk) => { rawBody += chunk; });
+        req.on('end', () => {
+          const body = JSON.parse(rawBody || '{}');
+          expect(body.name).toBe('metapi-e2e');
+          expect(body.group_id).toBe(8);
+          expect(body.groupId).toBe(8);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            code: 0,
+            message: 'success',
+            data: {
+              id: 1,
+              key: 'sk-created',
+              name: body.name,
+              group_id: body.group_id,
+            },
+          }));
+        });
+        return;
+      }
+      res.writeHead(404).end();
+    });
+
+    const created = await adapter.createApiToken(baseUrl, 'jwt-token', undefined, { name: 'metapi-e2e', group: '生图' });
+    expect(created).toBe(true);
+  });
+
+  it('normalizes group name when creating sub2api api key', async () => {
+    await startServer((req, res) => {
+      if (req.url === '/api/v1/groups/available') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          code: 0,
+          message: 'success',
+          data: [
+            { id: 3, name: 'pro' },
+            { id: 8, name: '生图（1k）' },
+          ],
+        }));
+        return;
+      }
+      if (req.url === '/api/v1/keys' && req.method === 'POST') {
+        let rawBody = '';
+        req.on('data', (chunk) => { rawBody += chunk; });
+        req.on('end', () => {
+          const body = JSON.parse(rawBody || '{}');
+          expect(body.name).toBe('metapi-e2e');
+          expect(body.group_id).toBe(8);
+          expect(body.groupId).toBe(8);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            code: 0,
+            message: 'success',
+            data: {
+              id: 1,
+              key: 'sk-created',
+              name: body.name,
+              group_id: body.group_id,
+            },
+          }));
+        });
+        return;
+      }
+      res.writeHead(404).end();
+    });
+
+    const created = await adapter.createApiToken(baseUrl, 'jwt-token', undefined, {
+      name: 'metapi-e2e',
+      group: '生图-1k',
+    });
     expect(created).toBe(true);
   });
 

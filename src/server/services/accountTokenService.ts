@@ -2,6 +2,7 @@
 import { db, schema } from '../db/index.js';
 import { getInsertedRowId } from '../db/insertHelpers.js';
 import { getCredentialModeFromExtraConfig } from './accountExtraConfig.js';
+import { fetchModelPricingCatalog } from './modelPricingService.js';
 
 type UpstreamApiToken = {
   name?: string | null;
@@ -147,6 +148,57 @@ function normalizeTokenGroup(value: string | null | undefined, tokenName?: strin
   }
   if (/^token-\d+$/.test(normalized)) return null;
   return name;
+}
+
+function normalizePricingLookupKey(value: string | null | undefined): string | null {
+  const trimmed = (value || '').trim();
+  if (!trimmed) return null;
+  return trimmed
+    .replace(/[（(]/g, '-')
+    .replace(/[）)]/g, '')
+    .replace(/[–—_/\s]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .toLowerCase();
+}
+
+type GroupRatioMappingEntry = {
+  ratio: number;
+  group: string | null;
+};
+
+function setGroupRatioMapping(
+  map: Map<string, GroupRatioMappingEntry>,
+  accountId: number,
+  value: string | null | undefined,
+  ratio: number,
+  group: string | null,
+) {
+  const entry = { ratio, group };
+  const exact = normalizeTokenGroup(value, null);
+  if (exact) map.set(`${accountId}:${exact}`, entry);
+  const lookup = normalizePricingLookupKey(value);
+  if (lookup) map.set(`${accountId}:lookup:${lookup}`, entry);
+}
+
+function resolveGroupRatioMapping(
+  map: Map<string, GroupRatioMappingEntry>,
+  accountId: number,
+  candidates: Array<string | null | undefined>,
+): GroupRatioMappingEntry | undefined {
+  for (const candidate of candidates) {
+    const exact = normalizeTokenGroup(candidate, null);
+    if (exact) {
+      const value = map.get(`${accountId}:${exact}`);
+      if (value !== undefined) return value;
+    }
+    const lookup = normalizePricingLookupKey(candidate);
+    if (lookup) {
+      const value = map.get(`${accountId}:lookup:${lookup}`);
+      if (value !== undefined) return value;
+    }
+  }
+  return undefined;
 }
 
 function isStoredPricingAvailable(value: unknown): boolean {
@@ -585,15 +637,16 @@ export async function listTokensWithRelations(accountId?: number) {
   })
     .from(schema.tokenGroupPricing)
     .all();
-  const ratioByAccountAndGroup = new Map<string, number>();
+  const ratioByAccountAndGroup = new Map<string, GroupRatioMappingEntry>();
   for (const row of pricingRows) {
     if (!isStoredPricingAvailable(row.pricingAvailable)) continue;
     const group = normalizeTokenGroup(row.group, null);
     const groupName = normalizeTokenGroup(row.groupName, null);
     const ratio = Number(row.ratio);
     if (!row.accountId || !group || !Number.isFinite(ratio) || ratio <= 0) continue;
-    ratioByAccountAndGroup.set(`${row.accountId}:${group}`, ratio);
-    if (groupName) ratioByAccountAndGroup.set(`${row.accountId}:${groupName}`, ratio);
+    const displayGroup = groupName || group;
+    setGroupRatioMapping(ratioByAccountAndGroup, row.accountId, group, ratio, displayGroup);
+    if (groupName) setGroupRatioMapping(ratioByAccountAndGroup, row.accountId, groupName, ratio, displayGroup);
   }
 
   const tokenModelRows = await db.select({
@@ -641,12 +694,55 @@ export async function listTokensWithRelations(accountId?: number) {
     rows.sort((left, right) => left.modelName.localeCompare(right.modelName));
   }
 
+  const catalogByAccountId = new Map<number, Awaited<ReturnType<typeof fetchModelPricingCatalog>>>();
+  const mergeCatalogRatiosForAccount = async (
+    account: typeof schema.accounts.$inferSelect,
+    site: typeof schema.sites.$inferSelect,
+  ) => {
+    if (catalogByAccountId.has(account.id)) return;
+    let catalog: Awaited<ReturnType<typeof fetchModelPricingCatalog>> = null;
+    try {
+      catalog = await fetchModelPricingCatalog({
+        site: {
+          id: site.id,
+          url: site.url,
+          platform: site.platform,
+          apiKey: site.apiKey,
+        },
+        account: {
+          id: account.id,
+          accessToken: account.accessToken,
+          apiToken: account.apiToken,
+        },
+        modelName: '',
+      });
+    } catch {
+      catalog = null;
+    }
+    catalogByAccountId.set(account.id, catalog);
+    for (const [group, ratioValue] of Object.entries(catalog?.groupRatio || {})) {
+      const ratio = Number(ratioValue);
+      if (!group || !Number.isFinite(ratio) || ratio <= 0) continue;
+      setGroupRatioMapping(ratioByAccountAndGroup, account.id, group, ratio, group);
+    }
+  };
+
+  for (const row of rows) {
+    if (isApiKeyConnection(row.accounts)) continue;
+    await mergeCatalogRatiosForAccount(row.accounts, row.sites);
+  }
+
   return rows
     .filter((row) => !isApiKeyConnection(row.accounts))
     .map((row) => {
     const { token, ...tokenMeta } = row.account_tokens;
     const group = normalizeTokenGroup(row.account_tokens.tokenGroup, row.account_tokens.name) || 'default';
-    const groupRatio = ratioByAccountAndGroup.get(`${row.accounts.id}:${group}`);
+    const groupRatioEntry = resolveGroupRatioMapping(ratioByAccountAndGroup, row.accounts.id, [
+      group,
+      row.account_tokens.name,
+      row.account_tokens.tokenGroup,
+    ]);
+    const groupRatio = groupRatioEntry?.ratio;
     const modelNames = modelsByTokenId.get(row.account_tokens.id) || [];
     const modelAvailability = modelAvailabilityByTokenId.get(row.account_tokens.id) || [];
     return {
@@ -655,6 +751,8 @@ export async function listTokensWithRelations(accountId?: number) {
       tokenMasked: maskToken(token, row.sites.platform),
       groupRatio: groupRatio ?? null,
       groupRatioAvailable: groupRatio !== undefined,
+      tokenGroupRatio: groupRatio ?? null,
+      tokenGroupRatioGroup: groupRatioEntry?.group ?? null,
       modelNames,
       modelCount: modelNames.length,
       modelAvailability,

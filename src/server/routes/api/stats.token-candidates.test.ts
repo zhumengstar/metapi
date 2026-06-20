@@ -366,6 +366,71 @@ describe('/api/models/token-candidates', () => {
     ]);
   });
 
+  it('matches token groups with normalized punctuation and spacing', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'site-normalized',
+      url: 'https://site-normalized.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'norman',
+      accessToken: 'acc-token-normalized',
+      status: 'active',
+    }).returning().get();
+
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'codex-token',
+      token: 'sk-normalized',
+      tokenGroup: '标准ChatGPT-Codex通道',
+      enabled: true,
+      isDefault: true,
+    }).returning().get();
+
+    await db.insert(schema.modelAvailability).values({
+      accountId: account.id,
+      modelName: 'gpt-5.2-codex',
+      available: true,
+    }).run();
+
+    await db.insert(schema.tokenModelAvailability).values({
+      tokenId: token.id,
+      modelName: 'gpt-5.2-codex',
+      available: true,
+    }).run();
+
+    fetchModelPricingCatalogMock.mockResolvedValue({
+      models: [
+        {
+          modelName: 'gpt-5.2-codex',
+          quotaType: 0,
+          modelDescription: null,
+          tags: [],
+          supportedEndpointTypes: [],
+          ownerBy: null,
+          enableGroups: ['标准 ChatGPT-Codex 通道'],
+          groupPricing: {},
+        },
+      ],
+      groupRatio: { '标准 ChatGPT-Codex 通道': 0.5 },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/models/token-candidates',
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as {
+      modelsMissingTokenGroups: Record<string, Array<{ accountId: number }>>;
+    };
+
+    expect(body.modelsMissingTokenGroups['gpt-5.2-codex']).toBeUndefined();
+  });
+
   it('marks coverage as uncertain when token group cannot be inferred', async () => {
     const site = await db.insert(schema.sites).values({
       name: 'site-d',

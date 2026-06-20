@@ -5,14 +5,17 @@ import { join } from 'node:path';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { and, eq, sql } from 'drizzle-orm';
 import { mergeAccountExtraConfig } from '../../services/accountExtraConfig.js';
+import { waitForBackgroundTaskToReachTerminalState } from '../../test-fixtures/backgroundTaskTestUtils.js';
 
 const getApiTokensMock = vi.fn();
 const getApiTokenMock = vi.fn();
 const createApiTokenMock = vi.fn();
 const getUserGroupsMock = vi.fn();
 const deleteApiTokenMock = vi.fn();
+const fetchModelPricingCatalogMock = vi.fn();
 
 type AccountTokenServiceModule = typeof import('../../services/accountTokenService.js');
+type BackgroundTaskServiceModule = typeof import('../../services/backgroundTaskService.js');
 
 vi.mock('../../services/platforms/index.js', () => ({
   getAdapter: () => ({
@@ -24,6 +27,14 @@ vi.mock('../../services/platforms/index.js', () => ({
   }),
 }));
 
+vi.mock('../../services/modelPricingService.js', async () => {
+  const actual = await vi.importActual<typeof import('../../services/modelPricingService.js')>('../../services/modelPricingService.js');
+  return {
+    ...actual,
+    fetchModelPricingCatalog: (...args: unknown[]) => fetchModelPricingCatalogMock(...args),
+  };
+});
+
 type DbModule = typeof import('../../db/index.js');
 
 describe('account tokens sync routes with site status', () => {
@@ -31,6 +42,8 @@ describe('account tokens sync routes with site status', () => {
   let db: DbModule['db'];
   let schema: DbModule['schema'];
   let maskToken: AccountTokenServiceModule['maskToken'];
+  let getBackgroundTask: BackgroundTaskServiceModule['getBackgroundTask'];
+  let resetBackgroundTasks: BackgroundTaskServiceModule['__resetBackgroundTasksForTests'];
   let dataDir = '';
   let previousDataDir: string | undefined;
   let seedId = 0;
@@ -71,10 +84,13 @@ describe('account tokens sync routes with site status', () => {
     await import('../../db/migrate.js');
     const dbModule = await import('../../db/index.js');
     const accountTokenServiceModule = await import('../../services/accountTokenService.js');
+    const backgroundTaskServiceModule = await import('../../services/backgroundTaskService.js');
     const routesModule = await import('./accountTokens.js');
     db = dbModule.db;
     schema = dbModule.schema;
     maskToken = accountTokenServiceModule.maskToken;
+    getBackgroundTask = backgroundTaskServiceModule.getBackgroundTask;
+    resetBackgroundTasks = backgroundTaskServiceModule.__resetBackgroundTasksForTests;
 
     app = Fastify();
     await app.register(routesModule.accountTokensRoutes);
@@ -86,8 +102,12 @@ describe('account tokens sync routes with site status', () => {
     createApiTokenMock.mockReset();
     getUserGroupsMock.mockReset();
     deleteApiTokenMock.mockReset();
+    fetchModelPricingCatalogMock.mockReset();
+    fetchModelPricingCatalogMock.mockResolvedValue(null);
+    resetBackgroundTasks();
     seedId = 0;
 
+    await db.delete(schema.events).run();
     await db.delete(schema.accountTokens).run();
     await db.delete(schema.routeChannels).run();
     await db.delete(schema.tokenRoutes).run();
@@ -624,6 +644,77 @@ describe('account tokens sync routes with site status', () => {
     expect(response.json()).toEqual([]);
   });
 
+  it('loads token group ratios from the account pricing catalog', async () => {
+    const { site, account } = await seedAccount({ siteStatus: 'active' });
+    await db.update(schema.sites)
+      .set({ platform: 'sub2api' })
+      .where(eq(schema.sites.id, site.id))
+      .run();
+
+    await db.insert(schema.accountTokens).values([
+      {
+        accountId: account.id,
+        name: '生图-1k',
+        token: 'sk-image-1k',
+        tokenGroup: '生图-1k',
+        enabled: true,
+        isDefault: true,
+      },
+      {
+        accountId: account.id,
+        name: '生图-2k4k',
+        token: 'sk-image-2k4k',
+        tokenGroup: '生图-2k4k',
+        enabled: true,
+        isDefault: false,
+      },
+    ]).run();
+
+    fetchModelPricingCatalogMock.mockResolvedValue({
+      models: [],
+      groupRatio: {
+        '生图（1k）': 0.12,
+        '生图（2k4k）': 0.25,
+        default: 1,
+      },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/account-tokens',
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as Array<{
+      name: string;
+      tokenGroupRatio: number | null;
+      tokenGroupRatioGroup: string | null;
+    }>;
+    expect(body).toEqual([
+      expect.objectContaining({
+        name: '生图-1k',
+        tokenGroupRatio: 0.12,
+        tokenGroupRatioGroup: '生图（1k）',
+      }),
+      expect.objectContaining({
+        name: '生图-2k4k',
+        tokenGroupRatio: 0.25,
+        tokenGroupRatioGroup: '生图（2k4k）',
+      }),
+    ]);
+    expect(fetchModelPricingCatalogMock).toHaveBeenCalledTimes(1);
+    expect(fetchModelPricingCatalogMock).toHaveBeenCalledWith(expect.objectContaining({
+      account: expect.objectContaining({
+        id: account.id,
+        accessToken: account.accessToken,
+      }),
+      site: expect.objectContaining({
+        id: site.id,
+        platform: 'sub2api',
+      }),
+    }));
+  });
+
   it('sync-all skips disabled-site accounts and syncs active-site accounts', async () => {
     const disabled = await seedAccount({ siteStatus: 'disabled' });
     const active = await seedAccount({ siteStatus: 'active' });
@@ -963,7 +1054,12 @@ describe('account tokens sync routes with site status', () => {
       url: `/api/account-tokens/${token.id}`,
     });
 
-    expect(response.statusCode).toBe(200);
+    expect(response.statusCode).toBe(202);
+    const body = response.json() as { jobId: string; queued: boolean };
+    expect(body.queued).toBe(true);
+
+    const task = await waitForBackgroundTaskToReachTerminalState(getBackgroundTask, body.jobId);
+    expect(task?.status).toBe('succeeded');
     expect(deleteApiTokenMock).toHaveBeenCalledTimes(1);
     expect(deleteApiTokenMock.mock.calls[0][0]).toBe(site.url);
     expect(deleteApiTokenMock.mock.calls[0][1]).toBe(account.accessToken);
@@ -971,6 +1067,15 @@ describe('account tokens sync routes with site status', () => {
 
     const removed = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, token.id)).get();
     expect(removed).toBeUndefined();
+    expect(task?.logs.some((entry) => entry.message.includes('原站点删除成功'))).toBe(true);
+    const events = await db.select().from(schema.events).where(eq(schema.events.type, 'token')).all();
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        title: '账号令牌删除成功',
+        message: expect.stringContaining('原站点删除成功'),
+        relatedType: 'account_token',
+      }),
+    ]));
   });
 
   it('keeps local token when upstream deletion fails', async () => {
@@ -990,14 +1095,24 @@ describe('account tokens sync routes with site status', () => {
       url: `/api/account-tokens/${token.id}`,
     });
 
-    expect(response.statusCode).toBe(502);
-    expect(response.json()).toMatchObject({
-      success: false,
-      message: '站点删除令牌失败，本地未删除',
-    });
+    expect(response.statusCode).toBe(202);
+    const body = response.json() as { jobId: string; queued: boolean };
+    expect(body.queued).toBe(true);
+
+    const task = await waitForBackgroundTaskToReachTerminalState(getBackgroundTask, body.jobId);
+    expect(task?.status).toBe('failed');
+    expect(task?.error).toBe('站点删除令牌失败，本地未删除');
 
     const existing = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, token.id)).get();
     expect(existing).toBeDefined();
+    const events = await db.select().from(schema.events).where(eq(schema.events.type, 'token')).all();
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        title: '账号令牌删除失败',
+        message: expect.stringContaining('本地未删除'),
+        relatedType: 'account_token',
+      }),
+    ]));
   });
 
   it('rejects retrieving token value when stored token is masked', async () => {
@@ -1195,7 +1310,7 @@ describe('account tokens sync routes with site status', () => {
     expect((response.json() as { message?: string }).message).toContain('name');
   });
 
-  it('deletes masked_pending placeholders locally without calling upstream delete', async () => {
+  it('keeps masked_pending placeholders locally because upstream deletion cannot be confirmed', async () => {
     const { account } = await seedAccount({ siteStatus: 'active' });
     const token = await db.insert(schema.accountTokens).values({
       accountId: account.id,
@@ -1212,9 +1327,24 @@ describe('account tokens sync routes with site status', () => {
       url: `/api/account-tokens/${token.id}`,
     });
 
-    expect(response.statusCode).toBe(200);
+    expect(response.statusCode).toBe(202);
+    const body = response.json() as { jobId: string; queued: boolean };
+    expect(body.queued).toBe(true);
+
+    const task = await waitForBackgroundTaskToReachTerminalState(getBackgroundTask, body.jobId);
+    expect(task?.status).toBe('failed');
+    expect(task?.error).toContain('本地未删除');
     expect(deleteApiTokenMock).not.toHaveBeenCalled();
-    const removed = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, token.id)).get();
-    expect(removed).toBeUndefined();
+    const existing = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, token.id)).get();
+    expect(existing).toBeDefined();
+    expect(task?.logs.some((entry) => entry.message.includes('原站点未删除'))).toBe(true);
+    const events = await db.select().from(schema.events).where(eq(schema.events.type, 'token')).all();
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        title: '账号令牌删除失败',
+        message: expect.stringContaining('原站点未删除'),
+        relatedType: 'account_token',
+      }),
+    ]));
   });
 });

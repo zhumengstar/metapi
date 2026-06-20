@@ -11,6 +11,7 @@ import {
   UserInfo,
 } from './base.js';
 import { stripTrailingSlashes } from '../urlNormalization.js';
+import { normalizeTokenGroupLookupKey } from '../tokenGroupNames.js';
 
 function normalizeBaseUrl(baseUrl: string): string {
   return stripTrailingSlashes(baseUrl || '');
@@ -20,7 +21,8 @@ function normalizeBaseUrl(baseUrl: string): string {
  * Sub2API adapter.
  *
  * Sub2API uses JWT-based auth with endpoints under /api/v1/*.
- * It does NOT support: login or check-in.
+ * It supports username/password login on /api/v1/auth/login and does not
+ * support check-in.
  * Balance is derived from a USD amount returned by /api/v1/auth/me.
  */
 export class Sub2ApiAdapter extends BasePlatformAdapter {
@@ -488,6 +490,41 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
     return (await this.listGroupDetails(baseUrl, accessToken)).map((item) => item.group);
   }
 
+  private async resolveGroupIdByName(baseUrl: string, accessToken: string, groupName: string): Promise<number | null> {
+    const normalizedGroupName = groupName.trim();
+    if (!normalizedGroupName) return null;
+
+    const directGroupId = this.parsePositiveInteger(normalizedGroupName);
+    if (directGroupId) return directGroupId;
+
+    const groups = await this.listGroupDetails(baseUrl, accessToken);
+    const normalize = (value: string) => value.trim().toLowerCase();
+    const target = normalize(normalizedGroupName);
+    const exactGroup = groups.find((item) => normalize(item.group) === target || normalize(item.name || '') === target);
+    const exactGroupId = this.parsePositiveInteger(exactGroup?.groupKey);
+    if (exactGroupId) return exactGroupId;
+
+    const targetLookupKey = normalizeTokenGroupLookupKey(normalizedGroupName);
+    const fuzzyGroup = groups.find((item) => {
+      const groupLookupKey = normalizeTokenGroupLookupKey(item.group);
+      const nameLookupKey = normalizeTokenGroupLookupKey(item.name || '');
+      return !!targetLookupKey && (groupLookupKey === targetLookupKey || nameLookupKey === targetLookupKey);
+    });
+    return this.parsePositiveInteger(fuzzyGroup?.groupKey) || null;
+  }
+
+  private async buildGroupNameById(baseUrl: string, accessToken: string): Promise<Map<number, string>> {
+    const map = new Map<number, string>();
+    for (const item of await this.listGroupDetails(baseUrl, accessToken)) {
+      const groupId = this.parsePositiveInteger(item.groupKey || item.group);
+      const groupName = (item.name || item.group || '').trim();
+      if (groupId && groupName && !/^\d+$/.test(groupName)) {
+        map.set(groupId, groupName);
+      }
+    }
+    return map;
+  }
+
   private parseGroupIdsFromTokenPayload(payload: any): string[] {
     const source = payload?.data ?? payload;
     const rawItems = (() => {
@@ -616,7 +653,12 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
           headers,
         });
         const data = this.parseSub2ApiEnvelope<any>(res, endpoint);
-        const items = this.parseTokenItems(data);
+        const groupNameById = await this.buildGroupNameById(baseUrl, accessToken);
+        const items = this.parseTokenItems(data).map((item) => {
+          const groupId = this.parsePositiveInteger(item.tokenGroup || '');
+          const groupName = groupId ? groupNameById.get(groupId) : undefined;
+          return groupName ? { ...item, tokenGroup: groupName } : item;
+        });
         if (items.length > 0) return items;
       } catch {}
     }
@@ -735,6 +777,16 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
     return body.data as T;
   }
 
+  private parseLoginTokenExpiresAt(raw: unknown): number | undefined {
+    const seconds = typeof raw === 'number' && Number.isFinite(raw)
+      ? raw
+      : typeof raw === 'string'
+        ? Number.parseInt(raw.trim(), 10)
+        : Number.NaN;
+    if (!Number.isFinite(seconds) || seconds <= 0) return undefined;
+    return Date.now() + Math.trunc(seconds) * 1000;
+  }
+
   /**
    * Extract display name: prefer username, fall back to email local part.
    */
@@ -789,13 +841,41 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
     return Math.round(Math.max(0, balanceUsd) * 500000);
   }
 
-  // --- Login: Not supported (JWT only) ---
+  // --- Login ---
   override async login(
-    _baseUrl: string,
-    _username: string,
-    _password: string,
-  ): Promise<{ success: false; message: string }> {
-    return { success: false, message: 'Sub2API uses JWT authentication; login is not supported' };
+    baseUrl: string,
+    username: string,
+    password: string,
+  ): Promise<{
+    success: boolean;
+    accessToken?: string;
+    refreshToken?: string;
+    tokenExpiresAt?: number;
+    username?: string;
+    message?: string;
+  }> {
+    const endpoint = '/api/v1/auth/login';
+    try {
+      const res = await this.fetchJson<any>(`${normalizeBaseUrl(baseUrl)}${endpoint}`, {
+        method: 'POST',
+        body: JSON.stringify({ username, password, email: username }),
+      });
+      const data = this.parseSub2ApiEnvelope<any>(res, endpoint);
+      const accessToken = typeof data?.access_token === 'string' ? data.access_token.trim() : '';
+      const refreshToken = typeof data?.refresh_token === 'string' ? data.refresh_token.trim() : '';
+      if (!accessToken) {
+        return { success: false, message: 'Sub2API login response missing access token' };
+      }
+      return {
+        success: true,
+        accessToken,
+        refreshToken: refreshToken || undefined,
+        tokenExpiresAt: this.parseLoginTokenExpiresAt(data?.expires_in),
+        username,
+      };
+    } catch (err: any) {
+      return { success: false, message: err?.message || 'Sub2API 登录请求失败' };
+    }
   }
 
   // --- User Info ---
@@ -942,9 +1022,16 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
       name: (options?.name || '').trim() || 'metapi',
     };
 
-    const groupId = Number.parseInt((options?.group || '').trim(), 10);
-    if (Number.isFinite(groupId) && groupId > 0) {
+    const requestedGroup = (options?.group || '').trim();
+    const groupId = requestedGroup
+      ? await this.resolveGroupIdByName(normalizedBase, accessToken, requestedGroup)
+      : null;
+    if (requestedGroup && !groupId) {
+      return false;
+    }
+    if (groupId) {
       payload.group_id = groupId;
+      payload.groupId = groupId;
     }
 
     const expiresInDays = this.resolveExpiresInDays(options?.expiredTime);
