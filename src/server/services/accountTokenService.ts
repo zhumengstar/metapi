@@ -149,6 +149,10 @@ function normalizeTokenGroup(value: string | null | undefined, tokenName?: strin
   return name;
 }
 
+function isStoredPricingAvailable(value: unknown): boolean {
+  return value === true || value === 1 || value === '1';
+}
+
 function sameTokenGroup(
   leftGroup: string | null | undefined,
   leftName: string | null | undefined,
@@ -342,6 +346,41 @@ export async function syncTokensFromUpstream(accountId: number, upstreamTokens: 
       continue;
     }
 
+    const matchingPendingByClearValue = nextValueStatus === ACCOUNT_TOKEN_VALUE_STATUS_READY
+      ? existing.filter((row) => (
+        isMaskedPendingAccountToken(row)
+        && matchesMaskedTokenValue(tokenValue, row.token)
+      ))
+      : [];
+    const pendingClearMatch = matchingPendingByClearValue.length === 1
+      ? matchingPendingByClearValue[0]
+      : null;
+    if (pendingClearMatch) {
+      await db.update(schema.accountTokens)
+        .set({
+          name: tokenName,
+          token: tokenValue,
+          tokenGroup,
+          valueStatus: ACCOUNT_TOKEN_VALUE_STATUS_READY,
+          source: 'sync',
+          enabled,
+          isDefault: false,
+          updatedAt: now,
+        })
+        .where(eq(schema.accountTokens.id, pendingClearMatch.id))
+        .run();
+      pendingClearMatch.name = tokenName;
+      pendingClearMatch.token = tokenValue;
+      pendingClearMatch.tokenGroup = tokenGroup;
+      pendingClearMatch.valueStatus = ACCOUNT_TOKEN_VALUE_STATUS_READY;
+      pendingClearMatch.source = 'sync';
+      pendingClearMatch.enabled = enabled;
+      pendingClearMatch.isDefault = false;
+      pendingClearMatch.updatedAt = now;
+      updated++;
+      continue;
+    }
+
     const matchingReadyByMaskedValue = nextValueStatus === ACCOUNT_TOKEN_VALUE_STATUS_MASKED_PENDING
       ? existing.filter((row) => (
         resolveAccountTokenValueStatus(row) === ACCOUNT_TOKEN_VALUE_STATUS_READY
@@ -485,14 +524,85 @@ export async function listTokensWithRelations(accountId?: number) {
     ? await base.where(eq(schema.accountTokens.accountId, accountId)).all()
     : await base.all();
 
+  const pricingRows = await db.select({
+    accountId: schema.tokenGroupPricing.accountId,
+    group: schema.tokenGroupPricing.group,
+    ratio: schema.tokenGroupPricing.ratio,
+    pricingAvailable: schema.tokenGroupPricing.pricingAvailable,
+  })
+    .from(schema.tokenGroupPricing)
+    .all();
+  const ratioByAccountAndGroup = new Map<string, number>();
+  for (const row of pricingRows) {
+    if (!isStoredPricingAvailable(row.pricingAvailable)) continue;
+    const group = normalizeTokenGroup(row.group, null);
+    const ratio = Number(row.ratio);
+    if (!row.accountId || !group || !Number.isFinite(ratio) || ratio <= 0) continue;
+    ratioByAccountAndGroup.set(`${row.accountId}:${group}`, ratio);
+  }
+
+  const tokenModelRows = await db.select({
+    tokenId: schema.tokenModelAvailability.tokenId,
+    modelName: schema.tokenModelAvailability.modelName,
+    available: schema.tokenModelAvailability.available,
+    latencyMs: schema.tokenModelAvailability.latencyMs,
+    checkedAt: schema.tokenModelAvailability.checkedAt,
+  })
+    .from(schema.tokenModelAvailability)
+    .all();
+  const modelsByTokenId = new Map<number, string[]>();
+  const modelAvailabilityByTokenId = new Map<number, Array<{
+    modelName: string;
+    available: boolean | null;
+    latencyMs: number | null;
+    checkedAt: string | null;
+  }>>();
+  const seenModelKeysByTokenId = new Map<number, Set<string>>();
+  for (const row of tokenModelRows) {
+    const modelName = (row.modelName || '').trim();
+    if (!modelName) continue;
+    const availabilityRows = modelAvailabilityByTokenId.get(row.tokenId) || [];
+    availabilityRows.push({
+      modelName,
+      available: row.available,
+      latencyMs: row.latencyMs,
+      checkedAt: row.checkedAt,
+    });
+    modelAvailabilityByTokenId.set(row.tokenId, availabilityRows);
+
+    const seen = seenModelKeysByTokenId.get(row.tokenId) || new Set<string>();
+    const key = modelName.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    seenModelKeysByTokenId.set(row.tokenId, seen);
+    const models = modelsByTokenId.get(row.tokenId) || [];
+    models.push(modelName);
+    modelsByTokenId.set(row.tokenId, models);
+  }
+  for (const models of modelsByTokenId.values()) {
+    models.sort((left, right) => left.localeCompare(right));
+  }
+  for (const rows of modelAvailabilityByTokenId.values()) {
+    rows.sort((left, right) => left.modelName.localeCompare(right.modelName));
+  }
+
   return rows
     .filter((row) => !isApiKeyConnection(row.accounts))
     .map((row) => {
     const { token, ...tokenMeta } = row.account_tokens;
+    const group = normalizeTokenGroup(row.account_tokens.tokenGroup, row.account_tokens.name) || 'default';
+    const groupRatio = ratioByAccountAndGroup.get(`${row.accounts.id}:${group}`);
+    const modelNames = modelsByTokenId.get(row.account_tokens.id) || [];
+    const modelAvailability = modelAvailabilityByTokenId.get(row.account_tokens.id) || [];
     return {
       ...tokenMeta,
       valueStatus: resolveAccountTokenValueStatus(row.account_tokens),
       tokenMasked: maskToken(token, row.sites.platform),
+      groupRatio: groupRatio ?? null,
+      groupRatioAvailable: groupRatio !== undefined,
+      modelNames,
+      modelCount: modelNames.length,
+      modelAvailability,
       account: {
         id: row.accounts.id,
         username: row.accounts.username,

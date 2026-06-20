@@ -31,6 +31,15 @@ import {
   parseAccountTokenSyncAllPayload,
   parseAccountTokenUpdatePayload,
 } from '../../contracts/accountTokensRoutePayloads.js';
+import {
+  buildTokenGroupPricingOverview,
+  listTokenGroupPricingGroups,
+  syncTokenGroupPricingCache,
+} from '../../services/tokenGroupPricingOverviewService.js';
+import { getAccountTokenModels } from '../../services/accountTokenModelService.js';
+import { testAccountTokenModelAvailability } from '../../services/accountTokenAvailabilityTestService.js';
+
+const ACCOUNT_TOKEN_UPSTREAM_DELETE_TIMEOUT_MS = 6_000;
 
 type AccountWithSiteRow = {
   accounts: typeof schema.accounts.$inferSelect;
@@ -73,7 +82,26 @@ type CoverageRefreshFailureItem = {
 type CoverageRefreshItem = ModelRefreshResult | CoverageRefreshFailureItem;
 type CoverageRefreshRebuildResult = CoverageBatchRebuildResult;
 
+type EnsureGroupTokensExecutionResult = {
+  accountId: number;
+  accountName: string;
+  accountStatus: string | null;
+  siteId: number;
+  siteName: string;
+  siteStatus: string | null;
+  status: 'synced' | 'skipped' | 'failed';
+  reason?: string;
+  message?: string;
+  groupCount: number;
+  missingGroupCount: number;
+  created: number;
+  disabled: number;
+  syncedCreated: number;
+  syncedUpdated: number;
+};
+
 const TOKEN_SYNC_TIMEOUT_MS = 15_000;
+const GROUP_TOKEN_ENSURE_TIMEOUT_MS = 60_000;
 const SYNC_ALL_BATCH_SIZE = 3;
 
 function buildSyncAccountLabel(item: SyncExecutionResult): string {
@@ -178,6 +206,44 @@ function normalizeBatchIds(input: unknown): number[] {
   return input
     .map((item) => Number.parseInt(String(item), 10))
     .filter((id) => Number.isFinite(id) && id > 0);
+}
+
+function normalizeTokenGroupKey(value: unknown): string {
+  return String(value || '').trim();
+}
+
+function normalizeTokenValueKey(value: unknown): string {
+  return String(value || '').trim();
+}
+
+function normalizeGeneratedTokenName(group: string, index: number): string {
+  const collapsed = group.replace(/\s+/g, '');
+  const sanitized = collapsed.replace(/[^\p{L}\p{N}_-]+/gu, '-').replace(/^-+|-+$/g, '');
+  return sanitized || `group-${index}`;
+}
+
+function buildCapturedTokenSyncResult(
+  row: AccountWithSiteRow,
+  tokenSync: Awaited<ReturnType<typeof convergeAccountMutation>>['tokenSync'],
+): SyncExecutionResult {
+  return {
+    accountId: row.accounts.id,
+    accountName: row.accounts.username || `account-${row.accounts.id}`,
+    accountStatus: row.accounts.status,
+    siteId: row.sites.id,
+    siteName: row.sites.name,
+    siteStatus: row.sites.status,
+    status: 'synced',
+    reason: 'created_token_captured',
+    message: 'created token captured from upstream response',
+    synced: true,
+    created: tokenSync?.created || 0,
+    updated: tokenSync?.updated || 0,
+    maskedPending: tokenSync?.maskedPending || 0,
+    pendingTokenIds: tokenSync?.pendingTokenIds || [],
+    total: tokenSync?.total || 0,
+    defaultTokenId: tokenSync?.defaultTokenId || null,
+  };
 }
 
 async function withTimeout<T>(fn: () => Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
@@ -428,6 +494,232 @@ async function executeSyncAllAccountTokens() {
   return { summary, results, coverageRefresh };
 }
 
+async function fetchUpstreamApiTokens(row: AccountWithSiteRow, timeoutMs = TOKEN_SYNC_TIMEOUT_MS) {
+  const adapter = getAdapter(row.sites.platform);
+  if (!adapter) throw new Error(`不支持的平台: ${row.sites.platform}`);
+  const platformUserId = resolvePlatformUserId(row.accounts.extraConfig, row.accounts.username);
+  const accountProxyUrl = getProxyUrlFromExtraConfig(row.accounts.extraConfig);
+  let tokens = await withTimeout(
+    () => withAccountProxyOverride(accountProxyUrl,
+      () => adapter.getApiTokens(row.sites.url, row.accounts.accessToken, platformUserId)),
+    timeoutMs,
+    `token sync timeout (${Math.round(timeoutMs / 1000)}s)`,
+  );
+
+  if (tokens.length === 0) {
+    const fallback = await withTimeout(
+      () => withAccountProxyOverride(accountProxyUrl,
+        () => adapter.getApiToken(row.sites.url, row.accounts.accessToken, platformUserId)),
+      timeoutMs,
+      `token sync timeout (${Math.round(timeoutMs / 1000)}s)`,
+    );
+    if (fallback) {
+      tokens = [{ name: 'default', key: fallback, enabled: true, tokenGroup: 'default' }];
+    }
+  }
+  return tokens;
+}
+
+async function disableMissingUpstreamTokens(accountId: number, upstreamTokens: Array<{ key?: string | null; name?: string | null; tokenGroup?: string | null }>) {
+  const upstreamTokenValues = new Set(upstreamTokens.map((token) => normalizeTokenValueKey(token.key)).filter(Boolean));
+  if (upstreamTokenValues.size === 0) return 0;
+  const upstreamNameGroupKeys = new Set(upstreamTokens.map((token) => {
+    const name = String(token.name || '').trim();
+    const group = normalizeTokenGroupKey(token.tokenGroup || token.name);
+    return name || group ? `${name}::${group}` : '';
+  }).filter(Boolean));
+
+  const localTokens = await db.select()
+    .from(schema.accountTokens)
+    .where(eq(schema.accountTokens.accountId, accountId))
+    .all();
+  const now = new Date().toISOString();
+  let disabled = 0;
+  for (const token of localTokens) {
+    if (!isUsableAccountToken(token)) continue;
+    if (upstreamTokenValues.has(normalizeTokenValueKey(token.token))) continue;
+    const localNameGroupKey = `${String(token.name || '').trim()}::${normalizeTokenGroupKey(token.tokenGroup || token.name)}`;
+    if (upstreamNameGroupKeys.has(localNameGroupKey)) continue;
+    await db.update(schema.accountTokens)
+      .set({ enabled: false, isDefault: false, updatedAt: now })
+      .where(eq(schema.accountTokens.id, token.id))
+      .run();
+    disabled++;
+  }
+  if (disabled > 0) {
+    await repairDefaultToken(accountId);
+  }
+  return disabled;
+}
+
+async function executeEnsureGroupTokensForAccount(row: AccountWithSiteRow): Promise<EnsureGroupTokensExecutionResult> {
+  const accountId = row.accounts.id;
+  const base = {
+    accountId,
+    accountName: row.accounts.username || `account-${accountId}`,
+    accountStatus: row.accounts.status,
+    siteId: row.sites.id,
+    siteName: row.sites.name,
+    siteStatus: row.sites.status,
+  };
+
+  if (isSiteDisabled(row.sites.status)) {
+    return { ...base, status: 'skipped', reason: 'site_disabled', message: 'site disabled', groupCount: 0, missingGroupCount: 0, created: 0, disabled: 0, syncedCreated: 0, syncedUpdated: 0 };
+  }
+  if (isApiKeyConnection(row.accounts)) {
+    return { ...base, status: 'skipped', reason: 'apikey_connection', message: 'apikey connection does not support account tokens', groupCount: 0, missingGroupCount: 0, created: 0, disabled: 0, syncedCreated: 0, syncedUpdated: 0 };
+  }
+  if (!row.accounts.accessToken?.trim()) {
+    return { ...base, status: 'skipped', reason: 'missing_access_token', message: '账号缺少访问令牌', groupCount: 0, missingGroupCount: 0, created: 0, disabled: 0, syncedCreated: 0, syncedUpdated: 0 };
+  }
+
+  const adapter = getAdapter(row.sites.platform);
+  if (!adapter) {
+    return { ...base, status: 'failed', reason: 'unsupported_platform', message: `不支持的平台: ${row.sites.platform}`, groupCount: 0, missingGroupCount: 0, created: 0, disabled: 0, syncedCreated: 0, syncedUpdated: 0 };
+  }
+
+  try {
+    const platformUserId = resolvePlatformUserId(row.accounts.extraConfig, row.accounts.username);
+    const accountProxyUrl = getProxyUrlFromExtraConfig(row.accounts.extraConfig);
+    const groups = await withTimeout(
+      () => withAccountProxyOverride(accountProxyUrl,
+        () => adapter.getUserGroups(row.sites.url, row.accounts.accessToken, platformUserId)),
+      GROUP_TOKEN_ENSURE_TIMEOUT_MS,
+      `group fetch timeout (${Math.round(GROUP_TOKEN_ENSURE_TIMEOUT_MS / 1000)}s)`,
+    );
+    const normalizedGroups = Array.from(new Set((groups || []).map(normalizeTokenGroupKey).filter(Boolean)));
+    if (normalizedGroups.length === 0) {
+      return { ...base, status: 'skipped', reason: 'no_groups', message: 'upstream returned no groups', groupCount: 0, missingGroupCount: 0, created: 0, disabled: 0, syncedCreated: 0, syncedUpdated: 0 };
+    }
+
+    let upstreamTokens = await fetchUpstreamApiTokens(row, GROUP_TOKEN_ENSURE_TIMEOUT_MS);
+    const syncedBeforeCreate = upstreamTokens.length > 0
+      ? (await convergeAccountMutation({ accountId, upstreamTokens })).tokenSync
+      : null;
+    const disabled = upstreamTokens.length > 0 ? await disableMissingUpstreamTokens(accountId, upstreamTokens) : 0;
+    const existingGroups = new Set(upstreamTokens.map((token) => normalizeTokenGroupKey(token.tokenGroup || token.name)).filter(Boolean));
+    const missingGroups = normalizedGroups.filter((group) => !existingGroups.has(group));
+    let created = 0;
+    let createdWithoutClearToken = 0;
+
+    for (let index = 0; index < missingGroups.length; index += 1) {
+      const group = missingGroups[index]!;
+      const name = normalizeGeneratedTokenName(group, index + 1);
+      const createdTokensFromUpstream: Array<{ name: string; key: string; enabled?: boolean; tokenGroup?: string | null }> = [];
+      let createdViaUpstream = false;
+      try {
+        createdViaUpstream = await withTimeout(
+          () => withAccountProxyOverride(accountProxyUrl,
+            () => adapter.createApiToken(
+              row.sites.url,
+              row.accounts.accessToken,
+              platformUserId,
+              {
+                name,
+                group,
+                unlimitedQuota: true,
+                onCreatedToken: (token) => createdTokensFromUpstream.push(token),
+              },
+            )),
+          GROUP_TOKEN_ENSURE_TIMEOUT_MS,
+          `token create timeout (${Math.round(GROUP_TOKEN_ENSURE_TIMEOUT_MS / 1000)}s)`,
+        );
+      } catch (error: any) {
+        const refreshedTokens = await fetchUpstreamApiTokens(row, GROUP_TOKEN_ENSURE_TIMEOUT_MS).catch(() => []);
+        const matchedAfterTimeout = refreshedTokens.find((token) => (
+          normalizeTokenGroupKey(token.tokenGroup || token.name) === group
+          || String(token.name || '').trim() === name
+        ));
+        if (!matchedAfterTimeout) {
+          throw error;
+        }
+        createdViaUpstream = true;
+        upstreamTokens = refreshedTokens;
+        await convergeAccountMutation({ accountId, upstreamTokens: refreshedTokens });
+      }
+      if (!createdViaUpstream) continue;
+      created++;
+      const capturedToken = createdTokensFromUpstream.find((token) => !isMaskedTokenValue(token.key));
+      if (capturedToken) {
+        await convergeAccountMutation({
+          accountId,
+          upstreamTokens: [{ ...capturedToken, name, tokenGroup: group }],
+        });
+      } else {
+        createdWithoutClearToken++;
+      }
+    }
+
+    if (createdWithoutClearToken > 0 || (created === 0 && upstreamTokens.length === 0)) {
+      upstreamTokens = await fetchUpstreamApiTokens(row, GROUP_TOKEN_ENSURE_TIMEOUT_MS);
+      if (upstreamTokens.length > 0) {
+        await convergeAccountMutation({ accountId, upstreamTokens });
+      }
+    }
+
+    return {
+      ...base,
+      status: 'synced',
+      groupCount: normalizedGroups.length,
+      missingGroupCount: missingGroups.length,
+      created,
+      disabled,
+      syncedCreated: syncedBeforeCreate?.created || 0,
+      syncedUpdated: syncedBeforeCreate?.updated || 0,
+    };
+  } catch (error: any) {
+    return {
+      ...base,
+      status: 'failed',
+      reason: 'ensure_group_tokens_error',
+      message: error?.message || '获取分组并补齐令牌失败',
+      groupCount: 0,
+      missingGroupCount: 0,
+      created: 0,
+      disabled: 0,
+      syncedCreated: 0,
+      syncedUpdated: 0,
+    };
+  }
+}
+
+async function executeEnsureGroupTokensAllAccounts() {
+  const rows = await db.select().from(schema.accounts)
+    .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+    .where(eq(schema.accounts.status, 'active'))
+    .all();
+
+  const results: EnsureGroupTokensExecutionResult[] = [];
+  for (let offset = 0; offset < rows.length; offset += SYNC_ALL_BATCH_SIZE) {
+    const batch = rows.slice(offset, offset + SYNC_ALL_BATCH_SIZE);
+    const batchResults = await Promise.all(batch.map((row) => executeEnsureGroupTokensForAccount(row)));
+    results.push(...batchResults);
+  }
+
+  const syncedAccountIds = results.filter((item) => item.status === 'synced').map((item) => item.accountId);
+  const coverageRefresh = await refreshCoverageForAccounts(syncedAccountIds);
+  let pricingRefresh: Awaited<ReturnType<typeof buildTokenGroupPricingOverview>> | null = null;
+  try {
+    pricingRefresh = await buildTokenGroupPricingOverview({ refresh: true });
+  } catch (error: any) {
+    console.warn(`[account-tokens] group pricing refresh failed after ensure-all: ${error?.message || error}`);
+  }
+  const summary = {
+    total: results.length,
+    synced: results.filter((item) => item.status === 'synced').length,
+    skipped: results.filter((item) => item.status === 'skipped').length,
+    failed: results.filter((item) => item.status === 'failed').length,
+    groupCount: results.reduce((acc, item) => acc + item.groupCount, 0),
+    missingGroupCount: results.reduce((acc, item) => acc + item.missingGroupCount, 0),
+    created: results.reduce((acc, item) => acc + item.created, 0),
+    disabled: results.reduce((acc, item) => acc + item.disabled, 0),
+    pricingAvailableCount: pricingRefresh?.summary?.pricingAvailableCount || 0,
+    pricingRefreshFailed: pricingRefresh === null,
+  };
+
+  return { summary, results, coverageRefresh, pricingRefresh };
+}
+
 async function refreshCoverageForAccounts(accountIds: number[]) {
   const result = await refreshAccountCoverageBatch({
     accountIds,
@@ -474,6 +766,25 @@ export async function accountTokensRoutes(app: FastifyInstance) {
   app.get<{ Querystring: { accountId?: string } }>('/api/account-tokens', async (request) => {
     const accountId = request.query.accountId ? Number.parseInt(request.query.accountId, 10) : undefined;
     return listTokensWithRelations(Number.isFinite(accountId as number) ? accountId : undefined);
+  });
+
+  app.get<{ Querystring: { refresh?: string | boolean } }>('/api/account-tokens/group-pricing/overview', async (request) => {
+    const refresh = parseOptionalBoolean(request.query.refresh) === true;
+    return buildTokenGroupPricingOverview({ refresh });
+  });
+
+  app.post('/api/account-tokens/group-pricing/sync', async () => syncTokenGroupPricingCache());
+
+  app.get<{ Querystring: { model?: string; sortBy?: string; sortOrder?: string } }>('/api/account-tokens/group-pricing/groups', async (request) => {
+    const sortBy = ['site', 'group', 'ratio', 'modelCount'].includes(String(request.query.sortBy || ''))
+      ? request.query.sortBy as 'site' | 'group' | 'ratio' | 'modelCount'
+      : undefined;
+    const sortOrder = request.query.sortOrder === 'desc' ? 'desc' : 'asc';
+    return listTokenGroupPricingGroups({
+      model: request.query.model,
+      sortBy,
+      sortOrder,
+    });
   });
 
   app.post<{ Body: unknown }>('/api/account-tokens', async (request, reply) => {
@@ -592,6 +903,10 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     }
 
     const platformUserId = resolvePlatformUserId(account.extraConfig, account.username);
+    const createdTokensFromUpstream: Array<{ name: string; key: string; enabled?: boolean; tokenGroup?: string | null }> = [];
+    const rememberCreatedToken = (token: { name: string; key: string; enabled?: boolean; tokenGroup?: string | null }) => {
+      createdTokensFromUpstream.push(token);
+    };
     const createdViaUpstream = await withAccountProxyOverride(
       getProxyUrlFromExtraConfig(account.extraConfig),
       () => adapter.createApiToken(
@@ -607,6 +922,7 @@ export async function accountTokensRoutes(app: FastifyInstance) {
           allowIps: asTrimmedString(body.allowIps),
           modelLimitsEnabled,
           modelLimits: asTrimmedString(body.modelLimits),
+          onCreatedToken: rememberCreatedToken,
         },
       ),
     );
@@ -614,7 +930,56 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       return reply.code(502).send({ success: false, message: '站点创建令牌失败' });
     }
 
-    const syncResult = await executeAccountTokenSync(row);
+    const requestedName = asTrimmedString(body.name);
+    const requestedGroup = asTrimmedString(body.group);
+    const capturedToken = createdTokensFromUpstream.find((token) => !isMaskedTokenValue(token.key));
+    let syncResult: SyncExecutionResult;
+
+    if (capturedToken && !isMaskedTokenValue(capturedToken.key)) {
+      const convergence = await convergeAccountMutation({
+        accountId: account.id,
+        upstreamTokens: [{
+          ...capturedToken,
+          name: requestedName || capturedToken.name,
+          tokenGroup: requestedGroup || capturedToken.tokenGroup || null,
+        }],
+      });
+      syncResult = buildCapturedTokenSyncResult(row, convergence.tokenSync);
+    } else {
+      try {
+        syncResult = await executeAccountTokenSync(row);
+      } catch (error: any) {
+        const refreshedTokens = await fetchUpstreamApiTokens(row, TOKEN_SYNC_TIMEOUT_MS).catch(() => []);
+        const matchedAfterCreate = refreshedTokens.find((token) => {
+          const name = String(token.name || '').trim();
+          const group = normalizeTokenGroupKey(token.tokenGroup || token.name);
+          return (requestedName && name === requestedName) || (requestedGroup && group === requestedGroup);
+        });
+        if (!matchedAfterCreate) {
+          throw error;
+        }
+        const convergence = await convergeAccountMutation({
+          accountId: account.id,
+          upstreamTokens: refreshedTokens,
+        });
+        syncResult = buildCapturedTokenSyncResult(row, convergence.tokenSync);
+      }
+      if (syncResult.status !== 'synced' && /timeout|超时/i.test(String(syncResult.message || syncResult.reason || ''))) {
+        const refreshedTokens = await fetchUpstreamApiTokens(row, TOKEN_SYNC_TIMEOUT_MS).catch(() => []);
+        const matchedAfterCreate = refreshedTokens.find((token) => {
+          const name = String(token.name || '').trim();
+          const group = normalizeTokenGroupKey(token.tokenGroup || token.name);
+          return (requestedName && name === requestedName) || (requestedGroup && group === requestedGroup);
+        });
+        if (matchedAfterCreate) {
+          const convergence = await convergeAccountMutation({
+            accountId: account.id,
+            upstreamTokens: refreshedTokens,
+          });
+          syncResult = buildCapturedTokenSyncResult(row, convergence.tokenSync);
+        }
+      }
+    }
     appendTokenSyncEvent(syncResult);
 
     if (syncResult.status === 'failed') {
@@ -623,7 +988,9 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     if (syncResult.status === 'skipped') {
       return reply.code(502).send({ success: false, message: syncResult.message || '站点未返回可用令牌' });
     }
-    const coverageRefresh = await refreshCoverageForAccounts([account.id]);
+    void refreshCoverageForAccounts([account.id]).catch((error) => {
+      app.log.warn({ err: error, accountId: account.id }, 'refresh account token coverage after create failed');
+    });
 
     const preferred = await db.select().from(schema.accountTokens)
       .where(and(eq(schema.accountTokens.accountId, account.id), eq(schema.accountTokens.isDefault, true)))
@@ -637,7 +1004,7 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       success: true,
       createdViaUpstream: true,
       ...syncResult,
-      coverageRefresh,
+      coverageRefresh: { queued: true },
       token,
     };
   });
@@ -668,15 +1035,28 @@ export async function accountTokensRoutes(app: FastifyInstance) {
 
     if (shouldDeleteUpstream) {
       const platformUserId = resolvePlatformUserId(account.extraConfig, account.username);
-      const upstreamDeleted = await withAccountProxyOverride(
-        getProxyUrlFromExtraConfig(account.extraConfig),
-        () => adapter!.deleteApiToken(
-          site.url,
-          account.accessToken,
-          existing.token,
-          platformUserId,
-        ),
-      );
+      let upstreamDeleted = false;
+      try {
+        upstreamDeleted = await withTimeout(
+          () => withAccountProxyOverride(
+            getProxyUrlFromExtraConfig(account.extraConfig),
+            () => adapter!.deleteApiToken(
+              site.url,
+              account.accessToken,
+              existing.token,
+              platformUserId,
+              {
+                name: existing.name,
+                group: existing.tokenGroup,
+              },
+            ),
+          ),
+          ACCOUNT_TOKEN_UPSTREAM_DELETE_TIMEOUT_MS,
+          `站点删除令牌超时（${Math.round(ACCOUNT_TOKEN_UPSTREAM_DELETE_TIMEOUT_MS / 1000)}s），本地未删除`,
+        );
+      } catch (error: any) {
+        return { success: false, message: error?.message || '站点删除令牌失败，本地未删除' };
+      }
       if (!upstreamDeleted) {
         return { success: false, message: '站点删除令牌失败，本地未删除' };
       }
@@ -907,6 +1287,71 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     };
   });
 
+  app.get<{ Params: { id: string }; Querystring: { refresh?: string | boolean } }>('/api/account-tokens/:id/models', async (request, reply) => {
+    const tokenId = Number.parseInt(request.params.id, 10);
+    if (Number.isNaN(tokenId)) {
+      return reply.code(400).send({ success: false, message: '令牌 ID 无效' });
+    }
+
+    try {
+      const refresh = parseOptionalBoolean(request.query?.refresh);
+      const result = await getAccountTokenModels(tokenId, { refresh: refresh !== false });
+      if (!result) {
+        return reply.code(404).send({ success: false, message: '令牌不存在' });
+      }
+      return {
+        success: true,
+        ...result,
+      };
+    } catch (error: any) {
+      return reply.code(502).send({
+        success: false,
+        message: error?.message || '拉取令牌模型失败',
+      });
+    }
+  });
+
+  app.post<{ Body: unknown }>('/api/account-tokens/models/test', async (request, reply) => {
+    const body = (request.body || {}) as Record<string, unknown>;
+    const model = typeof body.model === 'string' ? body.model.trim() : '';
+    const tokenIds = Array.isArray(body.tokenIds)
+      ? body.tokenIds
+        .map((id) => Number(id))
+        .filter((id) => Number.isInteger(id) && id > 0)
+      : [];
+
+    if (!model) {
+      return reply.code(400).send({ success: false, message: '模型名称不能为空' });
+    }
+    if (tokenIds.length === 0) {
+      return reply.code(400).send({ success: false, message: '请选择需要测试的令牌' });
+    }
+    if (tokenIds.length > 100) {
+      return reply.code(400).send({ success: false, message: '单次最多测试 100 个令牌' });
+    }
+
+    try {
+      const startedAt = Date.now();
+      app.log.info({ model, tokenCount: tokenIds.length }, 'account token model availability test started');
+      const result = await testAccountTokenModelAvailability({ model, tokenIds });
+      app.log.info({
+        model,
+        tokenCount: tokenIds.length,
+        availableCount: result.results.filter((item) => item.available).length,
+        durationMs: Date.now() - startedAt,
+      }, 'account token model availability test completed');
+      return {
+        success: true,
+        ...result,
+      };
+    } catch (error: any) {
+      return reply.code(502).send({
+        success: false,
+        message: error?.message || '测试令牌可用性失败',
+      });
+    }
+  });
+
   app.get<{ Params: { accountId: string } }>('/api/account-tokens/groups/:accountId', async (request, reply) => {
     const accountId = Number.parseInt(request.params.accountId, 10);
     if (Number.isNaN(accountId)) {
@@ -1043,6 +1488,51 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       message: reused
         ? '令牌同步任务执行中，请稍后查看程序日志'
         : '已开始全部账号令牌同步，请稍后查看程序日志',
+    });
+  });
+
+  app.post<{ Body: unknown }>('/api/account-tokens/groups/ensure-all', async (request, reply) => {
+    const parsedBody = parseAccountTokenSyncAllPayload(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({ success: false, message: parsedBody.error });
+    }
+
+    if (parsedBody.data.wait) {
+      const ensureResult = await executeEnsureGroupTokensAllAccounts();
+      return { success: true, ...ensureResult };
+    }
+
+    const { task, reused } = startBackgroundTask(
+      {
+        type: 'token',
+        title: '获取全部账号分组并补齐令牌',
+        dedupeKey: 'ensure-all-account-group-tokens',
+        notifyOnFailure: true,
+        successTitle: (currentTask) => {
+          const summary = (currentTask.result as any)?.summary;
+          if (!summary) return '获取全部账号分组已完成';
+          return `获取全部账号分组已完成（补齐${summary.created}/禁用${summary.disabled}/失败${summary.failed}）`;
+        },
+        failureTitle: () => '获取全部账号分组失败',
+        successMessage: (currentTask) => {
+          const summary = (currentTask.result as any)?.summary;
+          if (!summary) return '全部账号分组补齐任务已完成';
+          return `全部账号分组补齐完成：成功 ${summary.synced}，跳过 ${summary.skipped}，失败 ${summary.failed}，补齐令牌 ${summary.created}，禁用失效令牌 ${summary.disabled}`;
+        },
+        failureMessage: (currentTask) => `全部账号分组补齐失败：${currentTask.error || 'unknown error'}`,
+      },
+      async () => executeEnsureGroupTokensAllAccounts(),
+    );
+
+    return reply.code(202).send({
+      success: true,
+      queued: true,
+      reused,
+      jobId: task.id,
+      status: task.status,
+      message: reused
+        ? '账号分组补齐任务执行中，请稍后查看程序日志'
+        : '已开始获取全部账号分组并补齐令牌，请稍后查看程序日志',
     });
   });
 
