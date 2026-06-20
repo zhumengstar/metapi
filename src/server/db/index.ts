@@ -27,6 +27,7 @@ const TABLES_WITH_NUMERIC_ID = new Set([
   'sites',
   'accounts',
   'account_tokens',
+  'token_group_pricing',
   'checkin_logs',
   'model_availability',
   'token_model_availability',

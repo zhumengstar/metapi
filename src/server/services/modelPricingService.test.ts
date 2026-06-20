@@ -179,6 +179,58 @@ describe('modelPricingService', () => {
     expect(cost).toBe(0.00372);
   });
 
+  it('uses upstream ratios for GPT models when upstream pricing is available', () => {
+    const model: PricingModel = {
+      modelName: 'gpt-5.5',
+      quotaType: 0,
+      modelRatio: 2,
+      completionRatio: 3,
+      cacheRatio: 0.2,
+      cacheCreationRatio: 1.5,
+      modelPrice: null,
+      enableGroups: ['default'],
+    };
+
+    const detail = calculateModelUsageBreakdown(
+      model,
+      {
+        promptTokens: 1_565,
+        completionTokens: 577,
+        totalTokens: 2_142,
+        cacheReadTokens: 500,
+        cacheCreationTokens: 100,
+        promptTokensIncludeCache: true,
+      },
+      { default: 1 },
+    );
+
+    expect(detail).toMatchObject({
+      usage: {
+        billablePromptTokens: 965,
+        cacheReadTokens: 500,
+        cacheCreationTokens: 100,
+      },
+      pricing: {
+        modelRatio: 2,
+        completionRatio: 3,
+        cacheRatio: 0.2,
+        cacheCreationRatio: 1.5,
+        groupRatio: 1,
+      },
+      breakdown: {
+        inputPerMillion: 4,
+        outputPerMillion: 12,
+        cacheReadPerMillion: 0.8,
+        cacheCreationPerMillion: 6,
+        inputCost: 0.00386,
+        outputCost: 0.006924,
+        cacheReadCost: 0.0004,
+        cacheCreationCost: 0.0006,
+        totalCost: 0.011784,
+      },
+    });
+  });
+
   it('uses platform-specific fallback token divisor', () => {
     expect(fallbackTokenCost(1500, 'new-api')).toBe(0.003);
     expect(fallbackTokenCost(1500, 'veloera')).toBe(0.0015);

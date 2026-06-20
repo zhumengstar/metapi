@@ -103,6 +103,29 @@ export const accountTokens = sqliteTable('account_tokens', {
   enabledIdx: index('account_tokens_enabled_idx').on(table.enabled),
 }));
 
+export const tokenGroupPricing = sqliteTable('token_group_pricing', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  siteId: integer('site_id').notNull().references(() => sites.id, { onDelete: 'cascade' }),
+  accountId: integer('account_id').references(() => accounts.id, { onDelete: 'cascade' }),
+  sourceKey: text('source_key').notNull(),
+  group: text('group').notNull(),
+  groupName: text('group_name'),
+  description: text('description'),
+  ratio: real('ratio').notNull().default(1),
+  source: text('source').notNull().default('upstream'),
+  modelCount: integer('model_count').notNull().default(0),
+  pricingAvailable: integer('pricing_available', { mode: 'boolean' }).notNull().default(false),
+  lastError: text('last_error'),
+  refreshedAt: text('refreshed_at').default(sql`(datetime('now'))`),
+  createdAt: text('created_at').default(sql`(datetime('now'))`),
+  updatedAt: text('updated_at').default(sql`(datetime('now'))`),
+}, (table) => ({
+  sourceGroupUnique: uniqueIndex('token_group_pricing_source_group_unique').on(table.siteId, table.sourceKey, table.group),
+  siteIdIdx: index('token_group_pricing_site_id_idx').on(table.siteId),
+  accountIdIdx: index('token_group_pricing_account_id_idx').on(table.accountId),
+  groupIdx: index('token_group_pricing_group_idx').on(table.group),
+}));
+
 export const checkinLogs = sqliteTable('checkin_logs', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   accountId: integer('account_id').notNull().references(() => accounts.id, { onDelete: 'cascade' }),

@@ -17,6 +17,34 @@ const ROUTING_REFERENCE_USAGE = {
   totalTokens: 1_000_000,
 };
 
+type OfficialTokenPricing = {
+  aliases: string[];
+  inputPerMillion: number;
+  cachedInputPerMillion: number;
+  outputPerMillion: number;
+};
+
+const OPENAI_OFFICIAL_TOKEN_PRICING: OfficialTokenPricing[] = [
+  {
+    aliases: ['gpt-5.4-mini'],
+    inputPerMillion: 0.75,
+    cachedInputPerMillion: 0.075,
+    outputPerMillion: 4.5,
+  },
+  {
+    aliases: ['gpt-5.4'],
+    inputPerMillion: 2.5,
+    cachedInputPerMillion: 0.25,
+    outputPerMillion: 15,
+  },
+  {
+    aliases: ['gpt-5.5'],
+    inputPerMillion: 5,
+    cachedInputPerMillion: 0.5,
+    outputPerMillion: 30,
+  },
+];
+
 export interface PricingModel {
   modelName: string;
   quotaType: number;
@@ -79,7 +107,7 @@ export interface EstimateProxyCostInput {
   billingPricingOverride?: ProxyBillingPricingOverride | null;
 }
 
-interface ModelGroupPricing {
+export interface ModelGroupPricing {
   quotaType: number;
   inputPerMillion?: number;
   outputPerMillion?: number;
@@ -90,7 +118,7 @@ interface ModelGroupPricing {
   perCallTotal?: number;
 }
 
-interface ModelPricingCatalogEntry {
+export interface ModelPricingCatalogEntry {
   modelName: string;
   quotaType: number;
   modelDescription: string | null;
@@ -101,7 +129,7 @@ interface ModelPricingCatalogEntry {
   groupPricing: Record<string, ModelGroupPricing>;
 }
 
-interface ModelPricingCatalog {
+export interface ModelPricingCatalog {
   models: ModelPricingCatalogEntry[];
   groupRatio: Record<string, number>;
 }
@@ -201,6 +229,27 @@ function normalizeStringArray(raw: unknown): string[] {
   return [];
 }
 
+function normalizeGroupList(raw: unknown): string[] {
+  if (Array.isArray(raw)) {
+    return raw
+      .map((item) => {
+        if (item && typeof item === 'object') {
+          return String((item as any).group || (item as any).name || (item as any).id || '').trim();
+        }
+        return String(item || '').trim();
+      })
+      .filter(Boolean);
+  }
+
+  if (raw && typeof raw === 'object') {
+    return Object.keys(raw as Record<string, unknown>)
+      .map((key) => key.trim())
+      .filter(Boolean);
+  }
+
+  return normalizeStringArray(raw);
+}
+
 function normalizeRatio(value: unknown, fallback: number): number {
   const ratio = toNumber(value, Number.NaN);
   if (Number.isFinite(ratio) && ratio >= 0) return ratio;
@@ -230,10 +279,14 @@ function normalizePricingModels(rawModels: unknown[]): Map<string, PricingModel>
         ?? (raw as any).createCacheRatio,
       1,
     );
-    const enableGroupsRaw = (raw as any).enable_groups;
-    const enableGroups = Array.isArray(enableGroupsRaw)
-      ? enableGroupsRaw.map((item: unknown) => String(item || '').trim()).filter(Boolean)
-      : [DEFAULT_GROUP];
+    const enableGroups = normalizeGroupList(
+      (raw as any).enable_groups
+      ?? (raw as any).enableGroups
+      ?? (raw as any).groups
+      ?? (raw as any).group
+      ?? (raw as any).group_name
+      ?? (raw as any).groupName,
+    );
     const modelDescriptionRaw = (raw as any).model_description;
     const modelDescription = typeof modelDescriptionRaw === 'string'
       ? (modelDescriptionRaw.trim() || null)
@@ -421,6 +474,65 @@ function getCacheKey(input: EstimateProxyCostInput): string {
 
 function normalizeModelKey(modelName: string): string {
   return modelName.trim().toLowerCase();
+}
+
+function normalizeOfficialModelKey(modelName: string): string {
+  return normalizeModelKey(modelName)
+    .replace(/^openai\//, '')
+    .replace(/^openai:/, '');
+}
+
+function resolveOpenAiOfficialTokenPricing(modelName: string): OfficialTokenPricing | null {
+  const normalized = normalizeOfficialModelKey(modelName);
+  for (const pricing of OPENAI_OFFICIAL_TOKEN_PRICING) {
+    if (pricing.aliases.some((alias) => normalized === alias || normalized.startsWith(`${alias}-`))) {
+      return pricing;
+    }
+  }
+  return null;
+}
+
+function buildOpenAiOfficialFallbackModel(modelName: string): { model: PricingModel; groupRatio: Record<string, number> } | null {
+  const pricing = resolveOpenAiOfficialTokenPricing(modelName);
+  if (!pricing) return null;
+
+  const modelRatio = pricing.inputPerMillion / 2;
+  const completionRatio = pricing.inputPerMillion > 0
+    ? pricing.outputPerMillion / pricing.inputPerMillion
+    : 1;
+  const cacheRatio = pricing.inputPerMillion > 0
+    ? pricing.cachedInputPerMillion / pricing.inputPerMillion
+    : 1;
+
+  return {
+    model: {
+      modelName,
+      quotaType: 0,
+      modelRatio,
+      completionRatio,
+      cacheRatio,
+      cacheCreationRatio: 1,
+      modelPrice: null,
+      enableGroups: [DEFAULT_GROUP],
+    },
+    groupRatio: { [DEFAULT_GROUP]: 1 },
+  };
+}
+
+function calculateOpenAiOfficialFallbackCost(
+  modelName: string,
+  usage: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    cacheReadTokens?: number;
+    cacheCreationTokens?: number;
+    promptTokensIncludeCache?: boolean | null;
+  },
+): number | null {
+  const fallback = buildOpenAiOfficialFallbackModel(modelName);
+  if (!fallback) return null;
+  return calculateModelUsageCost(fallback.model, usage, fallback.groupRatio);
 }
 
 function buildRoutingReferenceCostMap(data: PricingData): Map<string, number> {
@@ -786,6 +898,19 @@ export async function refreshModelPricingCatalog(input: EstimateProxyCostInput):
   return buildModelPricingCatalogFromData(pricingData);
 }
 
+export function listCatalogModelsForGroup(catalog: ModelPricingCatalog | null, group: string): string[] {
+  if (!catalog) return [];
+  const normalizedGroup = String(group || DEFAULT_GROUP).trim() || DEFAULT_GROUP;
+  const groupKey = normalizedGroup.toLowerCase();
+  return catalog.models
+    .filter((model) => {
+      if (model.groupPricing[normalizedGroup]) return true;
+      return Object.keys(model.groupPricing).some((candidate) => candidate.toLowerCase() === groupKey);
+    })
+    .map((model) => model.modelName)
+    .sort((a, b) => a.localeCompare(b));
+}
+
 export function fallbackTokenCost(totalTokens: number, platform: string): number {
   const divisor = platform === 'veloera' ? 1_000_000 : 500_000;
   return roundCost(toPositiveInt(totalTokens) / divisor);
@@ -812,12 +937,14 @@ export async function estimateProxyCost(input: EstimateProxyCostInput): Promise<
 
     const pricingData = await getPricingDataCached(input);
     if (!pricingData) {
-      return fallbackTokenCost(totalTokens, input.site.platform);
+      return calculateOpenAiOfficialFallbackCost(input.modelName, usage)
+        ?? fallbackTokenCost(totalTokens, input.site.platform);
     }
 
     const model = resolveModel(input.modelName, pricingData);
     if (!model) {
-      return fallbackTokenCost(totalTokens, input.site.platform);
+      return calculateOpenAiOfficialFallbackCost(input.modelName, usage)
+        ?? fallbackTokenCost(totalTokens, input.site.platform);
     }
 
     return calculateModelUsageCost(model, usage, pricingData.groupRatio);
@@ -857,10 +984,19 @@ export async function buildProxyBillingDetails(input: EstimateProxyCostInput): P
     }
 
     const pricingData = await getPricingDataCached(input);
-    if (!pricingData) return null;
+    if (!pricingData) {
+      const fallback = buildOpenAiOfficialFallbackModel(input.modelName);
+      if (!fallback) return null;
+      return calculateModelUsageBreakdown(fallback.model, usage, fallback.groupRatio);
+    }
 
     const model = resolveModel(input.modelName, pricingData);
-    if (!model || model.quotaType === 1) return null;
+    if (!model) {
+      const fallback = buildOpenAiOfficialFallbackModel(input.modelName);
+      if (!fallback) return null;
+      return calculateModelUsageBreakdown(fallback.model, usage, fallback.groupRatio);
+    }
+    if (model.quotaType === 1) return null;
 
     return calculateModelUsageBreakdown(model, usage, pricingData.groupRatio);
   } catch {

@@ -183,6 +183,13 @@
       "when": 1776944000000,
       "tag": "0026_site_probe_latency_threshold",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "6",
+      "when": 1781860400000,
+      "tag": "0027_token_group_pricing_cache",
+      "breakpoints": true
     }
   ]
 }

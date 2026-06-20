@@ -2116,6 +2116,100 @@
         }
       }
     },
+    "token_group_pricing": {
+      "columns": {
+        "id": {
+          "logicalType": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKey": true
+        },
+        "site_id": {
+          "logicalType": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "account_id": {
+          "logicalType": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "source_key": {
+          "logicalType": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "group": {
+          "logicalType": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "group_name": {
+          "logicalType": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "description": {
+          "logicalType": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "ratio": {
+          "logicalType": "real",
+          "notNull": true,
+          "defaultValue": "1",
+          "primaryKey": false
+        },
+        "source": {
+          "logicalType": "text",
+          "notNull": true,
+          "defaultValue": "'upstream'",
+          "primaryKey": false
+        },
+        "model_count": {
+          "logicalType": "integer",
+          "notNull": true,
+          "defaultValue": "0",
+          "primaryKey": false
+        },
+        "pricing_available": {
+          "logicalType": "boolean",
+          "notNull": true,
+          "defaultValue": "false",
+          "primaryKey": false
+        },
+        "last_error": {
+          "logicalType": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "refreshed_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": "datetime('now')",
+          "primaryKey": false
+        },
+        "created_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": "datetime('now')",
+          "primaryKey": false
+        },
+        "updated_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": "datetime('now')",
+          "primaryKey": false
+        }
+      }
+    },
     "token_model_availability": {
       "columns": {
         "id": {
@@ -2901,6 +2995,40 @@
       "unique": false
     },
     {
+      "name": "token_group_pricing_account_id_idx",
+      "table": "token_group_pricing",
+      "columns": [
+        "account_id"
+      ],
+      "unique": false
+    },
+    {
+      "name": "token_group_pricing_group_idx",
+      "table": "token_group_pricing",
+      "columns": [
+        "group"
+      ],
+      "unique": false
+    },
+    {
+      "name": "token_group_pricing_site_id_idx",
+      "table": "token_group_pricing",
+      "columns": [
+        "site_id"
+      ],
+      "unique": false
+    },
+    {
+      "name": "token_group_pricing_source_group_unique",
+      "table": "token_group_pricing",
+      "columns": [
+        "site_id",
+        "source_key",
+        "group"
+      ],
+      "unique": true
+    },
+    {
       "name": "token_model_availability_available_idx",
       "table": "token_model_availability",
       "columns": [
@@ -3075,6 +3203,15 @@
       "columns": [
         "platform",
         "url"
+      ]
+    },
+    {
+      "name": "token_group_pricing_source_group_unique",
+      "table": "token_group_pricing",
+      "columns": [
+        "site_id",
+        "source_key",
+        "group"
       ]
     },
     {
@@ -3287,6 +3424,28 @@
     },
     {
       "table": "site_hour_usage",
+      "columns": [
+        "site_id"
+      ],
+      "referencedTable": "sites",
+      "referencedColumns": [
+        "id"
+      ],
+      "onDelete": "CASCADE"
+    },
+    {
+      "table": "token_group_pricing",
+      "columns": [
+        "account_id"
+      ],
+      "referencedTable": "accounts",
+      "referencedColumns": [
+        "id"
+      ],
+      "onDelete": "CASCADE"
+    },
+    {
+      "table": "token_group_pricing",
       "columns": [
         "site_id"
       ],

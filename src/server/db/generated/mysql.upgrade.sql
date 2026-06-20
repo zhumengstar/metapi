@@ -1,1 +1,5 @@
--- no schema changes detected for mysql
+CREATE TABLE IF NOT EXISTS `token_group_pricing` (`id` INT AUTO_INCREMENT NOT NULL PRIMARY KEY, `site_id` INT NOT NULL, `account_id` INT, `source_key` TEXT NOT NULL, `group` TEXT NOT NULL, `group_name` TEXT, `description` TEXT, `ratio` DOUBLE NOT NULL DEFAULT 1, `source` VARCHAR(191) NOT NULL DEFAULT 'upstream', `model_count` INT NOT NULL DEFAULT 0, `pricing_available` BOOLEAN NOT NULL DEFAULT false, `last_error` TEXT, `refreshed_at` VARCHAR(191) DEFAULT (DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s')), `created_at` VARCHAR(191) DEFAULT (DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s')), `updated_at` VARCHAR(191) DEFAULT (DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s')), FOREIGN KEY (`account_id`) REFERENCES `accounts`(`id`) ON DELETE CASCADE, FOREIGN KEY (`site_id`) REFERENCES `sites`(`id`) ON DELETE CASCADE);
+CREATE UNIQUE INDEX `token_group_pricing_source_group_unique` ON `token_group_pricing` (`site_id`, `source_key`(191), `group`(191));
+CREATE INDEX `token_group_pricing_account_id_idx` ON `token_group_pricing` (`account_id`);
+CREATE INDEX `token_group_pricing_group_idx` ON `token_group_pricing` (`group`(191));
+CREATE INDEX `token_group_pricing_site_id_idx` ON `token_group_pricing` (`site_id`);
