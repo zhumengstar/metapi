@@ -719,6 +719,7 @@ describe('Sub2ApiAdapter', () => {
           const body = JSON.parse(rawBody || '{}');
           expect(body.name).toBe('metapi-e2e');
           expect(body.group_id).toBe(8);
+          expect(body.groupId).toBe(8);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
             code: 0,
@@ -737,6 +738,52 @@ describe('Sub2ApiAdapter', () => {
     });
 
     const created = await adapter.createApiToken(baseUrl, 'jwt-token', undefined, { name: 'metapi-e2e', group: '生图' });
+    expect(created).toBe(true);
+  });
+
+  it('normalizes group name when creating sub2api api key', async () => {
+    await startServer((req, res) => {
+      if (req.url === '/api/v1/groups/available') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          code: 0,
+          message: 'success',
+          data: [
+            { id: 3, name: 'pro' },
+            { id: 8, name: '生图（1k）' },
+          ],
+        }));
+        return;
+      }
+      if (req.url === '/api/v1/keys' && req.method === 'POST') {
+        let rawBody = '';
+        req.on('data', (chunk) => { rawBody += chunk; });
+        req.on('end', () => {
+          const body = JSON.parse(rawBody || '{}');
+          expect(body.name).toBe('metapi-e2e');
+          expect(body.group_id).toBe(8);
+          expect(body.groupId).toBe(8);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            code: 0,
+            message: 'success',
+            data: {
+              id: 1,
+              key: 'sk-created',
+              name: body.name,
+              group_id: body.group_id,
+            },
+          }));
+        });
+        return;
+      }
+      res.writeHead(404).end();
+    });
+
+    const created = await adapter.createApiToken(baseUrl, 'jwt-token', undefined, {
+      name: 'metapi-e2e',
+      group: '生图-1k',
+    });
     expect(created).toBe(true);
   });
 

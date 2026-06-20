@@ -10,6 +10,7 @@ import {
   UserInfo,
 } from './base.js';
 import { stripTrailingSlashes } from '../urlNormalization.js';
+import { normalizeTokenGroupLookupKey } from '../tokenGroupNames.js';
 
 function normalizeBaseUrl(baseUrl: string): string {
   return stripTrailingSlashes(baseUrl || '');
@@ -437,7 +438,15 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
 
     const normalize = (value: string) => value.trim().toLowerCase();
     const target = normalize(normalizedGroupName);
-    const group = (await this.listGroupEntries(baseUrl, accessToken)).find((item) => normalize(item.name) === target);
+    const groups = await this.listGroupEntries(baseUrl, accessToken);
+    const exactGroup = groups.find((item) => normalize(item.name) === target);
+    if (exactGroup?.id) return exactGroup.id;
+
+    const targetLookupKey = normalizeTokenGroupLookupKey(normalizedGroupName);
+    const group = groups.find((item) => {
+      const lookupKey = normalizeTokenGroupLookupKey(item.name);
+      return !!lookupKey && lookupKey === targetLookupKey;
+    });
     return group?.id || null;
   }
 
@@ -896,6 +905,7 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
     }
     if (groupId) {
       payload.group_id = groupId;
+      payload.groupId = groupId;
     }
 
     const expiresInDays = this.resolveExpiresInDays(options?.expiredTime);
