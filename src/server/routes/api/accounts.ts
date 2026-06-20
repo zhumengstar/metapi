@@ -1514,6 +1514,41 @@ export async function accountsRoutes(app: FastifyInstance) {
         });
       }
 
+      const wantsAutoReloginPatch =
+        Object.prototype.hasOwnProperty.call(body, "loginUsername") ||
+        Object.prototype.hasOwnProperty.call(body, "loginPassword");
+      if (wantsAutoReloginPatch) {
+        const baseExtraConfig =
+          typeof updates.extraConfig === "string"
+            ? updates.extraConfig
+            : account.extraConfig;
+        const loginUsername = Object.prototype.hasOwnProperty.call(
+          body,
+          "loginUsername",
+        )
+          ? String(body.loginUsername || "").trim()
+          : typeof updates.username === "string"
+            ? updates.username.trim()
+            : account.username || "";
+        const loginPassword = Object.prototype.hasOwnProperty.call(
+          body,
+          "loginPassword",
+        )
+          ? String(body.loginPassword || "")
+          : "";
+
+        updates.extraConfig = mergeAccountExtraConfig(baseExtraConfig, {
+          autoRelogin:
+            loginUsername && loginPassword
+              ? {
+                  username: loginUsername,
+                  passwordCipher: encryptAccountPassword(loginPassword),
+                  updatedAt: new Date().toISOString(),
+                }
+              : undefined,
+        });
+      }
+
       const nextAccessToken =
         typeof updates.accessToken === "string"
           ? updates.accessToken

@@ -18,6 +18,8 @@ const accountCreatePayloadSchema = z.object({
 
 const accountUpdatePayloadSchema = z.object({
   username: z.string().optional(),
+  loginUsername: z.union([z.string(), z.null()]).optional(),
+  loginPassword: z.union([z.string(), z.null()]).optional(),
   accessToken: z.string().optional(),
   apiToken: z.union([z.string(), z.null()]).optional(),
   status: z.string().optional(),
@@ -89,6 +91,12 @@ function formatAccountsPayloadError(error: z.ZodError): string {
   }
   if (firstPath === 'username') {
     return 'Invalid username. Expected string.';
+  }
+  if (firstPath === 'loginUsername') {
+    return 'Invalid loginUsername. Expected string or null.';
+  }
+  if (firstPath === 'loginPassword') {
+    return 'Invalid loginPassword. Expected string or null.';
   }
   if (firstPath === 'password') {
     return 'Invalid password. Expected string.';

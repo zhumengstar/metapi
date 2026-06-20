@@ -2,9 +2,12 @@ import { and, eq, gte, lt, sql } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
 import {
   getCredentialModeFromExtraConfig,
+  getAccountCacheUsageStats,
+  getAutoReloginConfig,
   hasOauthProvider,
   type AccountCredentialMode,
 } from "./accountExtraConfig.js";
+import { decryptAccountPassword } from "./accountCredentialService.js";
 import {
   buildRuntimeHealthForAccount,
   type RuntimeHealthInfo,
@@ -28,8 +31,15 @@ export type AccountOverviewRow = typeof schema.accounts.$inferSelect & {
   site: typeof schema.sites.$inferSelect;
   credentialMode: AccountCredentialMode;
   capabilities: AccountCapabilities;
+  loginCredential: {
+    username: string | null;
+    password: string | null;
+    available: boolean;
+  };
   todaySpend: number;
   todayReward: number;
+  cacheReadTokens: number;
+  cacheHitRate: number | null;
   runtimeHealth: RuntimeHealthInfo;
 };
 
@@ -184,11 +194,25 @@ async function loadAccountsSnapshotPayload(): Promise<AccountsSnapshotPayload> {
     accounts: rows.map((row) => {
       const credentialMode = resolveStoredCredentialMode(row.accounts);
       const capabilities = buildCapabilitiesForAccount(row.accounts);
+      const cacheStats = getAccountCacheUsageStats(row.accounts.extraConfig);
+      const relogin = getAutoReloginConfig(row.accounts.extraConfig);
+      const loginPassword = relogin?.passwordCipher
+        ? decryptAccountPassword(relogin.passwordCipher)
+        : null;
+      const cacheInputTokens = cacheStats.cacheReadTokens + cacheStats.promptTokens;
+      const cacheHitRate = cacheInputTokens > 0
+        ? Math.round((cacheStats.cacheReadTokens / cacheInputTokens) * 10_000) / 100
+        : null;
       return {
         ...row.accounts,
         site: row.sites,
         credentialMode,
         capabilities,
+        loginCredential: {
+          username: relogin?.username || row.accounts.username || null,
+          password: loginPassword || null,
+          available: !!(relogin?.username && loginPassword),
+        },
         todaySpend:
           Math.round((spendByAccount[row.accounts.id] || 0) * 1_000_000) /
           1_000_000,
@@ -203,6 +227,8 @@ async function loadAccountsSnapshotPayload(): Promise<AccountsSnapshotPayload> {
               extraConfig: row.accounts.extraConfig,
             }) * 1_000_000,
           ) / 1_000_000,
+        cacheReadTokens: cacheStats.cacheReadTokens,
+        cacheHitRate,
         runtimeHealth: buildRuntimeHealthForAccount({
           accountStatus: row.accounts.status,
           siteStatus: row.sites.status,

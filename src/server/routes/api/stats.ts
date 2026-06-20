@@ -586,12 +586,40 @@ function mapProxyLogRow(
   },
   options?: { includeBillingDetails?: boolean },
 ) {
+  const readBillingUsageToken = (
+    details: Record<string, unknown> | null,
+    key: string,
+  ): number | null => {
+    const usage = details?.usage;
+    if (!usage || typeof usage !== "object" || Array.isArray(usage)) return null;
+    const raw = (usage as Record<string, unknown>)[key];
+    if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+    if (typeof raw === "string") {
+      const parsed = Number(raw.trim());
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+  };
   const clientMeta = resolveProxyLogClientMeta(row.proxy_logs);
   const legacyMeta = parseProxyLogMessageMeta(
     typeof row.proxy_logs.errorMessage === "string"
       ? row.proxy_logs.errorMessage
       : "",
   );
+  const billingDetails = parseProxyLogBillingDetails(
+    row.proxy_logs.billingDetails,
+  );
+  const cacheReadTokens = readBillingUsageToken(billingDetails, "cacheReadTokens");
+  const promptTokens = typeof row.proxy_logs.promptTokens === "number"
+    ? row.proxy_logs.promptTokens
+    : readBillingUsageToken(billingDetails, "promptTokens");
+  const cacheHitRate =
+    typeof cacheReadTokens === "number"
+    && typeof promptTokens === "number"
+    && cacheReadTokens + promptTokens > 0
+      ? Math.round((cacheReadTokens / (cacheReadTokens + promptTokens)) * 10_000) / 100
+      : null;
+
   return {
     ...row.proxy_logs,
     isStream:
@@ -600,11 +628,11 @@ function mapProxyLogRow(
       typeof row.proxy_logs.firstByteLatencyMs === "number"
         ? row.proxy_logs.firstByteLatencyMs
         : null,
+    cacheReadTokens,
+    cacheHitRate,
     ...(options?.includeBillingDetails
       ? {
-          billingDetails: parseProxyLogBillingDetails(
-            row.proxy_logs.billingDetails,
-          ),
+          billingDetails,
         }
       : {}),
     clientFamily: clientMeta.clientFamily,
@@ -715,7 +743,10 @@ export async function statsRoutes(app: FastifyInstance) {
       ({ fields }) => {
         let query = db
           .select({
-            proxy_logs: fields,
+            proxy_logs: {
+              ...fields,
+              billingDetails: schema.proxyLogs.billingDetails,
+            },
             accounts: {
               username: schema.accounts.username,
             },

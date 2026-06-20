@@ -6,6 +6,8 @@ import {
   hasProxyLogDownstreamApiKeyIdColumn,
   hasProxyLogStreamTimingColumns,
 } from '../db/index.js';
+import { and, eq, isNull } from 'drizzle-orm';
+import { mergeAccountCacheUsageStats } from './accountExtraConfig.js';
 
 export type ProxyLogInsertInput = {
   routeId?: number | null;
@@ -193,6 +195,69 @@ export function parseProxyLogBillingDetails(value: unknown): Record<string, unkn
   }
 }
 
+function readNonNegativeInt(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+    return Math.trunc(value);
+  }
+  if (typeof value === 'string') {
+    const parsed = Number(value.trim());
+    if (Number.isFinite(parsed) && parsed >= 0) return Math.trunc(parsed);
+  }
+  return 0;
+}
+
+function readBillingUsageToken(details: Record<string, unknown> | null, key: string): number {
+  const usage = details?.usage;
+  if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return 0;
+  return readNonNegativeInt((usage as Record<string, unknown>)[key]);
+}
+
+async function accumulateAccountCacheUsage(input: ProxyLogInsertInput): Promise<void> {
+  if (input.accountId == null) return;
+  const billingDetails = parseProxyLogBillingDetails(input.billingDetails);
+  const promptTokens = input.promptTokens != null
+    ? readNonNegativeInt(input.promptTokens)
+    : readBillingUsageToken(billingDetails, 'promptTokens');
+  const cacheReadTokens = readBillingUsageToken(billingDetails, 'cacheReadTokens');
+  if (promptTokens <= 0 && cacheReadTokens <= 0) return;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const rows = await db
+      .select({
+        id: schema.accounts.id,
+        extraConfig: schema.accounts.extraConfig,
+      })
+      .from(schema.accounts)
+      .where(eq(schema.accounts.id, input.accountId))
+      .limit(1)
+      .all();
+    const account = rows[0];
+    if (!account) return;
+
+    const whereClause = account.extraConfig == null
+      ? and(eq(schema.accounts.id, account.id), isNull(schema.accounts.extraConfig))
+      : and(eq(schema.accounts.id, account.id), eq(schema.accounts.extraConfig, account.extraConfig));
+    const result = await db
+      .update(schema.accounts)
+      .set({
+        extraConfig: mergeAccountCacheUsageStats(account.extraConfig, {
+          promptTokens,
+          cacheReadTokens,
+        }),
+        updatedAt: new Date().toISOString(),
+      })
+      .where(whereClause)
+      .run();
+    const changed = typeof result === 'object'
+      && result !== null
+      && 'changes' in result
+      && typeof result.changes === 'number'
+      ? result.changes
+      : 1;
+    if (changed > 0) return;
+  }
+}
+
 function normalizeProxyLogStoreErrorMessage(error: unknown): string {
   const message = typeof error === 'object' && error && 'message' in error
     ? String((error as { message?: unknown }).message || '')
@@ -321,6 +386,7 @@ export async function insertProxyLog(input: ProxyLogInsertInput): Promise<void> 
 
     try {
       await db.insert(schema.proxyLogs).values(values).run();
+      await accumulateAccountCacheUsage(input);
       return;
     } catch (error) {
       if (allowBillingDetails && isMissingBillingDetailsColumnError(error)) {

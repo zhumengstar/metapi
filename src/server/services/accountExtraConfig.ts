@@ -19,6 +19,12 @@ type Sub2ApiSubscriptionConfig = {
   subscriptions?: unknown;
 };
 
+export type AccountCacheUsageStats = {
+  promptTokens: number;
+  cacheReadTokens: number;
+  updatedAt?: string;
+};
+
 export type AccountCredentialMode = 'auto' | 'session' | 'apikey';
 
 const VALID_CREDENTIAL_MODES = new Set<AccountCredentialMode>([
@@ -38,6 +44,7 @@ type AccountExtraConfig = {
   autoRelogin?: AutoReloginConfig;
   sub2apiAuth?: Sub2ApiAuthConfig;
   sub2apiSubscription?: Sub2ApiSubscriptionConfig;
+  cacheUsageStats?: unknown;
   [key: string]: unknown;
 };
 
@@ -104,6 +111,11 @@ function normalizeNonNegativeNumber(raw: unknown): number | undefined {
     }
   }
   return undefined;
+}
+
+function normalizeNonNegativeInteger(raw: unknown): number {
+  const normalized = normalizeNonNegativeNumber(raw);
+  return normalized === undefined ? 0 : Math.trunc(normalized);
 }
 
 function normalizeIsoDateTime(raw: unknown): string | undefined {
@@ -354,6 +366,32 @@ export function mergeAccountExtraConfig(
     ...patch,
   };
   return JSON.stringify(merged);
+}
+
+export function getAccountCacheUsageStats(extraConfig?: ExtraConfigInput): AccountCacheUsageStats {
+  const parsed = parseExtraConfig(extraConfig);
+  const stats = isRecord(parsed.cacheUsageStats) ? parsed.cacheUsageStats : {};
+  return {
+    promptTokens: normalizeNonNegativeInteger(stats.promptTokens),
+    cacheReadTokens: normalizeNonNegativeInteger(stats.cacheReadTokens),
+    updatedAt: normalizeIsoDateTime(stats.updatedAt),
+  };
+}
+
+export function mergeAccountCacheUsageStats(
+  extraConfig: ExtraConfigInput,
+  delta: { promptTokens?: unknown; cacheReadTokens?: unknown },
+): string {
+  const current = getAccountCacheUsageStats(extraConfig);
+  const promptTokens = normalizeNonNegativeInteger(delta.promptTokens);
+  const cacheReadTokens = normalizeNonNegativeInteger(delta.cacheReadTokens);
+  return mergeAccountExtraConfig(extraConfig, {
+    cacheUsageStats: {
+      promptTokens: current.promptTokens + promptTokens,
+      cacheReadTokens: current.cacheReadTokens + cacheReadTokens,
+      updatedAt: new Date().toISOString(),
+    },
+  });
 }
 
 export function getAutoReloginConfig(extraConfig?: ExtraConfigInput): {
