@@ -2248,6 +2248,22 @@ describe('oauth routes', { timeout: 15_000 }, () => {
       }),
     );
 
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      paidTier: {
+        id: 'tier-1',
+        availableCredits: [
+          {
+            creditType: 'GOOGLE_ONE_AI',
+            creditAmount: '25000',
+            minimumCreditAmountForUsage: '50',
+          },
+        ],
+      },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
     const antigravityRefresh = await app.inject({
       method: 'POST',
       url: `/api/oauth/connections/${antigravityAccount.id}/quota/refresh`,
@@ -2256,10 +2272,33 @@ describe('oauth routes', { timeout: 15_000 }, () => {
     expect(antigravityRefresh.json()).toMatchObject({
       success: true,
       quota: expect.objectContaining({
-        status: 'unsupported',
-        providerMessage: 'official quota windows are not exposed for antigravity oauth',
+        status: 'supported',
+        source: 'official',
+        providerMessage: 'antigravity Google One AI credits loaded from loadCodeAssist',
+        windows: {
+          fiveHour: expect.objectContaining({
+            supported: true,
+            used: 25000,
+          }),
+          sevenDay: expect.objectContaining({
+            supported: true,
+            used: 50,
+          }),
+        },
       }),
     });
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      'https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist',
+      expect.objectContaining({
+        method: 'POST',
+        signal: expect.any(AbortSignal),
+        headers: expect.objectContaining({
+          Authorization: 'Bearer oauth-access-token',
+          Accept: '*/*',
+          'User-Agent': 'antigravity/1.21.9 darwin/arm64',
+        }),
+      }),
+    );
   });
 
   it('supports batch quota refresh for oauth connections', async () => {

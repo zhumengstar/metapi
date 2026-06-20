@@ -10,6 +10,11 @@ import {
   getOauthInfoFromAccount,
   type OauthInfo,
 } from './oauthAccount.js';
+import {
+  ANTIGRAVITY_INTERNAL_API_VERSION,
+  ANTIGRAVITY_LOAD_CODE_ASSIST_USER_AGENT,
+  ANTIGRAVITY_UPSTREAM_BASE_URL,
+} from './antigravityProvider.js';
 import { resolveOauthAccountProxyUrl } from './requestProxy.js';
 import type { OauthQuotaSnapshot, OauthQuotaWindowSnapshot } from './quotaTypes.js';
 
@@ -35,6 +40,8 @@ type CodexQuotaHeaderSnapshot = {
   capturedAt: string;
 };
 
+type QuotaHeaderSnapshot = CodexQuotaHeaderSnapshot;
+
 type NormalizedCodexQuotaHeaders = {
   fiveHour?: {
     usedPercent?: number;
@@ -54,6 +61,7 @@ const CODEX_QUOTA_PROBE_USER_AGENT = 'codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64
 const CODEX_QUOTA_PROBE_BETA = 'responses-2025-03-11';
 const CODEX_QUOTA_PROBE_INSTRUCTIONS = 'You are a helpful assistant.';
 const CODEX_QUOTA_PROBE_TIMEOUT_MS = 10_000;
+const ANTIGRAVITY_QUOTA_PROBE_TIMEOUT_MS = 10_000;
 const QUOTA_HEADER_SNAPSHOT_DEDUPE_WINDOW_MS = 30_000;
 const recentQuotaHeaderSnapshotByAccount = new Map<number, {
   fingerprint: string;
@@ -183,6 +191,70 @@ function parseCodexQuotaHeaders(
   return hasAnyValue ? snapshot : null;
 }
 
+function firstHeaderNumber(headers: HeaderSource, keys: string[], integer = false): number | undefined {
+  for (const key of keys) {
+    const value = integer ? asFiniteInteger(getHeaderValue(headers, key)) : asFiniteNumber(getHeaderValue(headers, key));
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return undefined;
+}
+
+function parseAntigravityQuotaHeaders(
+  headers: HeaderSource,
+  capturedAt = new Date().toISOString(),
+): QuotaHeaderSnapshot | null {
+  const snapshot: QuotaHeaderSnapshot = { capturedAt };
+  let hasAnyValue = false;
+
+  const assignField = (
+    field: keyof Omit<QuotaHeaderSnapshot, 'capturedAt'>,
+    value: number | undefined,
+  ) => {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return;
+    snapshot[field] = value as QuotaHeaderSnapshot[keyof Omit<QuotaHeaderSnapshot, 'capturedAt'>];
+    hasAnyValue = true;
+  };
+
+  assignField('primaryUsedPercent', firstHeaderNumber(headers, [
+    'x-antigravity-primary-used-percent',
+    'x-goog-primary-used-percent',
+    'x-ratelimit-primary-used-percent',
+    'x-codex-primary-used-percent',
+  ]));
+  assignField('primaryResetAfterSeconds', firstHeaderNumber(headers, [
+    'x-antigravity-primary-reset-after-seconds',
+    'x-goog-primary-reset-after-seconds',
+    'x-ratelimit-primary-reset-after-seconds',
+    'x-codex-primary-reset-after-seconds',
+  ], true));
+  assignField('primaryWindowMinutes', firstHeaderNumber(headers, [
+    'x-antigravity-primary-window-minutes',
+    'x-goog-primary-window-minutes',
+    'x-ratelimit-primary-window-minutes',
+    'x-codex-primary-window-minutes',
+  ], true));
+  assignField('secondaryUsedPercent', firstHeaderNumber(headers, [
+    'x-antigravity-secondary-used-percent',
+    'x-goog-secondary-used-percent',
+    'x-ratelimit-secondary-used-percent',
+    'x-codex-secondary-used-percent',
+  ]));
+  assignField('secondaryResetAfterSeconds', firstHeaderNumber(headers, [
+    'x-antigravity-secondary-reset-after-seconds',
+    'x-goog-secondary-reset-after-seconds',
+    'x-ratelimit-secondary-reset-after-seconds',
+    'x-codex-secondary-reset-after-seconds',
+  ], true));
+  assignField('secondaryWindowMinutes', firstHeaderNumber(headers, [
+    'x-antigravity-secondary-window-minutes',
+    'x-goog-secondary-window-minutes',
+    'x-ratelimit-secondary-window-minutes',
+    'x-codex-secondary-window-minutes',
+  ], true));
+
+  return hasAnyValue ? snapshot : null;
+}
+
 function normalizeCodexQuotaHeaders(snapshot: CodexQuotaHeaderSnapshot): NormalizedCodexQuotaHeaders | null {
   const primaryWindow = snapshot.primaryWindowMinutes;
   const secondaryWindow = snapshot.secondaryWindowMinutes;
@@ -247,8 +319,10 @@ function normalizeCodexQuotaHeaders(snapshot: CodexQuotaHeaderSnapshot): Normali
   return hasData ? normalized : null;
 }
 
-function buildCodexQuotaHeadersFingerprint(headers: HeaderSource): string | null {
-  const parsed = parseCodexQuotaHeaders(headers, 'fingerprint');
+function buildProviderQuotaHeadersFingerprint(provider: string, headers: HeaderSource): string | null {
+  const parsed = provider === 'antigravity'
+    ? parseAntigravityQuotaHeaders(headers, 'fingerprint')
+    : parseCodexQuotaHeaders(headers, 'fingerprint');
   if (!parsed) return null;
   const { capturedAt: _capturedAt, ...stableFields } = parsed;
   return JSON.stringify(stableFields);
@@ -281,6 +355,37 @@ function buildCodexWindowFromNormalized(input: {
     message: typeof input.windowMinutes === 'number' && Number.isFinite(input.windowMinutes)
       ? `codex ${Math.max(0, Math.trunc(input.windowMinutes))}m window inferred from rate limit headers`
       : 'codex window inferred from rate limit headers',
+  };
+}
+
+function buildWindowFromNormalized(input: {
+  providerLabel: string;
+  usedPercent?: number;
+  resetAfterSeconds?: number;
+  windowMinutes?: number;
+  capturedAt: string;
+}): OauthQuotaWindowSnapshot | null {
+  const usedPercent = typeof input.usedPercent === 'number' && Number.isFinite(input.usedPercent)
+    ? roundPercent(input.usedPercent)
+    : undefined;
+  const resetAt = addSecondsToIso(input.capturedAt, input.resetAfterSeconds);
+  if (usedPercent === undefined && !resetAt) {
+    return null;
+  }
+
+  return {
+    supported: true,
+    ...(usedPercent !== undefined
+      ? {
+        used: usedPercent,
+        limit: 100,
+        remaining: roundPercent(Math.max(0, 100 - usedPercent)),
+      }
+      : {}),
+    ...(resetAt ? { resetAt } : {}),
+    message: typeof input.windowMinutes === 'number' && Number.isFinite(input.windowMinutes)
+      ? `${input.providerLabel} ${Math.max(0, Math.trunc(input.windowMinutes))}m window inferred from rate limit headers`
+      : `${input.providerLabel} window inferred from rate limit headers`,
   };
 }
 
@@ -412,6 +517,51 @@ export function buildCodexQuotaSnapshotFromHeaders(
   };
 }
 
+export function buildAntigravityQuotaSnapshotFromHeaders(
+  oauth: Pick<OauthInfo, 'provider' | 'planType' | 'idToken' | 'quota'>,
+  headers: HeaderSource,
+  capturedAt = new Date().toISOString(),
+): OauthQuotaSnapshot | null {
+  if (oauth.provider !== 'antigravity') return null;
+  const parsedHeaders = parseAntigravityQuotaHeaders(headers, capturedAt);
+  if (!parsedHeaders) return null;
+  const normalizedHeaders = normalizeCodexQuotaHeaders(parsedHeaders);
+  if (!normalizedHeaders) return null;
+
+  const baseSnapshot = buildQuotaSnapshotFromOauthInfo(oauth);
+  const fiveHour = normalizedHeaders.fiveHour
+    ? buildWindowFromNormalized({
+      providerLabel: 'antigravity',
+      ...normalizedHeaders.fiveHour,
+      capturedAt: parsedHeaders.capturedAt,
+    })
+    : null;
+  const sevenDay = normalizedHeaders.sevenDay
+    ? buildWindowFromNormalized({
+      providerLabel: 'antigravity',
+      ...normalizedHeaders.sevenDay,
+      capturedAt: parsedHeaders.capturedAt,
+    })
+    : null;
+  if (!fiveHour && !sevenDay) return null;
+
+  const lastLimitResetAt = fiveHour?.resetAt || sevenDay?.resetAt || baseSnapshot.lastLimitResetAt;
+
+  return {
+    ...baseSnapshot,
+    status: 'supported',
+    source: 'reverse_engineered',
+    lastSyncAt: parsedHeaders.capturedAt,
+    lastError: undefined,
+    providerMessage: 'antigravity usage windows inferred from rate limit response headers',
+    windows: {
+      fiveHour: fiveHour || baseSnapshot.windows.fiveHour,
+      sevenDay: sevenDay || baseSnapshot.windows.sevenDay,
+    },
+    ...(lastLimitResetAt ? { lastLimitResetAt } : {}),
+  };
+}
+
 function buildStoredCodexSnapshot(oauth: Pick<OauthInfo, 'planType' | 'idToken' | 'quota'>): OauthQuotaSnapshot {
   const claims = parseCodexJwtClaims(oauth.idToken);
   const authClaims = claims?.['https://api.openai.com/auth'];
@@ -434,9 +584,36 @@ function buildStoredCodexSnapshot(oauth: Pick<OauthInfo, 'planType' | 'idToken' 
   };
 }
 
+function buildAntigravityPendingWindows(): OauthQuotaSnapshot['windows'] {
+  return {
+    fiveHour: buildUnsupportedWindow('refresh antigravity quota to populate Google One AI credit balance'),
+    sevenDay: buildUnsupportedWindow('refresh antigravity quota to populate Google One AI minimum usage amount'),
+  };
+}
+
+function buildStoredAntigravitySnapshot(oauth: Pick<OauthInfo, 'planType' | 'quota'>): OauthQuotaSnapshot {
+  const storedQuota = normalizeStoredQuotaSnapshot(oauth.quota);
+  const usableStoredQuota = storedQuota?.providerMessage === 'official quota windows are not exposed for antigravity oauth'
+    ? undefined
+    : storedQuota;
+  return {
+    status: usableStoredQuota?.status || 'supported',
+    source: usableStoredQuota?.source || 'reverse_engineered',
+    ...(usableStoredQuota?.lastSyncAt ? { lastSyncAt: usableStoredQuota.lastSyncAt } : {}),
+    ...(usableStoredQuota?.lastError ? { lastError: usableStoredQuota.lastError } : {}),
+    providerMessage: usableStoredQuota?.providerMessage || 'antigravity quota requires loadCodeAssist credit lookup',
+    ...(oauth.planType ? { subscription: { planType: oauth.planType } } : {}),
+    windows: usableStoredQuota?.windows || buildAntigravityPendingWindows(),
+    ...(usableStoredQuota?.lastLimitResetAt ? { lastLimitResetAt: usableStoredQuota.lastLimitResetAt } : {}),
+  };
+}
+
 export function buildQuotaSnapshotFromOauthInfo(oauth: Pick<OauthInfo, 'provider' | 'planType' | 'idToken' | 'quota'>): OauthQuotaSnapshot {
   if (oauth.provider === 'codex') {
     return buildStoredCodexSnapshot(oauth);
+  }
+  if (oauth.provider === 'antigravity') {
+    return buildStoredAntigravitySnapshot(oauth);
   }
   return buildProviderUnsupportedSnapshot(oauth.provider);
 }
@@ -499,9 +676,9 @@ export async function recordOauthQuotaHeadersSnapshot(input: {
   const account = await db.select().from(schema.accounts).where(eq(schema.accounts.id, input.accountId)).get();
   if (!account) return null;
   const oauth = getOauthInfoFromAccount(account);
-  if (!oauth || oauth.provider !== 'codex') return null;
+  if (!oauth || (oauth.provider !== 'codex' && oauth.provider !== 'antigravity')) return null;
 
-  const fingerprint = buildCodexQuotaHeadersFingerprint(input.headers);
+  const fingerprint = buildProviderQuotaHeadersFingerprint(oauth.provider, input.headers);
   if (!fingerprint) return null;
   const nowMs = Date.now();
   const lastRecorded = recentQuotaHeaderSnapshotByAccount.get(input.accountId);
@@ -517,7 +694,9 @@ export async function recordOauthQuotaHeadersSnapshot(input: {
     return buildQuotaSnapshotFromOauthInfo(oauth);
   }
 
-  const snapshot = buildCodexQuotaSnapshotFromHeaders(oauth, input.headers);
+  const snapshot = oauth.provider === 'antigravity'
+    ? buildAntigravityQuotaSnapshotFromHeaders(oauth, input.headers)
+    : buildCodexQuotaSnapshotFromHeaders(oauth, input.headers);
   if (!snapshot) return null;
   pendingQuotaHeaderSnapshotKeys.add(pendingKey);
   try {
@@ -530,6 +709,91 @@ export async function recordOauthQuotaHeadersSnapshot(input: {
   } finally {
     pendingQuotaHeaderSnapshotKeys.delete(pendingKey);
   }
+}
+
+function buildAntigravityQuotaProbeUrl(baseUrl: string): string {
+  return `${baseUrl.replace(/\/+$/, '')}/${ANTIGRAVITY_INTERNAL_API_VERSION}:loadCodeAssist`;
+}
+
+function buildAntigravityQuotaProbeHeaders(accessToken: string): Record<string, string> {
+  return {
+    Authorization: `Bearer ${accessToken.trim()}`,
+    'Content-Type': 'application/json',
+    Accept: '*/*',
+    'User-Agent': ANTIGRAVITY_LOAD_CODE_ASSIST_USER_AGENT,
+  };
+}
+
+function buildAntigravityQuotaProbePayload(): Record<string, unknown> {
+  return {
+    metadata: {
+      ideType: 'ANTIGRAVITY',
+    },
+  };
+}
+
+function parseCreditAmount(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string') return undefined;
+  const parsed = Number.parseFloat(value.trim());
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function extractAntigravityCreditSnapshot(
+  oauth: Pick<OauthInfo, 'provider' | 'planType' | 'idToken' | 'quota'>,
+  payload: unknown,
+  capturedAt: string,
+): OauthQuotaSnapshot | null {
+  if (oauth.provider !== 'antigravity' || !payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return null;
+  }
+  const paidTier = (payload as Record<string, unknown>).paidTier;
+  if (!paidTier || typeof paidTier !== 'object' || Array.isArray(paidTier)) return null;
+  const paidTierRecord = paidTier as Record<string, unknown>;
+  const credits = Array.isArray(paidTierRecord.availableCredits) ? paidTierRecord.availableCredits : [];
+  let selectedCredit: Record<string, unknown> | undefined;
+  for (const rawCredit of credits) {
+    if (!rawCredit || typeof rawCredit !== 'object' || Array.isArray(rawCredit)) continue;
+    const credit = rawCredit as Record<string, unknown>;
+    const creditType = asTrimmedString(credit.creditType);
+    if (creditType === 'GOOGLE_ONE_AI') {
+      selectedCredit = credit;
+      break;
+    }
+    if (!selectedCredit) selectedCredit = credit;
+  }
+  if (!selectedCredit) return null;
+
+  const creditAmount = parseCreditAmount(selectedCredit.creditAmount);
+  const minimumCreditAmount = parseCreditAmount(selectedCredit.minimumCreditAmountForUsage);
+  if (creditAmount === undefined && minimumCreditAmount === undefined) return null;
+
+  const tierId = asTrimmedString(paidTierRecord.id);
+  const creditType = asTrimmedString(selectedCredit.creditType) || 'GOOGLE_ONE_AI';
+  const baseSnapshot = buildQuotaSnapshotFromOauthInfo(oauth);
+  const creditAmountWindow: OauthQuotaWindowSnapshot = {
+    supported: true,
+    ...(creditAmount !== undefined ? { used: creditAmount } : {}),
+    message: `antigravity ${creditType} available credits${tierId ? ` (${tierId})` : ''}`,
+  };
+  const minimumAmountWindow: OauthQuotaWindowSnapshot = {
+    supported: true,
+    ...(minimumCreditAmount !== undefined ? { used: minimumCreditAmount } : {}),
+    message: `antigravity ${creditType} minimum credit amount for usage`,
+  };
+
+  return {
+    ...baseSnapshot,
+    status: 'supported',
+    source: 'official',
+    lastSyncAt: capturedAt,
+    lastError: undefined,
+    providerMessage: 'antigravity Google One AI credits loaded from loadCodeAssist',
+    windows: {
+      fiveHour: creditAmountWindow,
+      sevenDay: minimumAmountWindow,
+    },
+  };
 }
 
 function buildCodexQuotaProbePayload(): Record<string, unknown> {
@@ -645,6 +909,77 @@ async function probeCodexQuotaSnapshot(input: {
   });
 }
 
+async function probeAntigravityQuotaSnapshot(input: {
+  account: typeof schema.accounts.$inferSelect;
+  oauth: OauthInfo;
+  syncedAt: string;
+}): Promise<OauthQuotaSnapshot> {
+  const accessToken = (input.account.accessToken || '').trim();
+  if (!accessToken) {
+    throw new Error('antigravity oauth access token missing');
+  }
+  const proxyUrl = await resolveOauthAccountProxyUrl({
+    siteId: input.account.siteId,
+    extraConfig: input.account.extraConfig,
+  });
+  const requestBody = JSON.stringify(buildAntigravityQuotaProbePayload());
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), ANTIGRAVITY_QUOTA_PROBE_TIMEOUT_MS);
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetch(
+      buildAntigravityQuotaProbeUrl(ANTIGRAVITY_UPSTREAM_BASE_URL),
+      withExplicitProxyRequestInit(proxyUrl, {
+        method: 'POST',
+        headers: buildAntigravityQuotaProbeHeaders(accessToken),
+        body: requestBody,
+        signal: controller.signal,
+      }),
+    );
+  } catch (error) {
+    if (controller.signal.aborted) {
+      return buildQuotaErrorSnapshot({
+        oauth: input.oauth,
+        message: `antigravity quota probe timeout (${Math.round(ANTIGRAVITY_QUOTA_PROBE_TIMEOUT_MS / 1000)}s)`,
+        syncedAt: input.syncedAt,
+      });
+    }
+    return buildQuotaErrorSnapshot({
+      oauth: input.oauth,
+      message: error instanceof Error ? (error.message || error.name) : String(error || 'antigravity quota probe failed'),
+      syncedAt: input.syncedAt,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const text = await response.text().catch(() => '');
+  if (!response.ok) {
+    return buildQuotaErrorSnapshot({
+      oauth: input.oauth,
+      message: text || `antigravity loadCodeAssist quota probe failed with status ${response.status}`,
+      syncedAt: input.syncedAt,
+    });
+  }
+
+  let payload: unknown;
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch {
+    return buildQuotaErrorSnapshot({
+      oauth: input.oauth,
+      message: 'antigravity loadCodeAssist quota response was not valid JSON',
+      syncedAt: input.syncedAt,
+    });
+  }
+  const snapshot = extractAntigravityCreditSnapshot(input.oauth, payload, input.syncedAt);
+  return snapshot || buildQuotaErrorSnapshot({
+    oauth: input.oauth,
+    message: 'antigravity loadCodeAssist response did not expose Google One AI credits',
+    syncedAt: input.syncedAt,
+  });
+}
+
 export async function refreshOauthQuotaSnapshot(accountId: number): Promise<OauthQuotaSnapshot> {
   const account = await db.select().from(schema.accounts).where(eq(schema.accounts.id, accountId)).get();
   if (!account) {
@@ -667,6 +1002,26 @@ export async function refreshOauthQuotaSnapshot(accountId: number): Promise<Oaut
       const message = error instanceof Error
         ? (error.message || error.name)
         : String(error || 'codex quota probe failed');
+      return persistQuotaSnapshot(accountId, buildQuotaErrorSnapshot({
+        oauth,
+        message,
+        syncedAt,
+      }));
+    }
+  }
+  if (oauth.provider === 'antigravity') {
+    const syncedAt = new Date().toISOString();
+    try {
+      const snapshot = await probeAntigravityQuotaSnapshot({
+        account,
+        oauth,
+        syncedAt,
+      });
+      return persistQuotaSnapshot(accountId, snapshot);
+    } catch (error) {
+      const message = error instanceof Error
+        ? (error.message || error.name)
+        : String(error || 'antigravity quota probe failed');
       return persistQuotaSnapshot(accountId, buildQuotaErrorSnapshot({
         oauth,
         message,

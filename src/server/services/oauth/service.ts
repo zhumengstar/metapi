@@ -987,6 +987,13 @@ export async function deleteOauthConnection(accountId: number) {
 }
 
 export async function refreshOauthConnectionQuota(accountId: number) {
+  const account = await db.select().from(schema.accounts)
+    .where(eq(schema.accounts.id, accountId))
+    .get();
+  const oauth = getOauthInfoFromAccount(account);
+  if (oauth?.refreshToken) {
+    await refreshOauthAccessToken(accountId).catch(() => undefined);
+  }
   const quota = await refreshOauthQuotaSnapshot(accountId);
   return { success: true, quota };
 }

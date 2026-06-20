@@ -67,16 +67,42 @@ describe('oauth quota snapshot helpers', () => {
     });
   });
 
-  it('returns unsupported snapshots for non-codex providers', () => {
+  it('returns pending live-probe snapshots for antigravity providers', () => {
     const snapshot = buildQuotaSnapshotFromOauthInfo({
       provider: 'antigravity',
       planType: 'pro',
     });
 
     expect(snapshot).toEqual({
+      status: 'supported',
+      source: 'reverse_engineered',
+      providerMessage: 'antigravity quota requires loadCodeAssist credit lookup',
+      subscription: {
+        planType: 'pro',
+      },
+      windows: {
+        fiveHour: {
+          supported: false,
+          message: 'refresh antigravity quota to populate Google One AI credit balance',
+        },
+        sevenDay: {
+          supported: false,
+          message: 'refresh antigravity quota to populate Google One AI minimum usage amount',
+        },
+      },
+    });
+  });
+
+  it('returns unsupported snapshots for providers without quota support', () => {
+    const snapshot = buildQuotaSnapshotFromOauthInfo({
+      provider: 'claude',
+      planType: 'pro',
+    });
+
+    expect(snapshot).toEqual({
       status: 'unsupported',
       source: 'official',
-      providerMessage: 'official quota windows are not exposed for antigravity oauth',
+      providerMessage: 'official quota windows are not exposed for claude oauth',
       windows: {
         fiveHour: {
           supported: false,
