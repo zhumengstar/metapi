@@ -530,7 +530,11 @@ async function upsertStoredGroupRow(input: {
   sourceKey: string;
 }) {
   const now = new Date().toISOString();
-  const existing = await db.select({ id: schema.tokenGroupPricing.id })
+  const existing = await db.select({
+    id: schema.tokenGroupPricing.id,
+    ratio: schema.tokenGroupPricing.ratio,
+    pricingAvailable: schema.tokenGroupPricing.pricingAvailable,
+  })
     .from(schema.tokenGroupPricing)
     .where(and(
       eq(schema.tokenGroupPricing.siteId, input.row.site.id),
@@ -538,6 +542,13 @@ async function upsertStoredGroupRow(input: {
       eq(schema.tokenGroupPricing.group, input.row.group),
     ))
     .get();
+  const incomingRatio = Number(input.row.ratio);
+  const hasIncomingRatio = input.row.pricingAvailable && Number.isFinite(incomingRatio) && incomingRatio > 0;
+  const existingRatio = Number(existing?.ratio);
+  const canPreserveExistingRatio = existing
+    && isStoredPricingAvailable(existing.pricingAvailable)
+    && Number.isFinite(existingRatio)
+    && existingRatio > 0;
   const values = {
     siteId: input.row.site.id,
     accountId: input.row.account?.id ?? null,
@@ -545,12 +556,10 @@ async function upsertStoredGroupRow(input: {
     group: input.row.group,
     groupName: input.row.groupName || null,
     description: input.row.description || null,
-    ratio: input.row.pricingAvailable && Number.isFinite(input.row.ratio) && Number(input.row.ratio) > 0
-      ? Number(input.row.ratio)
-      : 0,
+    ratio: hasIncomingRatio ? incomingRatio : (canPreserveExistingRatio ? existingRatio : 0),
     source: input.row.groupSource,
     modelCount: input.row.modelCount,
-    pricingAvailable: input.row.ratio !== null && input.row.pricingAvailable,
+    pricingAvailable: hasIncomingRatio || canPreserveExistingRatio,
     lastError: input.row.groupError || null,
     refreshedAt: now,
     updatedAt: now,
