@@ -113,7 +113,7 @@ describe('ProgramLogs status label', () => {
     expect(String(statusBadge.props.className || '')).toContain('badge-success');
   });
 
-  it('does not present historical started events as still running', async () => {
+  it('presents started events as running instead of showing a separate started state', async () => {
     apiMock.getEvents.mockResolvedValue([
       {
         id: 3,
@@ -153,7 +153,7 @@ describe('ProgramLogs status label', () => {
 
     expect(startedRow).toBeTruthy();
     expect(runningRow).toBeTruthy();
-    expect(collectText(startedRow!.findAll((node) => node.type === 'td')[5]).trim()).toBe('已开始');
+    expect(collectText(startedRow!.findAll((node) => node.type === 'td')[5]).trim()).toBe('进行中');
     expect(collectText(runningRow!.findAll((node) => node.type === 'td')[5]).trim()).toBe('进行中');
   });
 });
