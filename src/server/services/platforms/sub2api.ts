@@ -340,6 +340,7 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
         break;
       }
       let picked = name || '';
+      let groupKey: string | null = null;
       if (!picked) {
         const numericCandidates = [
           (item as any).group_id,
@@ -351,6 +352,21 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
           const parsed = Number.parseInt(String(candidate), 10);
           if (Number.isFinite(parsed) && parsed > 0) {
             picked = String(parsed);
+            groupKey = picked;
+            break;
+          }
+        }
+      } else {
+        const numericCandidates = [
+          (item as any).group_id,
+          (item as any).groupId,
+          (item as any).id,
+          (item as any).value,
+        ];
+        for (const candidate of numericCandidates) {
+          const parsed = Number.parseInt(String(candidate), 10);
+          if (Number.isFinite(parsed) && parsed > 0) {
+            groupKey = String(parsed);
             break;
           }
         }
@@ -364,6 +380,7 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
         );
         groups.set(picked, {
           group: picked,
+          ...(groupKey && groupKey !== picked ? { groupKey } : {}),
           ...(ratio !== undefined ? { ratio } : {}),
           ...(name ? { name } : {}),
           ...(typeof (item as any).description === 'string' && (item as any).description.trim()

@@ -322,6 +322,44 @@ describe('account tokens sync routes with site status', () => {
     expect((tokenRows[0] as any).valueStatus).toBe('ready');
   });
 
+  it('shows group ratio for tokens matched by stored Chinese group name aliases', async () => {
+    const { site, account } = await seedAccount({ siteStatus: 'active' });
+    await db.insert(schema.tokenGroupPricing).values({
+      siteId: site.id,
+      accountId: account.id,
+      sourceKey: `account:${account.id}`,
+      group: '2',
+      groupName: '纯pro倍率',
+      ratio: 2.5,
+      source: 'upstream',
+      pricingAvailable: true,
+    }).run();
+    await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: '纯pro倍率',
+      token: 'sk-real-token-1234',
+      source: 'sync',
+      enabled: true,
+      isDefault: true,
+      tokenGroup: '纯pro倍率',
+      valueStatus: 'ready' as any,
+    }).run();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/account-tokens',
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([
+      expect.objectContaining({
+        name: '纯pro倍率',
+        groupRatio: 2.5,
+        groupRatioAvailable: true,
+      }),
+    ]);
+  });
+
   it('removes matching masked_pending placeholders after reusing a ready token', async () => {
     const { account } = await seedAccount({ siteStatus: 'active' });
     const fullToken = 'sk-real-token-1234';

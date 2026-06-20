@@ -81,6 +81,7 @@ export interface SiteAnnouncement {
 
 export interface UserGroupInfo {
   group: string;
+  groupKey?: string | null;
   ratio?: number;
   name?: string | null;
   description?: string | null;

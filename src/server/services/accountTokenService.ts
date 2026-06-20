@@ -579,6 +579,7 @@ export async function listTokensWithRelations(accountId?: number) {
   const pricingRows = await db.select({
     accountId: schema.tokenGroupPricing.accountId,
     group: schema.tokenGroupPricing.group,
+    groupName: schema.tokenGroupPricing.groupName,
     ratio: schema.tokenGroupPricing.ratio,
     pricingAvailable: schema.tokenGroupPricing.pricingAvailable,
   })
@@ -588,9 +589,11 @@ export async function listTokensWithRelations(accountId?: number) {
   for (const row of pricingRows) {
     if (!isStoredPricingAvailable(row.pricingAvailable)) continue;
     const group = normalizeTokenGroup(row.group, null);
+    const groupName = normalizeTokenGroup(row.groupName, null);
     const ratio = Number(row.ratio);
     if (!row.accountId || !group || !Number.isFinite(ratio) || ratio <= 0) continue;
     ratioByAccountAndGroup.set(`${row.accountId}:${group}`, ratio);
+    if (groupName) ratioByAccountAndGroup.set(`${row.accountId}:${groupName}`, ratio);
   }
 
   const tokenModelRows = await db.select({

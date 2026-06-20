@@ -24,6 +24,7 @@ type AccountWithSite = {
 
 type GroupDetail = {
   group: string;
+  groupKey?: string | null;
   ratio?: number;
   name?: string | null;
   description?: string | null;
@@ -214,6 +215,7 @@ function normalizeGroupDetails(details: GroupDetail[]): GroupDetail[] {
     const existing = byGroup.get(group) || { group };
     byGroup.set(group, {
       group,
+      groupKey: typeof item?.groupKey === 'string' && item.groupKey.trim() ? item.groupKey.trim() : existing.groupKey,
       ratio: Number.isFinite(ratio) && ratio > 0 ? Math.round(ratio * 1_000_000) / 1_000_000 : existing.ratio,
       name: typeof item?.name === 'string' && item.name.trim() ? item.name.trim() : existing.name,
       description: typeof item?.description === 'string' && item.description.trim() ? item.description.trim() : existing.description,
@@ -228,6 +230,8 @@ function buildRatioOverride(details: GroupDetail[]): Record<string, number> {
     const value = Number(item.ratio);
     if (Number.isFinite(value) && value > 0) {
       ratio[normalizeGroup(item.group)] = value;
+      if (item.groupKey) ratio[normalizeGroup(item.groupKey)] = value;
+      if (item.name) ratio[normalizeGroup(item.name)] = value;
     }
   }
   return ratio;
@@ -289,11 +293,19 @@ async function fetchPublicSiteGroups(site: SiteRow): Promise<{
   }
 }
 
-function summarizePricing(catalog: ModelPricingCatalog | null, groups: string[], ratioOverride: Record<string, number> = {}) {
+function summarizePricing(
+  catalog: ModelPricingCatalog | null,
+  groups: string[],
+  ratioOverride: Record<string, number> = {},
+  groupAliases: Record<string, string[]> = {},
+) {
   const ratio = { ...(catalog?.groupRatio || {}), ...ratioOverride };
   const groupRatio = groups.reduce<Record<string, number | null>>((acc, group) => {
-    const value = ratio[group];
-    acc[group] = Number.isFinite(value) && value > 0 ? value : null;
+    const candidates = [group, ...(groupAliases[group] || [])].map(normalizeGroup);
+    const value: number | undefined = candidates
+      .map((candidate) => ratio[candidate])
+      .find((candidateRatio): candidateRatio is number => Number.isFinite(candidateRatio) && candidateRatio > 0);
+    acc[group] = value ?? null;
     return acc;
   }, {});
   return {
@@ -358,6 +370,18 @@ function createGroupRowsFromSite(input: {
     modelNames: [],
     tokens: [],
   }));
+}
+
+function buildGroupAliases(details: GroupDetail[]): Record<string, string[]> {
+  const aliases: Record<string, string[]> = {};
+  for (const detail of details) {
+    const group = normalizeGroup(detail.group);
+    const candidates = [detail.groupKey, detail.name]
+      .map((value) => (typeof value === 'string' ? normalizeGroup(value) : ''))
+      .filter((value) => value && value !== group);
+    if (candidates.length > 0) aliases[group] = Array.from(new Set(candidates));
+  }
+  return aliases;
 }
 
 function normalizeStoredSource(value?: string | null): TokenGroupPricingOverviewAccount['groupSource'] {
@@ -893,7 +917,12 @@ export async function buildTokenGroupPricingOverview(options: TokenGroupPricingO
       groups,
       groupSource: groupResult.source,
       groupError: groupResult.error,
-      pricing: summarizePricing(catalog || null, groups, buildRatioOverride(groupResult.details)),
+      pricing: summarizePricing(
+        catalog || null,
+        groups,
+        buildRatioOverride(groupResult.details),
+        buildGroupAliases(groupResult.details),
+      ),
       tokens: accountTokens.sort((a, b) => Number(b.isDefault) - Number(a.isDefault) || a.name.localeCompare(b.name)),
     };
     accounts.push(accountOverview);

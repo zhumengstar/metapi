@@ -15,17 +15,18 @@ vi.mock('./platforms/index.js', () => ({
 vi.mock('./modelPricingService.js', () => ({
   fetchModelPricingCatalog: vi.fn(async () => ({
     models: [],
-    groupRatio: {},
+    groupRatio: mockCatalogGroupRatio,
   })),
   refreshModelPricingCatalog: vi.fn(async () => ({
     models: [],
-    groupRatio: {},
+    groupRatio: mockCatalogGroupRatio,
   })),
   listCatalogModelsForGroup: vi.fn(() => []),
 }));
 
 type DbModule = typeof import('../db/index.js');
 type OverviewModule = typeof import('./tokenGroupPricingOverviewService.js');
+let mockCatalogGroupRatio: Record<string, number> = {};
 
 describe('tokenGroupPricingOverviewService', () => {
   let db: DbModule['db'];
@@ -50,6 +51,7 @@ describe('tokenGroupPricingOverviewService', () => {
 
   beforeEach(async () => {
     getUserGroupDetailsMock.mockReset();
+    mockCatalogGroupRatio = {};
     await db.delete(schema.accountTokens).run();
     await db.delete(schema.tokenGroupPricing).run();
     await db.delete(schema.accounts).run();
@@ -159,6 +161,33 @@ describe('tokenGroupPricingOverviewService', () => {
     expect(storedRow).toMatchObject({
       ratio: 0,
       pricingAvailable: false,
+    });
+  });
+
+  it('uses numeric group aliases to show ratios for Chinese upstream group names', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'sub2api',
+      url: 'https://sub2api.example.com',
+      platform: 'sub2api',
+    }).returning().get();
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'mikoto',
+      accessToken: 'access-token',
+      status: 'active',
+    }).returning().get();
+    mockCatalogGroupRatio = { default: 1, '2': 2.5 };
+    getUserGroupDetailsMock.mockResolvedValue([
+      { group: '纯pro倍率', groupKey: '2', name: '纯pro倍率' },
+    ]);
+
+    const overview = await buildTokenGroupPricingOverview({ refresh: true });
+    const row = overview.groupRows.find((item) => item.account?.id === account.id && item.group === '纯pro倍率');
+
+    expect(row).toMatchObject({
+      ratio: 2.5,
+      pricingAvailable: true,
+      groupName: '纯pro倍率',
     });
   });
 });
