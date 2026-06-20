@@ -1066,7 +1066,7 @@ describe('account tokens sync routes with site status', () => {
     expect((response.json() as { message?: string }).message).toContain('name');
   });
 
-  it('deletes masked_pending placeholders locally without calling upstream delete', async () => {
+  it('keeps masked_pending placeholders locally because upstream deletion cannot be confirmed', async () => {
     const { account } = await seedAccount({ siteStatus: 'active' });
     const token = await db.insert(schema.accountTokens).values({
       accountId: account.id,
@@ -1088,16 +1088,17 @@ describe('account tokens sync routes with site status', () => {
     expect(body.queued).toBe(true);
 
     const task = await waitForBackgroundTaskToReachTerminalState(getBackgroundTask, body.jobId);
-    expect(task?.status).toBe('succeeded');
+    expect(task?.status).toBe('failed');
+    expect(task?.error).toContain('本地未删除');
     expect(deleteApiTokenMock).not.toHaveBeenCalled();
-    const removed = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, token.id)).get();
-    expect(removed).toBeUndefined();
-    expect(task?.logs.some((entry) => entry.message.includes('跳过原站点删除'))).toBe(true);
+    const existing = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, token.id)).get();
+    expect(existing).toBeDefined();
+    expect(task?.logs.some((entry) => entry.message.includes('原站点未删除'))).toBe(true);
     const events = await db.select().from(schema.events).where(eq(schema.events.type, 'token')).all();
     expect(events).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        title: '账号令牌删除成功',
-        message: expect.stringContaining('跳过原站点删除'),
+        title: '账号令牌删除失败',
+        message: expect.stringContaining('原站点未删除'),
         relatedType: 'account_token',
       }),
     ]));

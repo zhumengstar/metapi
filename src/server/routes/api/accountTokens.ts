@@ -179,7 +179,7 @@ function buildTokenDeleteEventMessage(result: AccountTokenDeleteResult): string 
     ? '原站点删除成功'
     : (result.upstreamAttempted
       ? `原站点删除失败：${result.message || '未知错误'}`
-      : `跳过原站点删除：${result.upstreamSkippedReason || '无需删除'}`);
+      : `原站点未删除：${result.upstreamSkippedReason || '未执行'}`);
   const local = result.localDeleted ? '本地删除成功' : '本地未删除';
   const status = result.success ? '删除成功' : `删除失败：${result.message || '未知错误'}`;
   return `${target}: ${status}；${upstream}；${local}`;
@@ -787,51 +787,57 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     } else if (!adapter) {
       upstreamSkippedReason = `不支持的平台: ${site.platform}`;
     }
-    const shouldDeleteUpstream = !upstreamSkippedReason;
-
-    if (shouldDeleteUpstream) {
-      const platformUserId = resolvePlatformUserId(account.extraConfig, account.username);
-      appendDeleteLog(options.taskId, `${tokenLabel} 正在删除原站点令牌`);
-      let upstreamDeleted = false;
-      try {
-        upstreamDeleted = await withTimeout(
-          () => withAccountProxyOverride(
-            getProxyUrlFromExtraConfig(account.extraConfig),
-            () => adapter!.deleteApiToken(
-              site.url,
-              account.accessToken,
-              existing.token,
-              platformUserId,
-            ),
-          ),
-          ACCOUNT_TOKEN_UPSTREAM_DELETE_TIMEOUT_MS,
-          `站点删除令牌超时（${Math.round(ACCOUNT_TOKEN_UPSTREAM_DELETE_TIMEOUT_MS / 1000)}s），本地未删除`,
-        );
-      } catch (error: any) {
-        const message = error?.message || '站点删除令牌失败，本地未删除';
-        appendDeleteLog(options.taskId, `${tokenLabel} 原站点删除失败：${message}`);
-        const result = {
-          ...labeledResult,
-          upstreamAttempted: true,
-          message,
-        };
-        await appendTokenDeleteEvent(result);
-        return result;
-      }
-      if (!upstreamDeleted) {
-        appendDeleteLog(options.taskId, `${tokenLabel} 原站点删除失败：站点删除令牌失败，本地未删除`);
-        const result = {
-          ...labeledResult,
-          upstreamAttempted: true,
-          message: '站点删除令牌失败，本地未删除',
-        };
-        await appendTokenDeleteEvent(result);
-        return result;
-      }
-      appendDeleteLog(options.taskId, `${tokenLabel} 原站点删除成功`);
-    } else {
-      appendDeleteLog(options.taskId, `${tokenLabel} 跳过原站点删除：${upstreamSkippedReason}`);
+    if (upstreamSkippedReason) {
+      const message = `原站点未删除：${upstreamSkippedReason}，本地未删除`;
+      appendDeleteLog(options.taskId, `${tokenLabel} 删除失败：${message}`);
+      const result = {
+        ...labeledResult,
+        upstreamSkippedReason,
+        message,
+      };
+      await appendTokenDeleteEvent(result);
+      return result;
     }
+
+    const platformUserId = resolvePlatformUserId(account.extraConfig, account.username);
+    appendDeleteLog(options.taskId, `${tokenLabel} 正在删除原站点令牌`);
+    let upstreamDeleted = false;
+    try {
+      upstreamDeleted = await withTimeout(
+        () => withAccountProxyOverride(
+          getProxyUrlFromExtraConfig(account.extraConfig),
+          () => adapter!.deleteApiToken(
+            site.url,
+            account.accessToken,
+            existing.token,
+            platformUserId,
+          ),
+        ),
+        ACCOUNT_TOKEN_UPSTREAM_DELETE_TIMEOUT_MS,
+        `站点删除令牌超时（${Math.round(ACCOUNT_TOKEN_UPSTREAM_DELETE_TIMEOUT_MS / 1000)}s），本地未删除`,
+      );
+    } catch (error: any) {
+      const message = error?.message || '站点删除令牌失败，本地未删除';
+      appendDeleteLog(options.taskId, `${tokenLabel} 原站点删除失败：${message}`);
+      const result = {
+        ...labeledResult,
+        upstreamAttempted: true,
+        message,
+      };
+      await appendTokenDeleteEvent(result);
+      return result;
+    }
+    if (!upstreamDeleted) {
+      appendDeleteLog(options.taskId, `${tokenLabel} 原站点删除失败：站点删除令牌失败，本地未删除`);
+      const result = {
+        ...labeledResult,
+        upstreamAttempted: true,
+        message: '站点删除令牌失败，本地未删除',
+      };
+      await appendTokenDeleteEvent(result);
+      return result;
+    }
+    appendDeleteLog(options.taskId, `${tokenLabel} 原站点删除成功`);
 
     await db.delete(schema.accountTokens).where(eq(schema.accountTokens.id, tokenId)).run();
     if (existing.isDefault) {
@@ -842,9 +848,8 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     const result = {
       ...labeledResult,
       success: true,
-      upstreamAttempted: shouldDeleteUpstream,
-      upstreamDeleted: shouldDeleteUpstream,
-      upstreamSkippedReason: upstreamSkippedReason || undefined,
+      upstreamAttempted: true,
+      upstreamDeleted: true,
       localDeleted: true,
     };
     await appendTokenDeleteEvent(result);
