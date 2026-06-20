@@ -29,15 +29,16 @@ ARG HELM_VERSION=v3.18.6
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl tar gzip \
-  && case "$TARGETARCH" in \
-    amd64|arm64) export ARCH="$TARGETARCH" ;; \
+  && BUILD_ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
+  && case "$BUILD_ARCH" in \
+    amd64|arm64) export ARCH="$BUILD_ARCH" ;; \
     arm) \
       if [ "${TARGETVARIANT:-}" = "v7" ]; then \
         export ARCH="arm"; \
       else \
-        echo "Unsupported TARGETARCH/TARGETVARIANT: $TARGETARCH/${TARGETVARIANT:-}" >&2; exit 1; \
+        echo "Unsupported TARGETARCH/TARGETVARIANT: $BUILD_ARCH/${TARGETVARIANT:-}" >&2; exit 1; \
       fi ;; \
-    *) echo "Unsupported TARGETARCH/TARGETVARIANT: $TARGETARCH/${TARGETVARIANT:-}" >&2; exit 1 ;; \
+    *) echo "Unsupported TARGETARCH/TARGETVARIANT: $BUILD_ARCH/${TARGETVARIANT:-}" >&2; exit 1 ;; \
   esac \
   && curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" \
   && chmod +x /usr/local/bin/kubectl \
