@@ -79,6 +79,51 @@ describe('modelPricingService sub2api pricing groups', () => {
     expect(String(fetchMock.mock.calls[1][0])).toBe('https://sub2api.example.com/api/v1/groups/available');
   });
 
+  it('loads sub2api group ratios from available groups when pricing endpoint is unavailable', async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response('not found', {
+        status: 404,
+        headers: { 'content-type': 'text/plain; charset=utf-8' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        code: 0,
+        message: 'success',
+        data: [
+          { id: 2, name: '纯pro通道-VIP-超稳定-专用通道', rate_multiplier: 0.2 },
+          { id: 3, name: '纯PLUS通道-稳定', rate_multiplier: 0.12 },
+          { id: 4, name: 'team渠道-特价组-杀号太厉害 暂停', rate_multiplier: 0.075 },
+        ],
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json; charset=utf-8' },
+      }));
+
+    const catalog = await fetchModelPricingCatalog({
+      site: {
+        id: 9203,
+        url: 'https://sub2api.example.com',
+        platform: 'sub2api',
+      },
+      account: {
+        id: 84,
+        accessToken: 'access-token',
+      },
+      modelName: 'gpt-5.2-codex',
+      totalTokens: 0,
+    });
+
+    expect(catalog?.models).toEqual([]);
+    expect(catalog?.groupRatio).toEqual({
+      '纯pro通道-VIP-超稳定-专用通道': 0.2,
+      '纯PLUS通道-稳定': 0.12,
+      'team渠道-特价组-杀号太厉害 暂停': 0.075,
+      default: 1,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[0][0])).toBe('https://sub2api.example.com/api/pricing');
+    expect(String(fetchMock.mock.calls[1][0])).toBe('https://sub2api.example.com/api/v1/groups/available');
+  });
+
   it('matches pricing groups with normalized punctuation and spacing', async () => {
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
       data: [{
