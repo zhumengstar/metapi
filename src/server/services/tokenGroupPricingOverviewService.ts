@@ -1,4 +1,4 @@
-import { and, eq } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 import { fetch } from 'undici';
 import { db, schema } from '../db/index.js';
 import { getProxyUrlFromExtraConfig, resolvePlatformUserId } from './accountExtraConfig.js';
@@ -579,6 +579,35 @@ async function upsertStoredGroupRow(input: {
     .run();
 }
 
+async function deleteStoredRowsMissingFromUpstream(input: {
+  siteId: number;
+  accountId: number | null;
+  sourceKey: string;
+  groups: string[];
+}) {
+  const upstreamGroups = new Set(input.groups.map(normalizeGroup).filter(Boolean));
+  const existingRows = await db.select({
+    id: schema.tokenGroupPricing.id,
+    group: schema.tokenGroupPricing.group,
+  })
+    .from(schema.tokenGroupPricing)
+    .where(and(
+      eq(schema.tokenGroupPricing.siteId, input.siteId),
+      eq(schema.tokenGroupPricing.sourceKey, input.sourceKey),
+      input.accountId === null
+        ? isNull(schema.tokenGroupPricing.accountId)
+        : eq(schema.tokenGroupPricing.accountId, input.accountId),
+    ))
+    .all();
+
+  for (const row of existingRows) {
+    if (upstreamGroups.has(normalizeGroup(row.group))) continue;
+    await db.delete(schema.tokenGroupPricing)
+      .where(eq(schema.tokenGroupPricing.id, row.id))
+      .run();
+  }
+}
+
 async function loadStoredGroupRows(
   tokensByAccountId: Map<number, TokenGroupPricingOverviewToken[]>,
 ): Promise<TokenGroupPricingOverviewGroupRow[]> {
@@ -635,8 +664,8 @@ function mergeGroupRows(
   storedRows: TokenGroupPricingOverviewGroupRow[],
 ): TokenGroupPricingOverviewGroupRow[] {
   const merged = new Map<string, TokenGroupPricingOverviewGroupRow>();
-  for (const row of liveRows) merged.set(row.id, row);
   for (const row of storedRows) merged.set(row.id, row);
+  for (const row of liveRows) merged.set(row.id, row);
   return Array.from(merged.values()).sort((a, b) => (
     a.site.name.localeCompare(b.site.name)
     || (a.account?.username || '').localeCompare(b.account?.username || '')
@@ -814,8 +843,11 @@ export async function buildTokenGroupPricingOverview(options: TokenGroupPricingO
       ...row,
       localTokenGroups: accountTokens.map((token) => token.group),
     }, refresh);
+    const upstreamGroups = filterGroupsForPlatform(uniqueGroups(groupResult.groups), row.sites.platform);
     const groups = filterGroupsForPlatform(
-      uniqueGroups([...groupResult.groups, ...accountTokens.map((token) => token.group)]),
+      refresh && groupResult.source === 'upstream'
+        ? upstreamGroups
+        : uniqueGroups([...groupResult.groups, ...accountTokens.map((token) => token.group)]),
       row.sites.platform,
     );
     const groupDetailsByGroup = new Map(groupResult.details.map((item) => [normalizeGroup(item.group), item]));
@@ -874,6 +906,12 @@ export async function buildTokenGroupPricingOverview(options: TokenGroupPricingO
     });
     groupRows.push(...accountGroupRows);
     if (refresh && groupResult.source === 'upstream') {
+      await deleteStoredRowsMissingFromUpstream({
+        siteId: row.sites.id,
+        accountId: row.accounts.id,
+        sourceKey: `account:${row.accounts.id}`,
+        groups: upstreamGroups,
+      });
       await Promise.all(accountGroupRows.map((item) => upsertStoredGroupRow({
         row: item,
         sourceKey: `account:${row.accounts.id}`,
@@ -891,6 +929,12 @@ export async function buildTokenGroupPricingOverview(options: TokenGroupPricingO
     }).map((item) => withCatalogGroupModels(item, catalogBySiteId.get(site.id) || null));
     groupRows.push(...siteGroupRows);
     if (refresh && groupResult.source === 'upstream') {
+      await deleteStoredRowsMissingFromUpstream({
+        siteId: site.id,
+        accountId: null,
+        sourceKey: 'site',
+        groups: groupResult.groups,
+      });
       await Promise.all(siteGroupRows.map((item) => upsertStoredGroupRow({
         row: item,
         sourceKey: 'site',

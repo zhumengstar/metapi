@@ -153,6 +153,57 @@ function isStoredPricingAvailable(value: unknown): boolean {
   return value === true || value === 1 || value === '1';
 }
 
+async function loadAccountGroupNameAliases(accountId: number): Promise<Map<string, string>> {
+  const rows = await db.select({
+    group: schema.tokenGroupPricing.group,
+    groupName: schema.tokenGroupPricing.groupName,
+  })
+    .from(schema.tokenGroupPricing)
+    .where(eq(schema.tokenGroupPricing.accountId, accountId))
+    .all();
+  const aliases = new Map<string, string>();
+  for (const row of rows) {
+    const group = normalizeTokenGroup(row.group, null);
+    const groupName = normalizeTokenGroup(row.groupName, null);
+    if (!group || !groupName || group === groupName) continue;
+    aliases.set(group, groupName);
+  }
+  return aliases;
+}
+
+function sameTokenGroupWithAliases(
+  aliases: Map<string, string>,
+  leftGroup: string | null | undefined,
+  leftName: string | null | undefined,
+  rightGroup: string | null | undefined,
+  rightName: string | null | undefined,
+): boolean {
+  const left = normalizeTokenGroup(leftGroup, leftName);
+  const right = normalizeTokenGroup(rightGroup, rightName);
+  if (left === right) return true;
+  return !!left && !!right && (aliases.get(left) === right || aliases.get(right) === left);
+}
+
+function sameTokenNameWithAliases(
+  aliases: Map<string, string>,
+  leftName: string,
+  leftGroup: string | null | undefined,
+  rightName: string,
+  rightGroup: string | null | undefined,
+): boolean {
+  const left = leftName.trim();
+  const right = rightName.trim();
+  if (left === right) return true;
+  if (!left || !right) return false;
+
+  const leftGroupName = normalizeTokenGroup(leftGroup, leftName);
+  const rightGroupName = normalizeTokenGroup(rightGroup, rightName);
+  return aliases.get(left) === right
+    || aliases.get(right) === left
+    || (!!leftGroupName && aliases.get(leftGroupName) === right)
+    || (!!rightGroupName && aliases.get(rightGroupName) === left);
+}
+
 function sameTokenGroup(
   leftGroup: string | null | undefined,
   leftName: string | null | undefined,
@@ -308,6 +359,7 @@ export async function syncTokensFromUpstream(accountId: number, upstreamTokens: 
   let updated = 0;
   let maskedPending = 0;
   const pendingTokenIds: number[] = [];
+  const groupNameAliases = await loadAccountGroupNameAliases(accountId);
   let index = existing.length + 1;
 
   for (const upstream of upstreamTokens) {
@@ -385,8 +437,8 @@ export async function syncTokensFromUpstream(accountId: number, upstreamTokens: 
       ? existing.filter((row) => (
         resolveAccountTokenValueStatus(row) === ACCOUNT_TOKEN_VALUE_STATUS_READY
         && matchesMaskedTokenValue(row.token, tokenValue)
-        && row.name === tokenName
-        && sameTokenGroup(row.tokenGroup, row.name, tokenGroup, tokenName)
+        && sameTokenNameWithAliases(groupNameAliases, row.name, row.tokenGroup, tokenName, tokenGroup)
+        && sameTokenGroupWithAliases(groupNameAliases, row.tokenGroup, row.name, tokenGroup, tokenName)
       ))
       : [];
     const readyMaskedMatch = matchingReadyByMaskedValue.length === 1
@@ -397,8 +449,8 @@ export async function syncTokensFromUpstream(accountId: number, upstreamTokens: 
         row.id !== readyMaskedMatch.id
         && resolveAccountTokenValueStatus(row) === ACCOUNT_TOKEN_VALUE_STATUS_MASKED_PENDING
         && matchesMaskedTokenValue(row.token, tokenValue)
-        && row.name === tokenName
-        && sameTokenGroup(row.tokenGroup, row.name, tokenGroup, tokenName)
+        && sameTokenNameWithAliases(groupNameAliases, row.name, row.tokenGroup, tokenName, tokenGroup)
+        && sameTokenGroupWithAliases(groupNameAliases, row.tokenGroup, row.name, tokenGroup, tokenName)
       ));
 
       await db.update(schema.accountTokens)
@@ -439,8 +491,8 @@ export async function syncTokensFromUpstream(accountId: number, upstreamTokens: 
 
     const matchingPlaceholder = existing.find((row) => (
       isMaskedPendingAccountToken(row)
-      && row.name === tokenName
-      && sameTokenGroup(row.tokenGroup, row.name, tokenGroup, tokenName)
+      && sameTokenNameWithAliases(groupNameAliases, row.name, row.tokenGroup, tokenName, tokenGroup)
+      && sameTokenGroupWithAliases(groupNameAliases, row.tokenGroup, row.name, tokenGroup, tokenName)
     ));
 
     if (matchingPlaceholder) {
