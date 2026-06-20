@@ -73,10 +73,10 @@ export function SortableChannelRow({
     transition: rowTransition || undefined,
     opacity: dragging ? 0.92 : channel.enabled === false ? 0.56 : 1,
     display: 'grid',
-    gridTemplateColumns: managementLocked || mobile ? 'minmax(0, 1fr)' : 'minmax(0, 1fr) auto auto auto',
+    gridTemplateColumns: 'minmax(0, 1fr)',
     alignItems: mobile ? 'stretch' : 'center',
-    gap: mobile ? 8 : 6,
-    padding: mobile ? '8px 9px' : '5px 8px',
+    gap: mobile ? 8 : 7,
+    padding: mobile ? '8px 9px' : '7px 8px',
     border: `1px solid ${dragging ? 'color-mix(in srgb, var(--color-info) 38%, var(--color-border-light))' : 'color-mix(in srgb, var(--color-border-light) 92%, transparent)'}`,
     borderRadius: 14,
     backgroundColor: dragging
@@ -293,6 +293,7 @@ export function SortableChannelRow({
                 <div style={{ width: '100%' }}>
                   <ModernSelect
                     size="sm"
+                    menuPlacement="inline"
                     value={String(activeTokenId || 0)}
                     onChange={(nextValue) => onTokenDraftChange(channel.id, Number.parseInt(nextValue, 10) || 0)}
                     disabled={isUpdatingToken}
@@ -357,7 +358,7 @@ export function SortableChannelRow({
 
   return (
     <div data-layer-root style={rowStyle}>
-      <div style={{ display: 'flex', alignItems: mobile ? 'stretch' : 'center', flexDirection: mobile ? 'column' : 'row', gap: 6, fontSize: 12, flexWrap: 'wrap', minWidth: 0 }}>
+      <div style={{ display: 'flex', alignItems: 'center', flexDirection: 'row', gap: 6, fontSize: 12, flexWrap: 'wrap', minWidth: 0 }}>
         <button
           type="button"
           ref={dragHandleRef}
@@ -523,32 +524,45 @@ export function SortableChannelRow({
       </div>
 
       {!managementLocked ? (
-        <>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            <div style={{ minWidth: 220, flex: 1 }}>
-              <ModernSelect
-                size="sm"
-                value={String(activeTokenId || 0)}
-                onChange={(nextValue) => onTokenDraftChange(channel.id, Number.parseInt(nextValue, 10) || 0)}
-                disabled={isUpdatingToken}
-                options={[
-                  {
-                    value: '0',
-                    label: tokenBinding.followOptionLabel,
-                    description: tokenBinding.followOptionDescription,
-                  },
-                  ...tokenOptions.map((token) => ({
-                    value: String(token.id),
-                    label: buildFixedTokenOptionLabel(token, { includeDefaultTag: true }),
-                    description: buildFixedTokenOptionDescription(token),
-                  })),
-                ]}
-                placeholder="选择令牌绑定方式"
-              />
-              <div style={{ marginTop: 3, fontSize: 10.5, color: 'var(--color-text-muted)', lineHeight: 1.35 }}>
-                {tokenBinding.helperText}
-              </div>
+        <div
+          data-channel-config-row
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'minmax(240px, 1fr) auto auto',
+            alignItems: 'start',
+            gap: 8,
+            width: '100%',
+            paddingTop: 6,
+            borderTop: '1px solid color-mix(in srgb, var(--color-border-light) 82%, transparent)',
+          }}
+        >
+          <div style={{ minWidth: 0 }}>
+            <ModernSelect
+              size="sm"
+              menuPlacement="inline"
+              value={String(activeTokenId || 0)}
+              onChange={(nextValue) => onTokenDraftChange(channel.id, Number.parseInt(nextValue, 10) || 0)}
+              disabled={isUpdatingToken}
+              options={[
+                {
+                  value: '0',
+                  label: tokenBinding.followOptionLabel,
+                  description: tokenBinding.followOptionDescription,
+                },
+                ...tokenOptions.map((token) => ({
+                  value: String(token.id),
+                  label: buildFixedTokenOptionLabel(token, { includeDefaultTag: true }),
+                  description: buildFixedTokenOptionDescription(token),
+                })),
+              ]}
+              placeholder="选择令牌绑定方式"
+            />
+            <div style={{ marginTop: 3, fontSize: 10.5, color: 'var(--color-text-muted)', lineHeight: 1.35 }}>
+              {tokenBinding.helperText}
             </div>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 6, flexWrap: 'wrap', minHeight: 32 }}>
             <button
               onClick={onSaveToken}
               disabled={isUpdatingToken}
@@ -556,17 +570,17 @@ export function SortableChannelRow({
             >
               {isUpdatingToken ? <span className="spinner spinner-sm" /> : '保存'}
             </button>
+
+            <button
+              onClick={() => onToggleEnabled(channel.enabled === false)}
+              className={`btn btn-link ${channel.enabled === false ? 'btn-link-info' : 'btn-link-warning'}`}
+              data-tooltip={suppressTooltips ? undefined : (channel.enabled === false ? '启用此通道' : '禁用此通道')}
+            >
+              {channel.enabled === false ? '启用' : '禁用'}
+            </button>
           </div>
 
-          <button
-            onClick={() => onToggleEnabled(channel.enabled === false)}
-            className={`btn btn-link ${channel.enabled === false ? 'btn-link-info' : 'btn-link-warning'}`}
-            data-tooltip={suppressTooltips ? undefined : (channel.enabled === false ? '启用此通道' : '禁用此通道')}
-          >
-            {channel.enabled === false ? '启用' : '禁用'}
-          </button>
-
-          <div style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 3, flexWrap: 'wrap', minHeight: 32 }}>
             {onSiteBlockModel && channel.site?.id ? (
               <button
                 onClick={onSiteBlockModel}
@@ -584,7 +598,7 @@ export function SortableChannelRow({
               移除
             </button>
           </div>
-        </>
+        </div>
       ) : null}
     </div>
   );

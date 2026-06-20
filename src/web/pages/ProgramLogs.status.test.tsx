@@ -112,4 +112,48 @@ describe('ProgramLogs status label', () => {
     const statusBadge = statusCell.find((node) => node.type === 'span');
     expect(String(statusBadge.props.className || '')).toContain('badge-success');
   });
+
+  it('does not present historical started events as still running', async () => {
+    apiMock.getEvents.mockResolvedValue([
+      {
+        id: 3,
+        type: 'status',
+        title: '获取全部账号分组并补齐令牌已开始',
+        message: '获取全部账号分组并补齐令牌 已开始执行',
+        level: 'info',
+        read: false,
+        createdAt: '2026-06-20T00:58:26.875Z',
+      },
+      {
+        id: 4,
+        type: 'status',
+        title: '刷新模型并重建路由进行中',
+        message: '刷新模型并重建路由 running',
+        level: 'info',
+        read: false,
+        createdAt: '2026-06-20T00:59:26.875Z',
+      },
+    ]);
+
+    let root!: WebTestRenderer;
+    await act(async () => {
+      root = create(
+        <MemoryRouter initialEntries={['/events']}>
+          <ToastProvider>
+            <ProgramLogs />
+          </ToastProvider>
+        </MemoryRouter>,
+      );
+    });
+    await flushMicrotasks();
+
+    const rows = root!.root.findAll((node) => node.type === 'tr');
+    const startedRow = rows.find((row) => collectText(row).includes('获取全部账号分组并补齐令牌已开始'));
+    const runningRow = rows.find((row) => collectText(row).includes('刷新模型并重建路由进行中'));
+
+    expect(startedRow).toBeTruthy();
+    expect(runningRow).toBeTruthy();
+    expect(collectText(startedRow!.findAll((node) => node.type === 'td')[5]).trim()).toBe('已开始');
+    expect(collectText(runningRow!.findAll((node) => node.type === 'td')[5]).trim()).toBe('进行中');
+  });
 });

@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { api } from '../api.js';
 import CenteredModal from '../components/CenteredModal.js';
@@ -59,7 +60,86 @@ type SyncableAccount = {
   } | null;
 };
 
+type TokenAvailabilityTestResult = {
+  tokenId: number;
+  model: string;
+  available: boolean;
+  message?: string;
+  httpStatus?: number | null;
+  latencyMs?: number | null;
+  checkedAt?: string | null;
+};
+
+type AvailabilityTooltipRow = {
+  label: string;
+  value?: string | number | null;
+  tone?: 'success' | 'error' | 'muted';
+};
+
+type AvailabilityTooltipState = {
+  rows: AvailabilityTooltipRow[];
+  left: number;
+  top: number;
+};
+
+const AVAILABILITY_TOOLTIP_WIDTH = 300;
+const AVAILABILITY_TOOLTIP_OFFSET = 12;
+
+type TokenSortKey =
+  | 'account'
+  | 'site'
+  | 'name'
+  | 'token'
+  | 'group'
+  | 'ratio'
+  | 'status'
+  | 'availability'
+  | 'default'
+  | 'updatedAt';
+
 const ACCOUNT_SELECT_SEARCH_PLACEHOLDER = '筛选账号（名称 / 站点）';
+const DEFAULT_BATCH_TEST_MODEL = 'gpt-5.5';
+
+function formatGroupRatio(value?: number | null) {
+  if (!Number.isFinite(value)) return '';
+  const normalized = Number(value);
+  return `${Number.isInteger(normalized) ? normalized : normalized.toFixed(3).replace(/0+$/, '').replace(/\.$/, '')}x`;
+}
+
+function resolveTokenAvailabilityResult(
+  token: any,
+  modelSearch: string,
+  pendingResult?: TokenAvailabilityTestResult,
+): TokenAvailabilityTestResult | null {
+  const tokenId = Number(token?.id);
+  if (!Number.isInteger(tokenId) || tokenId <= 0) return null;
+
+  const requestedModel = modelSearch.trim().toLowerCase();
+  if (pendingResult && (!requestedModel || pendingResult.model.trim().toLowerCase() === requestedModel)) {
+    return pendingResult;
+  }
+
+  const rows = Array.isArray(token?.modelAvailability) ? token.modelAvailability : [];
+  const matched = requestedModel
+    ? rows.find((row: any) => String(row?.modelName || '').trim().toLowerCase() === requestedModel)
+    : rows
+      .filter((row: any) => row?.available === true || row?.available === false)
+      .sort((left: any, right: any) => {
+        const leftTime = Date.parse(String(left?.checkedAt || ''));
+        const rightTime = Date.parse(String(right?.checkedAt || ''));
+        return (Number.isFinite(rightTime) ? rightTime : 0) - (Number.isFinite(leftTime) ? leftTime : 0);
+      })[0];
+
+  if (!matched || (matched.available !== true && matched.available !== false)) return null;
+  return {
+    tokenId,
+    model: String(matched.modelName || modelSearch.trim() || ''),
+    available: matched.available === true,
+    message: matched.available ? '请求成功' : '最近测试不可用',
+    latencyMs: matched.latencyMs,
+    checkedAt: matched.checkedAt,
+  };
+}
 
 const isAccountSyncable = (account: any) =>
   resolveAccountCredentialMode(account) === 'session'
@@ -86,6 +166,24 @@ const isMaskedPendingToken = (token: any): boolean => token?.valueStatus === 'ma
 const isMaskedPendingSyncResult = (result: AccountTokenSyncResult | null | undefined) =>
   String(result?.reason || '').trim().toLowerCase() === 'upstream_masked_tokens'
   && Number(result?.maskedPending || 0) > 0;
+
+const normalizeTokenModelNames = (token: any): string[] => {
+  const seen = new Set<string>();
+  return (Array.isArray(token?.modelNames) ? token.modelNames : [])
+    .map((item: unknown) => String(item || '').trim())
+    .filter((modelName) => {
+      if (!modelName) return false;
+      const key = modelName.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+};
+
+const resolveDefaultBatchTestModel = (token: any): string => {
+  const modelNames = normalizeTokenModelNames(token);
+  return modelNames.find((modelName) => modelName.toLowerCase() === DEFAULT_BATCH_TEST_MODEL) || modelNames[0] || '';
+};
 
 const resolveAccountLabel = (result: AccountTokenSyncResult | null | undefined) => {
   const name = typeof result?.accountName === 'string' ? result.accountName.trim() : '';
@@ -136,6 +234,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
   const [syncingAccountId, setSyncingAccountId] = useState(0);
   const [syncing, setSyncing] = useState(false);
   const [syncingAll, setSyncingAll] = useState(false);
+  const [ensuringGroupTokens, setEnsuringGroupTokens] = useState(false);
   const [saving, setSaving] = useState(false);
   const [savingEdit, setSavingEdit] = useState(false);
   const [editingToken, setEditingToken] = useState<any | null>(null);
@@ -155,6 +254,20 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     tokenName?: string;
     count?: number;
   }>(null);
+  const [tokenSort, setTokenSort] = useState<{ key: TokenSortKey; order: 'asc' | 'desc' }>({
+    key: 'account',
+    order: 'asc',
+  });
+  const [modelSearch, setModelSearch] = useState('');
+  const [testingModelTokens, setTestingModelTokens] = useState(false);
+  const [testingAvailabilityTokenIds, setTestingAvailabilityTokenIds] = useState<number[]>([]);
+  const [tokenAvailabilityById, setTokenAvailabilityById] = useState<Record<number, TokenAvailabilityTestResult>>({});
+  const [availabilityTooltip, setAvailabilityTooltip] = useState<AvailabilityTooltipState | null>(null);
+  const [modelDialogToken, setModelDialogToken] = useState<any | null>(null);
+  const [modelDialogModels, setModelDialogModels] = useState<string[]>([]);
+  const [modelDialogLoading, setModelDialogLoading] = useState(false);
+  const [modelDialogError, setModelDialogError] = useState('');
+  const [modelDialogSearch, setModelDialogSearch] = useState('');
   const [form, setForm] = useState(initialCreateForm);
   const [editForm, setEditForm] = useState({
     name: '',
@@ -188,10 +301,11 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       setAccounts(latestAccounts);
 
       const syncableAccounts = latestAccounts.filter(isAccountSyncable);
-      const hasCurrentSelected = syncableAccounts.some((account: SyncableAccount) => account.id === syncingAccountId);
-      if (!hasCurrentSelected) {
-        setSyncingAccountId(syncableAccounts[0]?.id || 0);
-      }
+      setSyncingAccountId((current) => (
+        current && !syncableAccounts.some((account: SyncableAccount) => account.id === current)
+          ? 0
+          : current
+      ));
       return {
         tokens: nextTokens,
         accounts: latestAccounts,
@@ -205,7 +319,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     } finally {
       setLoading(false);
     }
-  }, [syncingAccountId, toast]);
+  }, [toast]);
 
   useEffect(() => {
     void load();
@@ -300,8 +414,67 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     const accountLabel = (token: any) => String(token?.account?.username || `account-${token?.accountId || 0}`).toLowerCase();
     const siteLabel = (token: any) => String(token?.site?.name || '').toLowerCase();
     const tokenName = (token: any) => String(token?.name || '').toLowerCase();
+    const tokenValue = (token: any) => String(token?.tokenMasked || token?.token || '').toLowerCase();
+    const groupLabel = (token: any) => String(token?.tokenGroup || '').toLowerCase();
+    const normalizedModelSearch = modelSearch.trim().toLowerCase();
+    const tokenModelNames = (token: any): string[] => (
+      Array.isArray(token?.modelNames)
+        ? token.modelNames.map((item: unknown) => String(item || '').trim()).filter(Boolean)
+        : []
+    );
+    const ratioValue = (token: any) => {
+      if (!token?.groupRatioAvailable) return Number.POSITIVE_INFINITY;
+      const value = Number(token?.groupRatio);
+      return Number.isFinite(value) ? value : Number.POSITIVE_INFINITY;
+    };
+    const statusRank = (token: any) => {
+      if (isMaskedPendingToken(token)) return 0;
+      return token?.enabled ? 2 : 1;
+    };
+    const availabilityRank = (token: any) => {
+      const tokenId = Number(token?.id);
+      const result = resolveTokenAvailabilityResult(token, modelSearch, tokenAvailabilityById[tokenId]);
+      if (!result) return 1;
+      return result.available ? 2 : 1;
+    };
+    const defaultRank = (token: any) => (token?.isDefault ? 1 : 0);
+    const updatedAtValue = (token: any) => {
+      const timestamp = Date.parse(String(token?.updatedAt || ''));
+      return Number.isFinite(timestamp) ? timestamp : 0;
+    };
 
-    return [...tokens].sort((left, right) => {
+    return [...tokens].filter((token) => {
+      if (syncingAccountId && Number(token?.accountId || 0) !== syncingAccountId) return false;
+      if (!normalizedModelSearch) return true;
+      return tokenModelNames(token).some((modelName) => modelName.trim().toLowerCase() === normalizedModelSearch);
+    }).sort((left, right) => {
+      let result = 0;
+      if (tokenSort.key === 'ratio') {
+        result = ratioValue(left) - ratioValue(right);
+      } else if (tokenSort.key === 'site') {
+        result = siteLabel(left).localeCompare(siteLabel(right));
+      } else if (tokenSort.key === 'name') {
+        result = tokenName(left).localeCompare(tokenName(right));
+      } else if (tokenSort.key === 'token') {
+        result = tokenValue(left).localeCompare(tokenValue(right));
+      } else if (tokenSort.key === 'group') {
+        result = groupLabel(left).localeCompare(groupLabel(right));
+      } else if (tokenSort.key === 'status') {
+        result = statusRank(left) - statusRank(right);
+      } else if (tokenSort.key === 'availability') {
+        result = availabilityRank(left) - availabilityRank(right);
+        if (result === 0) {
+          const ratioCmp = ratioValue(left) - ratioValue(right);
+          if (ratioCmp !== 0) return ratioCmp;
+        }
+      } else if (tokenSort.key === 'default') {
+        result = defaultRank(left) - defaultRank(right);
+      } else if (tokenSort.key === 'updatedAt') {
+        result = updatedAtValue(left) - updatedAtValue(right);
+      } else {
+        result = accountLabel(left).localeCompare(accountLabel(right));
+      }
+      if (result !== 0) return tokenSort.order === 'desc' ? -result : result;
       const accountCmp = accountLabel(left).localeCompare(accountLabel(right));
       if (accountCmp !== 0) return accountCmp;
       const siteCmp = siteLabel(left).localeCompare(siteLabel(right));
@@ -310,7 +483,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       if (nameCmp !== 0) return nameCmp;
       return Number(left?.id || 0) - Number(right?.id || 0);
     });
-  }, [tokens]);
+  }, [modelSearch, syncingAccountId, tokenAvailabilityById, tokenSort, tokens]);
   const allVisibleTokensSelected = accountClusteredTokens.length > 0
     && accountClusteredTokens.every((token) => selectedTokenIds.includes(token.id));
 
@@ -326,6 +499,15 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       };
     })
   ), [activeAccounts]);
+
+  const exactModelSearch = modelSearch.trim();
+  const modelTestTokenIds = useMemo(() => (
+    exactModelSearch
+      ? accountClusteredTokens
+        .map((token: any) => Number(token?.id))
+        .filter((id) => Number.isInteger(id) && id > 0)
+      : []
+  ), [accountClusteredTokens, exactModelSearch]);
 
   useEffect(() => {
     const params = new URLSearchParams(location.search);
@@ -407,6 +589,40 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     }
   };
 
+  const markTokenAsDefault = useCallback((token: any) => {
+    const accountId = Number(token?.accountId || 0);
+    const tokenId = Number(token?.id || 0);
+    if (!accountId || !tokenId) return;
+    setTokens((current) => current.map((item) => (
+      Number(item?.accountId || 0) === accountId
+        ? { ...item, isDefault: Number(item?.id || 0) === tokenId }
+        : item
+    )));
+  }, []);
+
+  const handleSetDefaultToken = useCallback(async (token: any) => {
+    const loadingKey = `token-${token.id}-default`;
+    await withRowLoading(loadingKey, async () => {
+      await api.setDefaultAccountToken(token.id);
+      markTokenAsDefault(token);
+      toast.success('默认令牌已更新');
+    });
+  }, [markTokenAsDefault, toast]);
+
+  const patchTokenRow = useCallback((tokenId: number, patch: Record<string, unknown>) => {
+    setTokens((current) => current.map((item) => (
+      Number(item?.id || 0) === tokenId ? { ...item, ...patch } : item
+    )));
+  }, []);
+
+  const removeTokenRows = useCallback((tokenIds: number[]) => {
+    const idSet = new Set(tokenIds.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0));
+    if (idSet.size === 0) return;
+    setTokens((current) => current.filter((item) => !idSet.has(Number(item?.id || 0))));
+    setSelectedTokenIds((current) => current.filter((id) => !idSet.has(id)));
+    setExpandedTokenIds((current) => current.filter((id) => !idSet.has(id)));
+  }, []);
+
   const toggleTokenSelection = (tokenId: number, checked: boolean) => {
     setSelectedTokenIds((current) => (
       checked
@@ -422,6 +638,25 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     }
     setSelectedTokenIds((current) => Array.from(new Set([...current, ...accountClusteredTokens.map((token) => token.id)])));
   };
+
+  const toggleTokenSort = useCallback((key: TokenSortKey) => {
+    setTokenSort((current) => (
+      current.key === key
+        ? { key, order: current.order === 'asc' ? 'desc' : 'asc' }
+        : { key, order: key === 'availability' ? 'desc' : 'asc' }
+    ));
+  }, []);
+
+  const renderTokenSortLabel = useCallback((label: string, key: TokenSortKey) => (
+    <button
+      type="button"
+      onClick={() => toggleTokenSort(key)}
+      className="btn btn-link"
+      style={{ padding: 0, fontWeight: 700, color: 'inherit' }}
+    >
+      {label}{tokenSort.key === key ? (tokenSort.order === 'asc' ? ' ↑' : ' ↓') : ''}
+    </button>
+  ), [toggleTokenSort, tokenSort]);
 
   const toggleTokenDetails = (tokenId: number) => {
     setExpandedTokenIds((current) => (
@@ -451,8 +686,16 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       } else {
         toast.success(`批量操作完成：成功 ${successIds.length}`);
       }
+      if (action === 'delete') {
+        removeTokenRows(successIds);
+      } else {
+        setTokens((current) => current.map((item) => (
+          successIds.includes(Number(item?.id || 0))
+            ? { ...item, enabled: action === 'enable', updatedAt: new Date().toISOString() }
+            : item
+        )));
+      }
       setSelectedTokenIds(failedItems.map((item: any) => Number(item.id)).filter((id: number) => Number.isFinite(id) && id > 0));
-      await load();
     } catch (e: any) {
       toast.error(e.message || '批量操作失败');
     } finally {
@@ -466,11 +709,15 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
 
     setDeleteConfirm(null);
     if (target.mode === 'single' && target.tokenId) {
-      await withRowLoading(`token-${target.tokenId}-delete`, async () => {
-        await api.deleteAccountToken(target.tokenId!);
-        toast.success('令牌已删除');
-        await load();
-      });
+      try {
+        await withRowLoading(`token-${target.tokenId}-delete`, async () => {
+          await api.deleteAccountToken(target.tokenId!);
+          toast.success('令牌已删除');
+          removeTokenRows([target.tokenId!]);
+        });
+      } catch (e: any) {
+        toast.error(e?.message || '删除令牌失败');
+      }
       return;
     }
 
@@ -543,16 +790,27 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     }
     setSavingEdit(true);
     try {
-      await api.updateAccountToken(editingToken.id, {
+      const res = await api.updateAccountToken(editingToken.id, {
         name: editForm.name.trim() || editingToken.name,
         token: editForm.token.trim() || undefined,
         group: editForm.group || 'default',
         enabled: editForm.enabled,
         isDefault: editForm.isDefault,
       });
+      const latest = res?.token || {};
+      patchTokenRow(editingToken.id, {
+        name: latest.name ?? editForm.name.trim() ?? editingToken.name,
+        tokenGroup: latest.tokenGroup ?? editForm.group ?? 'default',
+        enabled: latest.enabled ?? editForm.enabled,
+        isDefault: latest.isDefault ?? editForm.isDefault,
+        valueStatus: latest.valueStatus || (editForm.token.trim() ? 'ready' : editingToken.valueStatus),
+        updatedAt: latest.updatedAt || new Date().toISOString(),
+      });
+      if (latest.isDefault || editForm.isDefault) {
+        markTokenAsDefault({ ...editingToken, id: editingToken.id, accountId: editingToken.accountId });
+      }
       toast.success('令牌已更新');
       closeEditPanel();
-      await load();
     } catch (e: any) {
       toast.error(e.message || '更新令牌失败');
     } finally {
@@ -592,6 +850,275 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       toast.error(error?.message || '复制令牌失败');
     }
   };
+
+  const handleAccountFilterChange = useCallback((nextValue: string) => {
+    setSyncingAccountId(Number.parseInt(nextValue, 10) || 0);
+    setSelectedTokenIds([]);
+  }, []);
+
+  const openTokenModels = useCallback((token: any) => {
+    const cachedModels = Array.isArray(token?.modelNames)
+      ? token.modelNames.map((item: unknown) => String(item || '').trim()).filter(Boolean)
+      : [];
+    setModelDialogToken(token);
+    setModelDialogModels(cachedModels);
+    setModelDialogSearch('');
+    setModelDialogError('');
+    setModelDialogLoading(false);
+  }, []);
+
+  const closeModelDialog = useCallback(() => {
+    setModelDialogToken(null);
+    setModelDialogModels([]);
+    setModelDialogError('');
+    setModelDialogSearch('');
+    setModelDialogLoading(false);
+  }, []);
+
+  const applyModelAvailabilityResults = useCallback((model: string, results: TokenAvailabilityTestResult[]) => {
+    const nextModel = model.trim();
+    if (!nextModel) return;
+
+    setTokenAvailabilityById((current) => {
+      const next = { ...current };
+      for (const result of results) {
+        const tokenId = Number(result?.tokenId);
+        if (!Number.isInteger(tokenId) || tokenId <= 0) continue;
+        next[tokenId] = {
+          tokenId,
+          model: nextModel,
+          available: !!result.available,
+          message: result.message,
+          httpStatus: result.httpStatus,
+          latencyMs: result.latencyMs,
+          checkedAt: result.checkedAt,
+        };
+      }
+      return next;
+    });
+
+    setTokens((current) => current.map((token) => {
+      const tokenId = Number(token?.id);
+      const result = results.find((item) => Number(item?.tokenId) === tokenId);
+      if (!result) return token;
+
+        const existingRows = Array.isArray(token?.modelAvailability) ? token.modelAvailability : [];
+        const nextAvailabilityRows = existingRows.filter((row: any) => (
+          String(row?.modelName || '').trim().toLowerCase() !== nextModel.toLowerCase()
+        ));
+        nextAvailabilityRows.push({
+          modelName: nextModel,
+          available: !!result.available,
+          latencyMs: result.latencyMs,
+          checkedAt: result.checkedAt,
+        });
+        nextAvailabilityRows.sort((left: any, right: any) => (
+          String(left?.modelName || '').localeCompare(String(right?.modelName || ''))
+        ));
+
+        const existingModels = Array.isArray(token?.modelNames)
+          ? token.modelNames.map((item: unknown) => String(item || '').trim()).filter(Boolean)
+          : [];
+        const hasModel = existingModels.some((item: string) => item.toLowerCase() === nextModel.toLowerCase());
+        const nextModelNames = hasModel
+          ? existingModels
+          : [...existingModels, nextModel].sort((left, right) => left.localeCompare(right));
+
+        return {
+          ...token,
+          modelNames: nextModelNames,
+          modelCount: nextModelNames.length,
+          modelAvailability: nextAvailabilityRows,
+          updatedAt: result.checkedAt || new Date().toISOString(),
+        };
+    }));
+  }, []);
+
+  const testModelTokens = useCallback(async (tokenIds: number[], emptyMessage: string) => {
+    const model = modelSearch.trim();
+    if (!model) {
+      toast.error('请先输入完整模型名称');
+      return;
+    }
+    const normalizedTokenIds = Array.from(new Set(tokenIds
+      .map((id) => Number(id))
+      .filter((id) => Number.isInteger(id) && id > 0)));
+    if (normalizedTokenIds.length === 0) {
+      toast.info(emptyMessage);
+      return;
+    }
+
+    setTestingModelTokens(true);
+    setTestingAvailabilityTokenIds(normalizedTokenIds);
+    try {
+      const res = await api.testAccountTokenModelAvailability({
+        model,
+        tokenIds: normalizedTokenIds,
+      });
+      const results: TokenAvailabilityTestResult[] = Array.isArray(res?.results) ? res.results : [];
+      applyModelAvailabilityResults(model, results);
+      const availableCount = results.filter((result) => result.available).length;
+      toast.success(`测试完成：可用 ${availableCount}，不可用 ${Math.max(results.length - availableCount, 0)}`);
+    } catch (error: any) {
+      toast.error(error?.message || '测试令牌可用性失败');
+    } finally {
+      setTestingModelTokens(false);
+      setTestingAvailabilityTokenIds([]);
+    }
+  }, [applyModelAvailabilityResults, modelSearch, toast]);
+
+  const handleTestFilteredModelTokens = useCallback(async () => {
+    await testModelTokens(modelTestTokenIds, '没有匹配该模型的令牌');
+  }, [modelTestTokenIds, testModelTokens]);
+
+  const handleBatchTestSelectedTokens = useCallback(async () => {
+    const model = modelSearch.trim();
+    if (model) {
+      await testModelTokens(selectedTokenIds, '请先选择需要检测的令牌');
+      return;
+    }
+
+    const selectedIdSet = new Set(selectedTokenIds);
+    const selectedTokens = tokens.filter((token) => selectedIdSet.has(Number(token?.id)));
+    const groupedTokenIds = new Map<string, number[]>();
+    const skippedCount = selectedTokens.reduce((count, token) => {
+      const tokenId = Number(token?.id);
+      if (!Number.isInteger(tokenId) || tokenId <= 0) return count + 1;
+      const testModel = resolveDefaultBatchTestModel(token);
+      if (!testModel) return count + 1;
+      const group = groupedTokenIds.get(testModel) || [];
+      group.push(tokenId);
+      groupedTokenIds.set(testModel, group);
+      return count;
+    }, 0);
+
+    const testGroups = Array.from(groupedTokenIds.entries());
+    if (testGroups.length === 0) {
+      toast.info(selectedTokenIds.length > 0 ? '所选令牌没有可检测的模型列表' : '请先选择需要检测的令牌');
+      return;
+    }
+
+    const testingTokenIds = Array.from(groupedTokenIds.values()).flat();
+    setTestingModelTokens(true);
+    setTestingAvailabilityTokenIds(testingTokenIds);
+    try {
+      let total = 0;
+      let availableCount = 0;
+      for (const [testModel, tokenIds] of testGroups) {
+        const res = await api.testAccountTokenModelAvailability({
+          model: testModel,
+          tokenIds,
+        });
+        const results: TokenAvailabilityTestResult[] = Array.isArray(res?.results) ? res.results : [];
+        applyModelAvailabilityResults(testModel, results);
+        total += results.length;
+        availableCount += results.filter((result) => result.available).length;
+      }
+      const skippedText = skippedCount > 0 ? `，跳过 ${skippedCount} 个无模型令牌` : '';
+      toast.success(`测试完成：可用 ${availableCount}，不可用 ${Math.max(total - availableCount, 0)}${skippedText}`);
+    } catch (error: any) {
+      toast.error(error?.message || '测试令牌可用性失败');
+    } finally {
+      setTestingModelTokens(false);
+      setTestingAvailabilityTokenIds([]);
+    }
+  }, [applyModelAvailabilityResults, modelSearch, selectedTokenIds, testModelTokens, toast, tokens]);
+
+  const showAvailabilityTooltip = useCallback((
+    event: React.MouseEvent<HTMLElement> | React.FocusEvent<HTMLElement>,
+    rows: AvailabilityTooltipRow[],
+  ) => {
+    const visibleRows = rows.filter((row) => (
+      row.value !== undefined
+      && row.value !== null
+      && String(row.value).trim()
+    ));
+    if (visibleRows.length === 0 || typeof window === 'undefined') {
+      setAvailabilityTooltip(null);
+      return;
+    }
+
+    const rect = event.currentTarget.getBoundingClientRect();
+    const pointerEvent = 'clientX' in event ? event : null;
+    const rawLeft = pointerEvent
+      ? pointerEvent.clientX + AVAILABILITY_TOOLTIP_OFFSET
+      : rect.right + AVAILABILITY_TOOLTIP_OFFSET;
+    const rawTop = pointerEvent
+      ? pointerEvent.clientY - AVAILABILITY_TOOLTIP_OFFSET
+      : rect.top - AVAILABILITY_TOOLTIP_OFFSET;
+    const left = Math.max(
+      8,
+      Math.min(rawLeft, window.innerWidth - AVAILABILITY_TOOLTIP_WIDTH - 8),
+    );
+    const top = Math.max(8, rawTop);
+    setAvailabilityTooltip({ rows: visibleRows, left, top });
+  }, []);
+
+  const hideAvailabilityTooltip = useCallback(() => {
+    setAvailabilityTooltip(null);
+  }, []);
+
+  useEffect(() => {
+    if (!availabilityTooltip || typeof window === 'undefined') return;
+    const hide = () => setAvailabilityTooltip(null);
+    window.addEventListener('scroll', hide, true);
+    window.addEventListener('resize', hide);
+    return () => {
+      window.removeEventListener('scroll', hide, true);
+      window.removeEventListener('resize', hide);
+    };
+  }, [availabilityTooltip]);
+
+  const renderAvailabilityBadge = useCallback((token: any) => {
+    const tokenId = Number(token?.id);
+    if (testingAvailabilityTokenIds.includes(tokenId)) {
+      return <span className="badge badge-info" style={{ fontSize: 11 }}><span className="spinner spinner-sm" /> 检测中</span>;
+    }
+    const model = modelSearch.trim().toLowerCase();
+    const pendingResult = tokenAvailabilityById[tokenId];
+    const result = resolveTokenAvailabilityResult(token, model, pendingResult);
+    if (!result) {
+      const rows: AvailabilityTooltipRow[] = [
+        { label: '模型', value: model || '-' },
+        { label: '结果', value: '未拉取到模型或没有测试记录', tone: 'error' },
+      ];
+      return (
+        <span
+          className="badge badge-error token-availability-badge"
+          style={{ fontSize: 11 }}
+          tabIndex={0}
+          onMouseEnter={(event) => showAvailabilityTooltip(event, rows)}
+          onMouseLeave={hideAvailabilityTooltip}
+          onFocus={(event) => showAvailabilityTooltip(event, rows)}
+          onBlur={hideAvailabilityTooltip}
+        >
+          否
+        </span>
+      );
+    }
+    const checkedAt = result.checkedAt ? formatDateTimeLocal(result.checkedAt) : '';
+    const rows: AvailabilityTooltipRow[] = [
+      { label: '模型', value: result.model || '-' },
+      { label: '结果', value: result.available ? '可用' : '不可用', tone: result.available ? 'success' : 'error' },
+      { label: '说明', value: result.available ? result.message : '' },
+      { label: '上游报错', value: result.available ? '' : result.message, tone: result.available ? undefined : 'error' },
+      { label: '耗时', value: Number.isFinite(Number(result.latencyMs)) ? `${result.latencyMs}ms` : '' },
+      { label: '检测时间', value: checkedAt },
+    ];
+    return (
+      <span
+        className={`badge ${result.available ? 'badge-success' : 'badge-info'} token-availability-badge`}
+        style={{ fontSize: 11 }}
+        tabIndex={0}
+        onMouseEnter={(event) => showAvailabilityTooltip(event, rows)}
+        onMouseLeave={hideAvailabilityTooltip}
+        onFocus={(event) => showAvailabilityTooltip(event, rows)}
+        onBlur={hideAvailabilityTooltip}
+      >
+        {result.available ? '是' : '否'}
+      </span>
+    );
+  }, [hideAvailabilityTooltip, modelSearch, showAvailabilityTooltip, testingAvailabilityTokenIds, tokenAvailabilityById]);
 
   const handleAddToken = async () => {
     if (!form.accountId) return;
@@ -728,6 +1255,26 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     }
   }, [load, toast]);
 
+  const handleEnsureGroupTokens = useCallback(async () => {
+    setEnsuringGroupTokens(true);
+    try {
+      const res = await api.ensureAllAccountGroupTokens();
+      if (res?.queued) {
+        toast.info(res.message || '已开始获取分组并补齐令牌，请稍后查看日志');
+        await load();
+        return;
+      }
+
+      const summary = res?.summary || {};
+      toast.success(`分组补齐完成：补齐 ${summary.created || 0}，禁用 ${summary.disabled || 0}，失败 ${summary.failed || 0}`);
+      await load();
+    } catch (e: any) {
+      toast.error(e.message || '获取分组并补齐令牌失败');
+    } finally {
+      setEnsuringGroupTokens(false);
+    }
+  }, [load, toast]);
+
   const handleToggleAdd = useCallback(() => {
     setShowAdd((prev) => {
       const nextOpen = !prev;
@@ -746,6 +1293,36 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     background: 'var(--color-bg)',
     color: 'var(--color-text-primary)',
   };
+
+  const renderModelFilterControl = useCallback((compact = false) => (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: compact ? 'stretch' : 'center',
+        gap: 8,
+        flexWrap: 'nowrap',
+        flexDirection: compact ? 'column' : 'row',
+        width: compact ? '100%' : 'min(100%, 560px)',
+      }}
+    >
+      <input
+        value={modelSearch}
+        onChange={(event) => setModelSearch(event.target.value)}
+        placeholder="输入完整模型名称精准筛选"
+        style={{ ...inputStyle, flex: compact ? undefined : '1 1 auto', minWidth: compact ? undefined : 0 }}
+      />
+      <button
+        type="button"
+        onClick={() => void handleTestFilteredModelTokens()}
+        disabled={testingModelTokens || !modelSearch.trim() || modelTestTokenIds.length === 0}
+        className="btn btn-ghost"
+        title={modelTestTokenIds.length > 0 ? `将测试 ${modelTestTokenIds.length} 个令牌` : undefined}
+        style={{ border: '1px solid var(--color-border)', whiteSpace: 'nowrap' }}
+      >
+        {testingModelTokens ? <><span className="spinner spinner-sm" /> 测试中...</> : `测试筛选令牌${modelTestTokenIds.length > 0 ? ` (${modelTestTokenIds.length})` : ''}`}
+      </button>
+    </div>
+  ), [handleTestFilteredModelTokens, inputStyle, modelSearch, modelTestTokenIds.length, testingModelTokens]);
 
   const sectionCardStyle: React.CSSProperties = {
     display: 'flex',
@@ -803,19 +1380,19 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
             <ModernSelect
               size="sm"
               value={String(syncingAccountId || 0)}
-              onChange={(nextValue) => setSyncingAccountId(Number.parseInt(nextValue, 10) || 0)}
+              onChange={handleAccountFilterChange}
               options={[
-                { value: '0', label: '选择账号后同步站点令牌' },
+                { value: '0', label: '全部账号令牌' },
                 ...activeAccountSelectOptions,
               ]}
-              placeholder="选择账号后同步站点令牌"
+              placeholder="选择账号筛选令牌"
               searchable
               searchPlaceholder={ACCOUNT_SELECT_SEARCH_PLACEHOLDER}
             />
           </div>
           <button
             onClick={handleSync}
-            disabled={syncing || syncingAll || !syncingAccountId}
+            disabled={syncing || syncingAll || ensuringGroupTokens || !syncingAccountId}
             className="btn btn-ghost"
             style={{ border: '1px solid var(--color-border)', padding: '8px 14px' }}
           >
@@ -823,11 +1400,19 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
           </button>
           <button
             onClick={handleSyncAll}
-            disabled={syncing || syncingAll || activeAccounts.length === 0}
+            disabled={syncing || syncingAll || ensuringGroupTokens || activeAccounts.length === 0}
             className="btn btn-ghost"
             style={{ border: '1px solid var(--color-border)', padding: '8px 14px' }}
           >
             {syncingAll ? <><span className="spinner spinner-sm" /> 同步中...</> : '同步全部账号'}
+          </button>
+          <button
+            onClick={handleEnsureGroupTokens}
+            disabled={syncing || syncingAll || ensuringGroupTokens || activeAccounts.length === 0}
+            className="btn btn-ghost"
+            style={{ border: '1px solid var(--color-border)', padding: '8px 14px' }}
+          >
+            {ensuringGroupTokens ? <><span className="spinner spinner-sm" /> 获取中...</> : '获取所有账号分组'}
           </button>
         </>
       )}
@@ -838,7 +1423,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         {showAdd ? '取消' : '+ 新增令牌'}
       </button>
     </div>
-  ), [activeAccountSelectOptions, activeAccounts.length, allVisibleTokensSelected, embedded, handleSync, handleSyncAll, handleToggleAdd, isMobile, showAdd, syncing, syncingAccountId, syncingAll]);
+  ), [activeAccountSelectOptions, activeAccounts.length, allVisibleTokensSelected, embedded, ensuringGroupTokens, handleAccountFilterChange, handleEnsureGroupTokens, handleSync, handleSyncAll, handleToggleAdd, isMobile, showAdd, syncing, syncingAccountId, syncingAll]);
 
   useEffect(() => {
     if (!embedded || !onEmbeddedActionsChange) return;
@@ -865,22 +1450,26 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         mobileContent={(
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>同步账号</div>
+              <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>模型筛选</div>
+              {renderModelFilterControl(true)}
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>账号筛选 / 同步账号</div>
               <ModernSelect
                 value={String(syncingAccountId || 0)}
-                onChange={(nextValue) => setSyncingAccountId(Number.parseInt(nextValue, 10) || 0)}
+                onChange={handleAccountFilterChange}
                 options={[
-                  { value: '0', label: '选择账号后同步站点令牌' },
+                  { value: '0', label: '全部账号令牌' },
                   ...activeAccountSelectOptions,
                 ]}
-                placeholder="选择账号后同步站点令牌"
+                placeholder="选择账号筛选令牌"
                 searchable
                 searchPlaceholder={ACCOUNT_SELECT_SEARCH_PLACEHOLDER}
               />
             </div>
             <button
               onClick={handleSync}
-              disabled={syncing || syncingAll || !syncingAccountId}
+              disabled={syncing || syncingAll || ensuringGroupTokens || !syncingAccountId}
               className="btn btn-ghost"
               style={{ border: '1px solid var(--color-border)' }}
             >
@@ -888,11 +1477,19 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
             </button>
             <button
               onClick={handleSyncAll}
-              disabled={syncing || syncingAll || activeAccounts.length === 0}
+              disabled={syncing || syncingAll || ensuringGroupTokens || activeAccounts.length === 0}
               className="btn btn-ghost"
               style={{ border: '1px solid var(--color-border)' }}
             >
               {syncingAll ? <><span className="spinner spinner-sm" /> 同步中...</> : '同步全部账号'}
+            </button>
+            <button
+              onClick={handleEnsureGroupTokens}
+              disabled={syncing || syncingAll || ensuringGroupTokens || activeAccounts.length === 0}
+              className="btn btn-ghost"
+              style={{ border: '1px solid var(--color-border)' }}
+            >
+              {ensuringGroupTokens ? <><span className="spinner spinner-sm" /> 获取中...</> : '获取所有账号分组'}
             </button>
           </div>
         )}
@@ -913,6 +1510,94 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
           ? <>确定要删除令牌 <strong>{deleteConfirm.tokenName || `#${deleteConfirm.tokenId}`}</strong> 吗？</>
           : <>确定要删除选中的 <strong>{deleteConfirm?.count || 0}</strong> 个令牌吗？</>}
       />
+
+      <CenteredModal
+        open={Boolean(modelDialogToken)}
+        onClose={closeModelDialog}
+        title="令牌模型"
+        maxWidth={780}
+        closeOnBackdrop
+        bodyStyle={{ display: 'flex', flexDirection: 'column', gap: 12 }}
+        footer={(
+          <button onClick={closeModelDialog} className="btn btn-ghost">关闭</button>
+        )}
+      >
+        {modelDialogToken ? (
+          <>
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 10,
+                flexWrap: 'wrap',
+                fontSize: 12,
+                color: 'var(--color-text-secondary)',
+                background: 'var(--color-bg)',
+                border: '1px solid var(--color-border-light)',
+                borderRadius: 'var(--radius-sm)',
+                padding: '8px 10px',
+              }}
+            >
+              <span>{modelDialogToken.name || `token-${modelDialogToken.id}`} @ {modelDialogToken.site?.name || '-'}</span>
+              <span>{`${modelDialogModels.length} 个模型`}</span>
+            </div>
+            <input
+              value={modelDialogSearch}
+              onChange={(event) => setModelDialogSearch(event.target.value)}
+              placeholder="筛选弹窗内模型"
+              style={inputStyle}
+            />
+            {modelDialogError ? (
+              <div
+                style={{
+                  fontSize: 12,
+                  color: 'var(--color-danger)',
+                  background: 'color-mix(in srgb, var(--color-danger) 8%, var(--color-bg))',
+                  border: '1px solid color-mix(in srgb, var(--color-danger) 20%, transparent)',
+                  borderRadius: 'var(--radius-sm)',
+                  padding: '8px 10px',
+                }}
+              >
+                {modelDialogError}
+              </div>
+            ) : null}
+            <div
+              style={{
+                maxHeight: 420,
+                overflow: 'auto',
+                border: '1px solid var(--color-border-light)',
+                borderRadius: 'var(--radius-sm)',
+                padding: 10,
+                background: 'var(--color-bg-card)',
+              }}
+            >
+              {(() => {
+                const keyword = modelDialogSearch.trim().toLowerCase();
+                const visibleModels = modelDialogModels.filter((modelName) => (
+                  !keyword || modelName.toLowerCase().includes(keyword)
+                ));
+                if (visibleModels.length === 0) {
+                  return <div style={{ padding: 20, color: 'var(--color-text-muted)' }}>暂无模型</div>;
+                }
+                return (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                    {visibleModels.map((modelName) => (
+                      <span
+                        key={modelName}
+                        className="badge badge-muted"
+                        style={{ fontSize: 12, maxWidth: '100%', wordBreak: 'break-all' }}
+                      >
+                        {modelName}
+                      </span>
+                    ))}
+                  </div>
+                );
+              })()}
+            </div>
+          </>
+        ) : null}
+      </CenteredModal>
 
       <CenteredModal
         open={Boolean(editingToken)}
@@ -1033,23 +1718,66 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         ) : null}
       </CenteredModal>
 
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'flex-start',
+          marginBottom: 12,
+        }}
+      >
+        {renderModelFilterControl(false)}
+      </div>
+
       {selectedTokenIds.length > 0 && (
         <ResponsiveBatchActionBar
           isMobile={isMobile}
           info={`已选 ${selectedTokenIds.length} 项`}
           desktopStyle={{ marginBottom: 12 }}
         >
-          <button onClick={() => runBatchTokenAction('enable')} disabled={batchActionLoading} className="btn btn-ghost" style={{ border: '1px solid var(--color-border)' }}>
+          <button onClick={() => runBatchTokenAction('enable')} disabled={batchActionLoading || testingModelTokens} className="btn btn-ghost" style={{ border: '1px solid var(--color-border)' }}>
             批量启用
           </button>
-          <button onClick={() => runBatchTokenAction('disable')} disabled={batchActionLoading} className="btn btn-ghost" style={{ border: '1px solid var(--color-border)' }}>
+          <button onClick={() => runBatchTokenAction('disable')} disabled={batchActionLoading || testingModelTokens} className="btn btn-ghost" style={{ border: '1px solid var(--color-border)' }}>
             批量禁用
           </button>
-          <button data-testid="tokens-batch-delete" onClick={() => runBatchTokenAction('delete')} disabled={batchActionLoading} className="btn btn-link btn-link-danger">
+          <button
+            onClick={() => void handleBatchTestSelectedTokens()}
+            disabled={batchActionLoading || testingModelTokens}
+            className="btn btn-ghost"
+            style={{ border: '1px solid var(--color-border)' }}
+            title={modelSearch.trim()
+              ? `检测已选 ${selectedTokenIds.length} 个令牌的 ${modelSearch.trim()}`
+              : `未输入模型时默认检测 ${DEFAULT_BATCH_TEST_MODEL}，没有则检测令牌的第一个模型`}
+          >
+            {testingModelTokens ? <><span className="spinner spinner-sm" /> 检测中...</> : '批量检测'}
+          </button>
+          <button data-testid="tokens-batch-delete" onClick={() => runBatchTokenAction('delete')} disabled={batchActionLoading || testingModelTokens} className="btn btn-link btn-link-danger">
             批量删除
           </button>
         </ResponsiveBatchActionBar>
       )}
+
+      {availabilityTooltip && typeof document !== 'undefined'
+        ? createPortal((
+          <div
+            className="token-availability-tooltip token-availability-tooltip-portal"
+            role="tooltip"
+            style={{
+              left: availabilityTooltip.left,
+              top: availabilityTooltip.top,
+            }}
+          >
+            {availabilityTooltip.rows.map((row) => (
+              <span className="token-availability-tooltip-row" key={row.label}>
+                <span className="token-availability-tooltip-label">{row.label}</span>
+                <span className={`token-availability-tooltip-value ${row.tone ? `is-${row.tone}` : ''}`.trim()}>
+                  {row.value}
+                </span>
+              </span>
+            ))}
+          </div>
+        ), document.body)
+        : null}
 
       <CenteredModal
         open={showAdd}
@@ -1169,7 +1897,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         </div>
       </CenteredModal>
 
-      <div className="card" style={{ overflowX: 'auto' }}>
+      <div className="card token-table-card">
         {loading ? (
           <div style={{ padding: 20 }}>
             <div className="skeleton" style={{ width: '100%', height: 34, marginBottom: 8 }} />
@@ -1206,7 +1934,10 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                         </button>
                         {!isPending ? (
                           <button
-                            onClick={() => handleCopyToken(token.id, token.name || '')}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void handleCopyToken(token.id, token.name || '');
+                            }}
                             disabled={!!rowLoading[`${loadingPrefix}-copy`]}
                             className="btn btn-link btn-link-primary"
                             data-testid={`token-copy-${token.id}`}
@@ -1214,8 +1945,22 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                             {rowLoading[`${loadingPrefix}-copy`] ? <span className="spinner spinner-sm" /> : '复制'}
                           </button>
                         ) : null}
+                        {!isPending ? (
+                          <button
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void openTokenModels(token);
+                            }}
+                            className="btn btn-link btn-link-info"
+                          >
+                            模型
+                          </button>
+                        ) : null}
                         <button
-                          onClick={() => openEditPanel(token)}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            openEditPanel(token);
+                          }}
                           className="btn btn-link btn-link-info"
                         >
                           {isPending ? '编辑补全' : '编辑'}
@@ -1225,6 +1970,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                   >
                     <MobileField label="账号" value={token.account?.username || `account-${token.accountId}`} />
                     <MobileField label="分组" value={token.tokenGroup || 'default'} />
+                    <MobileField label="倍率" value={formatGroupRatio(token.groupRatio) || '-'} />
                     <MobileField
                       label="状态"
                       value={(
@@ -1233,6 +1979,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                         </span>
                       )}
                     />
+                    <MobileField label="可用" value={renderAvailabilityBadge(token)} />
                     {isExpanded ? (
                       <div className="mobile-card-extra">
                         <MobileField
@@ -1267,11 +2014,10 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                         <div className="mobile-card-actions">
                           {!isPending && !token.isDefault && (
                             <button
-                              onClick={() => withRowLoading(`${loadingPrefix}-default`, async () => {
-                                await api.setDefaultAccountToken(token.id);
-                                toast.success('默认令牌已更新');
-                                await load();
-                              })}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                void handleSetDefaultToken(token);
+                              }}
                               disabled={!!rowLoading[`${loadingPrefix}-default`]}
                               className="btn btn-link btn-link-info"
                             >
@@ -1280,11 +2026,17 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                           )}
                           {!isPending ? (
                             <button
-                              onClick={() => withRowLoading(`${loadingPrefix}-toggle`, async () => {
-                                await api.updateAccountToken(token.id, { enabled: !token.enabled });
-                                toast.success(token.enabled ? '令牌已禁用' : '令牌已启用');
-                                await load();
-                              })}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                void withRowLoading(`${loadingPrefix}-toggle`, async () => {
+                                  await api.updateAccountToken(token.id, { enabled: !token.enabled });
+                                  toast.success(token.enabled ? '令牌已禁用' : '令牌已启用');
+                                  patchTokenRow(token.id, {
+                                    enabled: !token.enabled,
+                                    updatedAt: new Date().toISOString(),
+                                  });
+                                });
+                              }}
                               disabled={!!rowLoading[`${loadingPrefix}-toggle`]}
                               className={`btn btn-link ${token.enabled ? 'btn-link-warning' : 'btn-link-primary'}`}
                             >
@@ -1292,7 +2044,10 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                             </button>
                           ) : null}
                           <button
-                            onClick={() => setDeleteConfirm({ mode: 'single', tokenId: token.id, tokenName: token.name || '' })}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setDeleteConfirm({ mode: 'single', tokenId: token.id, tokenName: token.name || '' });
+                            }}
                             disabled={!!rowLoading[`${loadingPrefix}-delete`]}
                             className="btn btn-link btn-link-danger"
                           >
@@ -1316,15 +2071,17 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                     onChange={(e) => toggleSelectAllTokens(e.target.checked)}
                   />
                 </th>
-                <th>令牌名称</th>
-                <th>令牌值</th>
-                <th>来源站点</th>
-                <th>账号</th>
-                <th>分组</th>
-                <th>状态</th>
-                <th>默认</th>
-                <th>更新时间</th>
-                <th className="token-table-actions-col" style={{ textAlign: 'right' }}>操作</th>
+                <th className="token-table-name-col">{renderTokenSortLabel('令牌名称', 'name')}</th>
+                <th className="token-table-token-col">{renderTokenSortLabel('令牌值', 'token')}</th>
+                <th className="token-table-site-col">{renderTokenSortLabel('来源站点', 'site')}</th>
+                <th className="token-table-account-col">{renderTokenSortLabel('账号', 'account')}</th>
+                <th className="token-table-group-col">{renderTokenSortLabel('分组', 'group')}</th>
+                <th className="token-table-ratio-col">{renderTokenSortLabel('倍率', 'ratio')}</th>
+                <th className="token-table-status-col">{renderTokenSortLabel('状态', 'status')}</th>
+                <th className="token-table-availability-col">{renderTokenSortLabel('可用', 'availability')}</th>
+                <th className="token-table-default-col">{renderTokenSortLabel('默认', 'default')}</th>
+                <th className="token-table-updated-col">{renderTokenSortLabel('更新时间', 'updatedAt')}</th>
+                <th className="token-table-actions-col">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -1372,8 +2129,16 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                         </span>
                       )}
                     </td>
-                    <td>{token.account?.username || `account-${token.accountId}`}</td>
+                    <td className="token-account-cell">
+                      <span className="token-account-name">{token.account?.username || `account-${token.accountId}`}</span>
+                      <span className="token-account-meta">#{token.account?.id || token.accountId}</span>
+                    </td>
                     <td>{token.tokenGroup || 'default'}</td>
+                    <td>
+                      <span style={{ color: token.groupRatioAvailable ? 'var(--color-primary)' : 'var(--color-text-muted)', fontWeight: token.groupRatioAvailable ? 700 : 400 }}>
+                        {formatGroupRatio(token.groupRatio)}
+                      </span>
+                    </td>
                     <td>
                       {isPending ? (
                         <span className="badge badge-warning" style={{ fontSize: 11 }}>待补全</span>
@@ -1383,17 +2148,17 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                         </span>
                       )}
                     </td>
+                    <td>{renderAvailabilityBadge(token)}</td>
                     <td>{token.isDefault ? <span className="badge badge-warning" style={{ fontSize: 11 }}>默认</span> : '-'}</td>
                     <td style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>{formatDateTimeLocal(token.updatedAt)}</td>
-                    <td className="token-actions-cell" style={{ textAlign: 'right' }}>
+                    <td className="token-actions-cell">
                       <div className="token-table-actions">
                         {!isPending && !token.isDefault && (
                           <button
-                            onClick={() => withRowLoading(`${loadingPrefix}-default`, async () => {
-                              await api.setDefaultAccountToken(token.id);
-                              toast.success('默认令牌已更新');
-                              await load();
-                            })}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void handleSetDefaultToken(token);
+                            }}
                             disabled={!!rowLoading[`${loadingPrefix}-default`]}
                             className="btn btn-link btn-link-info token-table-action-btn"
                           >
@@ -1402,7 +2167,10 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                         )}
                         {!isPending ? (
                           <button
-                            onClick={() => handleCopyToken(token.id, token.name || '')}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void handleCopyToken(token.id, token.name || '');
+                            }}
                             disabled={!!rowLoading[`${loadingPrefix}-copy`]}
                             className="btn btn-link btn-link-primary token-table-action-btn"
                             data-testid={`token-copy-${token.id}`}
@@ -1410,19 +2178,39 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                             {rowLoading[`${loadingPrefix}-copy`] ? <span className="spinner spinner-sm" /> : '复制'}
                           </button>
                         ) : null}
+                        {!isPending ? (
+                          <button
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void openTokenModels(token);
+                            }}
+                            className="btn btn-link btn-link-info token-table-action-btn"
+                          >
+                            模型
+                          </button>
+                        ) : null}
                         <button
-                          onClick={() => openEditPanel(token)}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            openEditPanel(token);
+                          }}
                           className="btn btn-link btn-link-info token-table-action-btn"
                         >
                           {isPending ? '编辑补全' : '编辑'}
                         </button>
                         {!isPending ? (
                           <button
-                            onClick={() => withRowLoading(`${loadingPrefix}-toggle`, async () => {
-                              await api.updateAccountToken(token.id, { enabled: !token.enabled });
-                              toast.success(token.enabled ? '令牌已禁用' : '令牌已启用');
-                              await load();
-                            })}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void withRowLoading(`${loadingPrefix}-toggle`, async () => {
+                                await api.updateAccountToken(token.id, { enabled: !token.enabled });
+                                toast.success(token.enabled ? '令牌已禁用' : '令牌已启用');
+                                patchTokenRow(token.id, {
+                                  enabled: !token.enabled,
+                                  updatedAt: new Date().toISOString(),
+                                });
+                              });
+                            }}
                             disabled={!!rowLoading[`${loadingPrefix}-toggle`]}
                             className={`btn btn-link ${token.enabled ? 'btn-link-warning' : 'btn-link-primary'} token-table-action-btn`}
                           >
@@ -1430,7 +2218,10 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                           </button>
                         ) : null}
                         <button
-                          onClick={() => setDeleteConfirm({ mode: 'single', tokenId: token.id, tokenName: token.name || '' })}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setDeleteConfirm({ mode: 'single', tokenId: token.id, tokenName: token.name || '' });
+                          }}
                           disabled={!!rowLoading[`${loadingPrefix}-delete`]}
                           className="btn btn-link btn-link-danger token-table-action-btn"
                         >

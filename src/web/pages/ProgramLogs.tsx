@@ -73,7 +73,10 @@ function eventStatusLabel(row: ProgramEvent) {
   if (text.includes('跳过') || text.includes('skipped')) {
     return { label: '跳过', cls: 'badge-warning' };
   }
-  if (text.includes('进行中') || text.includes('已开始') || text.includes('running') || text.includes('pending')) {
+  if (text.includes('已开始')) {
+    return { label: '已开始', cls: 'badge-info' };
+  }
+  if (text.includes('进行中') || text.includes('running') || text.includes('pending')) {
     return { label: '进行中', cls: 'badge-info' };
   }
   if (text.includes('成功') || text.includes('已完成') || text.includes('completed') || text.includes('finished')) {

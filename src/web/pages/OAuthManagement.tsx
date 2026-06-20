@@ -152,6 +152,12 @@ function normalizeOauthMessage(value: string | null | undefined): string {
 
   return text
     .replace(/codex usage windows inferred from rate limit response headers/ig, '额度窗口已从响应头推断')
+    .replace(/antigravity Google One AI credits loaded from loadCodeAssist/ig, 'Antigravity Google One AI 额度已同步')
+    .replace(/antigravity quota requires loadCodeAssist credit lookup/ig, '需要刷新 Antigravity 额度')
+    .replace(/refresh antigravity quota to populate Google One AI credit balance/ig, '刷新后显示 Google One AI 余额')
+    .replace(/refresh antigravity quota to populate Google One AI minimum usage amount/ig, '刷新后显示最低使用额度')
+    .replace(/antigravity GOOGLE_ONE_AI available credits(?: \([^)]+\))?/ig, 'Google One AI 余额')
+    .replace(/antigravity GOOGLE_ONE_AI minimum credit amount for usage/ig, '最低使用额度')
     .replace(/official 5h quota window is not exposed by current codex oauth artifacts/ig, '当前 Codex OAuth 未暴露官方 5h 窗口')
     .replace(/official 7d quota window is not exposed by current codex oauth artifacts/ig, '当前 Codex OAuth 未暴露官方 7d 窗口')
     .replace(/official 5h quota window is unavailable for this provider/ig, '当前 Provider 不提供官方 5h 窗口')
@@ -354,7 +360,7 @@ function resolveQuotaStatusLabel(status?: OAuthQuotaInfo['status']): string {
 }
 
 function resolveQuotaSourceLabel(source?: OAuthQuotaInfo['source']): string {
-  return source === 'official' ? '官方' : '响应头推断';
+  return source === 'official' ? '官方' : '接口同步';
 }
 
 function resolveModelSyncStatusText(connection: OAuthConnectionInfo): string {
@@ -443,6 +449,13 @@ function resolveQuotaWindowPercent(window?: OAuthQuotaWindowInfo | null): number
 
 function resolveQuotaWindowSummary(window?: OAuthQuotaWindowInfo | null): string {
   if (!window || !window.supported) return '';
+  const message = normalizeOauthMessage(window.message || '');
+  const amount = typeof window.used === 'number'
+    ? window.used
+    : (typeof window.limit === 'number' ? window.limit : undefined);
+  if (message && amount !== undefined) {
+    return `${message} ${amount}`;
+  }
   if (typeof window.used === 'number' && typeof window.limit === 'number') {
     return `${window.used} / ${window.limit}`;
   }
@@ -450,7 +463,33 @@ function resolveQuotaWindowSummary(window?: OAuthQuotaWindowInfo | null): string
     return `剩余 ${window.remaining} / ${window.limit}`;
   }
   if (typeof window.limit === 'number') return `总量 ${window.limit}`;
-  return window.message || '官方未提供';
+  return message || '官方未提供';
+}
+
+function isAntigravityQuota(quota?: OAuthQuotaInfo | null): boolean {
+  return !!quota?.providerMessage?.includes('Google One AI');
+}
+
+function resolveAntigravityPlan(quota: OAuthQuotaInfo): string {
+  const plan = asTrimmedString(quota.subscription?.planType || '');
+  if (plan) return plan;
+  const tier = quota.providerMessage?.match(/\(([^)]+)\)/)?.[1];
+  if (tier?.includes('pro')) return 'Pro';
+  return 'Pro';
+}
+
+function resolveAntigravityWindowValue(window?: OAuthQuotaWindowInfo | null): string {
+  if (!window?.supported) return '不可用';
+  if (typeof window.remaining === 'number') return `剩余 ${window.remaining}`;
+  if (typeof window.used === 'number') return `使用门槛 ${window.used}`;
+  if (typeof window.limit === 'number') return `额度 ${window.limit}`;
+  return '额度可用';
+}
+
+function resolveAntigravityWindowRefresh(window?: OAuthQuotaWindowInfo | null, quota?: OAuthQuotaInfo): string {
+  if (window?.resetAt) return `${formatResetLabel(window.resetAt)} 后刷新`;
+  if (quota?.lastSyncAt) return '已同步';
+  return '刷新后更新';
 }
 
 function resolveProxyProjectSummary(connection: OAuthConnectionInfo): string {
@@ -564,6 +603,75 @@ function QuotaWindowRow({
           <span className="oauth-window-reset">重置 {formatResetLabel(window.resetAt)}</span>
         ) : null}
       </div>
+    </div>
+  );
+}
+
+function AntigravityQuotaLine({
+  label,
+  window,
+  quota,
+}: {
+  label: string;
+  window?: OAuthQuotaWindowInfo | null;
+  quota: OAuthQuotaInfo;
+}) {
+  const supported = !!window?.supported;
+  return (
+    <div className="oauth-antigravity-limit-row">
+      <span className="oauth-antigravity-limit-label">{label}</span>
+      <span className={supported ? 'oauth-antigravity-limit-value' : 'oauth-antigravity-limit-value is-muted'}>
+        {resolveAntigravityWindowValue(window)}
+      </span>
+      <span className="oauth-antigravity-limit-reset">{resolveAntigravityWindowRefresh(window, quota)}</span>
+      <span className="oauth-antigravity-bar" aria-hidden="true">
+        <span
+          className="oauth-antigravity-bar-fill"
+          style={{ width: supported ? '100%' : '0%' }}
+        />
+      </span>
+    </div>
+  );
+}
+
+function AntigravityQuotaFamily({
+  title,
+  models,
+  quota,
+}: {
+  title: string;
+  models: string;
+  quota: OAuthQuotaInfo;
+}) {
+  return (
+    <div className="oauth-antigravity-family">
+      <div className="oauth-antigravity-title">{title}</div>
+      <div className="oauth-antigravity-models">此分组包含：{models}</div>
+      <AntigravityQuotaLine label="5 小时限额" window={quota.windows?.fiveHour} quota={quota} />
+      <AntigravityQuotaLine label="周限额" window={quota.windows?.sevenDay} quota={quota} />
+    </div>
+  );
+}
+
+function AntigravityQuotaPanel({ quota }: { quota: OAuthQuotaInfo }) {
+  const tier = quota.providerMessage?.match(/\(([^)]+)\)/)?.[1];
+  return (
+    <div className="oauth-antigravity-quota">
+      <div className="oauth-antigravity-plan">
+        <span>套餐</span>
+        <strong>{resolveAntigravityPlan(quota)}</strong>
+        {tier ? <span className="oauth-antigravity-tier">{tier}</span> : null}
+      </div>
+      <AntigravityQuotaFamily
+        title="Gemini 模型"
+        models="Gemini Flash, Gemini Pro"
+        quota={quota}
+      />
+      <AntigravityQuotaFamily
+        title="Claude 和 GPT 模型"
+        models="Claude Opus, Claude Sonnet, GPT-OSS"
+        quota={quota}
+      />
     </div>
   );
 }
@@ -1842,8 +1950,14 @@ export default function OAuthManagement() {
                         </span>
                         <span className="oauth-cell-tertiary">{resolveQuotaSourceLabel(quota.source)}</span>
                       </div>
-                      <QuotaWindowRow label="5h" window={quota.windows?.fiveHour} />
-                      <QuotaWindowRow label="7d" window={quota.windows?.sevenDay} />
+                      {isAntigravityQuota(quota) ? (
+                        <AntigravityQuotaPanel quota={quota} />
+                      ) : (
+                        <>
+                          <QuotaWindowRow label="5h" window={quota.windows?.fiveHour} />
+                          <QuotaWindowRow label="7d" window={quota.windows?.sevenDay} />
+                        </>
+                      )}
                     </div>
                   ) : (
                     <span className="oauth-cell-secondary">--</span>
@@ -1985,8 +2099,14 @@ export default function OAuthManagement() {
                     </span>
                     <span className="oauth-cell-tertiary">{resolveQuotaSourceLabel(quota.source)}</span>
                   </div>
-                  <QuotaWindowRow label="5h" window={quota.windows?.fiveHour} />
-                  <QuotaWindowRow label="7d" window={quota.windows?.sevenDay} />
+                  {isAntigravityQuota(quota) ? (
+                    <AntigravityQuotaPanel quota={quota} />
+                  ) : (
+                    <>
+                      <QuotaWindowRow label="5h" window={quota.windows?.fiveHour} />
+                      <QuotaWindowRow label="7d" window={quota.windows?.sevenDay} />
+                    </>
+                  )}
                 </>
               ) : (
                 <div className="oauth-cell-secondary">--</div>

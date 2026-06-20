@@ -480,6 +480,8 @@ export type ProxyLogListItem = {
   clientConfidence?: ProxyLogClientConfidence;
   usageSource?: ProxyLogUsageSource;
   promptTokens?: number | null;
+  cacheReadTokens?: number | null;
+  cacheHitRate?: number | null;
   completionTokens?: number | null;
   estimatedCost?: number | null;
 };
@@ -870,6 +872,19 @@ export const api = {
   // Account tokens
   getAccountTokens: (accountId?: number) =>
     request(`/api/account-tokens${accountId ? `?accountId=${accountId}` : ""}`),
+  getTokenGroupPricingOverview: (options?: { refresh?: boolean }) =>
+    request(
+      `/api/account-tokens/group-pricing/overview${buildQueryString(
+        options?.refresh ? { refresh: true } : undefined,
+      )}`,
+    ),
+  getTokenGroupPricingGroups: (options?: { model?: string; sortBy?: string; sortOrder?: string }) =>
+    request(`/api/account-tokens/group-pricing/groups${buildQueryString(options)}`),
+  syncTokenGroupPricingGroups: () =>
+    request("/api/account-tokens/group-pricing/sync", {
+      method: "POST",
+      timeoutMs: 150_000,
+    }),
   addAccountToken: (data: any) =>
     request("/api/account-tokens", {
       method: "POST",
@@ -893,6 +908,18 @@ export const api = {
     request(`/api/account-tokens/${id}/default`, { method: "POST" }),
   getAccountTokenValue: (id: number) =>
     request(`/api/account-tokens/${id}/value`),
+  getAccountTokenModels: (id: number, options?: { refresh?: boolean }) =>
+    request(`/api/account-tokens/${id}/models${buildQueryString(
+      options?.refresh === false ? { refresh: false } : undefined,
+    )}`, {
+      timeoutMs: options?.refresh === false ? 30_000 : 60_000,
+    }),
+  testAccountTokenModelAvailability: (data: { model: string; tokenIds: number[] }) =>
+    request("/api/account-tokens/models/test", {
+      method: "POST",
+      body: JSON.stringify(data),
+      timeoutMs: 240_000,
+    }),
   syncAccountTokens: (accountId: number) =>
     request(`/api/account-tokens/sync/${accountId}`, {
       method: "POST",
@@ -903,6 +930,12 @@ export const api = {
       method: "POST",
       body: JSON.stringify(wait ? { wait: true } : {}),
       timeoutMs: wait ? 150_000 : 30_000,
+    }),
+  ensureAllAccountGroupTokens: (wait = false) =>
+    request("/api/account-tokens/groups/ensure-all", {
+      method: "POST",
+      body: JSON.stringify(wait ? { wait: true } : {}),
+      timeoutMs: wait ? 240_000 : 30_000,
     }),
 
   // Check-in

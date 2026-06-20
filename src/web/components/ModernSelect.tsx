@@ -23,6 +23,7 @@ type ModernSelectProps = {
   size?: 'md' | 'sm';
   searchable?: boolean;
   searchPlaceholder?: string;
+  menuPlacement?: 'overlay' | 'inline';
 };
 
 export default function ModernSelect({
@@ -38,6 +39,7 @@ export default function ModernSelect({
   size = 'md',
   searchable = false,
   searchPlaceholder = 'Search...',
+  menuPlacement = 'overlay',
 }: ModernSelectProps) {
   const [open, setOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -115,7 +117,7 @@ export default function ModernSelect({
     <div
       ref={rootRef}
       data-testid={dataTestId}
-      className={`modern-select ${open ? 'is-open' : ''} ${disabled ? 'is-disabled' : ''} ${size === 'sm' ? 'is-sm' : ''} ${className}`.trim()}
+      className={`modern-select ${open ? 'is-open' : ''} ${disabled ? 'is-disabled' : ''} ${size === 'sm' ? 'is-sm' : ''} ${menuPlacement === 'inline' ? 'is-inline-menu' : ''} ${className}`.trim()}
     >
       <button
         type="button"

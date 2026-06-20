@@ -323,14 +323,35 @@ function formatCompactNumber(value: number, digits = 6) {
   return formatted || "0";
 }
 
+function toFiniteNumber(value: unknown, fallback = 0) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Number(value.trim());
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return fallback;
+}
+
 function formatPerMillionPrice(value: number) {
   return `$${formatCompactNumber(value)} / 1M tokens`;
+}
+
+function formatBillingFormulaLine(
+  label: string,
+  tokens: unknown,
+  pricePerMillion: unknown,
+  cost: unknown,
+) {
+  const safeTokens = toFiniteNumber(tokens);
+  const safePrice = toFiniteNumber(pricePerMillion);
+  const safeCost = toFiniteNumber(cost);
+  return `${label}：${safeTokens.toLocaleString()} tokens * $${formatCompactNumber(safePrice)} / 1,000,000 = $${safeCost.toFixed(6)}`;
 }
 
 function formatBillingDetailSummary(log: ProxyLogRenderItem) {
   const detail = log.billingDetails;
   if (!detail) return null;
-  return `模型倍率 ${formatCompactNumber(detail.pricing.modelRatio)}，输出倍率 ${formatCompactNumber(detail.pricing.completionRatio)}，缓存倍率 ${formatCompactNumber(detail.pricing.cacheRatio)}，缓存创建倍率 ${formatCompactNumber(detail.pricing.cacheCreationRatio)}，分组倍率 ${formatCompactNumber(detail.pricing.groupRatio)}`;
+  return `模型倍率 ${formatCompactNumber(toFiniteNumber(detail.pricing?.modelRatio))}，输出倍率 ${formatCompactNumber(toFiniteNumber(detail.pricing?.completionRatio))}，缓存倍率 ${formatCompactNumber(toFiniteNumber(detail.pricing?.cacheRatio))}，缓存创建倍率 ${formatCompactNumber(toFiniteNumber(detail.pricing?.cacheCreationRatio))}，分组倍率 ${formatCompactNumber(toFiniteNumber(detail.pricing?.groupRatio))}`;
 }
 
 function formatProxyLogUsageSource(
@@ -344,6 +365,11 @@ function formatProxyLogUsageSource(
 
 function formatProxyLogTokenValue(value: number | null | undefined): string {
   return typeof value === "number" ? value.toLocaleString() : "--";
+}
+
+function formatProxyLogPercentValue(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "--";
+  return `${formatCompactNumber(value, 2)}%`;
 }
 
 function renderDownstreamKeySummary(log: ProxyLogRenderItem) {
@@ -360,44 +386,43 @@ function renderDownstreamKeySummary(log: ProxyLogRenderItem) {
 function buildBillingProcessLines(log: ProxyLogRenderItem) {
   const detail = log.billingDetails;
   if (!detail) return [];
+  const usage = detail.usage || {};
+  const breakdown = detail.breakdown || {};
+  const displayCost =
+    typeof log.estimatedCost === "number" && Number.isFinite(log.estimatedCost)
+      ? log.estimatedCost
+      : toFiniteNumber(breakdown.totalCost);
 
   const lines = [
-    `提示价格：${formatPerMillionPrice(detail.breakdown.inputPerMillion)}`,
-    `补全价格：${formatPerMillionPrice(detail.breakdown.outputPerMillion)}`,
+    formatBillingFormulaLine(
+      "缓存输入",
+      usage.cacheReadTokens,
+      breakdown.cacheReadPerMillion,
+      breakdown.cacheReadCost,
+    ),
+    formatBillingFormulaLine(
+      "普通输入",
+      usage.billablePromptTokens,
+      breakdown.inputPerMillion,
+      breakdown.inputCost,
+    ),
+    formatBillingFormulaLine(
+      "缓存创建",
+      usage.cacheCreationTokens,
+      breakdown.cacheCreationPerMillion,
+      breakdown.cacheCreationCost,
+    ),
+    formatBillingFormulaLine(
+      "输出",
+      usage.completionTokens,
+      breakdown.outputPerMillion,
+      breakdown.outputCost,
+    ),
   ];
 
-  if (detail.usage.cacheReadTokens > 0) {
-    lines.push(
-      `缓存价格：${formatPerMillionPrice(detail.breakdown.cacheReadPerMillion)} (缓存倍率: ${formatCompactNumber(detail.pricing.cacheRatio)})`,
-    );
-  }
-
-  if (detail.usage.cacheCreationTokens > 0) {
-    lines.push(
-      `缓存创建价格：${formatPerMillionPrice(detail.breakdown.cacheCreationPerMillion)} (缓存创建倍率: ${formatCompactNumber(detail.pricing.cacheCreationRatio)})`,
-    );
-  }
-
-  const parts = [
-    `提示 ${detail.usage.billablePromptTokens.toLocaleString()} tokens / 1M tokens * $${formatCompactNumber(detail.breakdown.inputPerMillion)}`,
-  ];
-
-  if (detail.usage.cacheReadTokens > 0) {
-    parts.push(
-      `缓存 ${detail.usage.cacheReadTokens.toLocaleString()} tokens / 1M tokens * $${formatCompactNumber(detail.breakdown.cacheReadPerMillion)}`,
-    );
-  }
-
-  if (detail.usage.cacheCreationTokens > 0) {
-    parts.push(
-      `缓存创建 ${detail.usage.cacheCreationTokens.toLocaleString()} tokens / 1M tokens * $${formatCompactNumber(detail.breakdown.cacheCreationPerMillion)}`,
-    );
-  }
-
-  parts.push(
-    `补全 ${detail.usage.completionTokens.toLocaleString()} tokens / 1M tokens * $${formatCompactNumber(detail.breakdown.outputPerMillion)} = $${detail.breakdown.totalCost.toFixed(6)}`,
+  lines.push(
+    `合计花费：$${displayCost.toFixed(6)}（总 tokens ${toFiniteNumber(usage.totalTokens).toLocaleString()}，与列表花费一致）`,
   );
-  lines.push(parts.join(" + "));
 
   return lines;
 }
@@ -788,7 +813,7 @@ export default function ProxyLogs() {
   const [clientOptions, setClientOptions] = useState<ProxyLogClientOption[]>(
     [],
   );
-  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [autoRefresh, setAutoRefresh] = useState(true);
   const [showDebugSettingsModal, setShowDebugSettingsModal] = useState(false);
   const [debugPanelLoading, setDebugPanelLoading] = useState(false);
   const [debugPanelSaving, setDebugPanelSaving] = useState(false);
@@ -2708,6 +2733,18 @@ export default function ProxyLogs() {
                       </div>
                     </div>
                     <div className="mobile-summary-metric">
+                      <div className="mobile-summary-metric-label">缓存输入</div>
+                      <div className="mobile-summary-metric-value">
+                        {formatProxyLogTokenValue(log.cacheReadTokens)}
+                      </div>
+                    </div>
+                    <div className="mobile-summary-metric">
+                      <div className="mobile-summary-metric-label">命中率</div>
+                      <div className="mobile-summary-metric-value">
+                        {formatProxyLogPercentValue(log.cacheHitRate)}
+                      </div>
+                    </div>
+                    <div className="mobile-summary-metric">
                       <div className="mobile-summary-metric-label">输出</div>
                       <div className="mobile-summary-metric-value">
                         {formatProxyLogTokenValue(log.completionTokens)}
@@ -2824,6 +2861,8 @@ export default function ProxyLogs() {
                 <th>客户端</th>
                 <th>{tr("状态")}</th>
                 <th style={{ textAlign: "center" }}>用时</th>
+                <th style={{ textAlign: "right" }}>缓存输入</th>
+                <th style={{ textAlign: "right" }}>命中率</th>
                 <th style={{ textAlign: "right" }}>输入</th>
                 <th style={{ textAlign: "right" }}>输出</th>
                 <th style={{ textAlign: "right" }}>花费</th>
@@ -3025,6 +3064,26 @@ export default function ProxyLogs() {
                           color: "var(--color-text-secondary)",
                         }}
                       >
+                        {formatProxyLogTokenValue(log.cacheReadTokens)}
+                      </td>
+                      <td
+                        style={{
+                          textAlign: "right",
+                          fontSize: 12,
+                          fontVariantNumeric: "tabular-nums",
+                          color: "var(--color-text-secondary)",
+                        }}
+                      >
+                        {formatProxyLogPercentValue(log.cacheHitRate)}
+                      </td>
+                      <td
+                        style={{
+                          textAlign: "right",
+                          fontSize: 12,
+                          fontVariantNumeric: "tabular-nums",
+                          color: "var(--color-text-secondary)",
+                        }}
+                      >
                         {formatProxyLogTokenValue(log.promptTokens)}
                       </td>
                       <td
@@ -3071,7 +3130,7 @@ export default function ProxyLogs() {
                     </tr>
                     {expanded === log.id && (
                       <tr style={{ background: "var(--color-bg)" }}>
-                        <td colSpan={11} style={{ padding: 0 }}>
+                        <td colSpan={13} style={{ padding: 0 }}>
                           <div className="anim-collapse is-open">
                             <div className="anim-collapse-inner">
                               <div
@@ -3267,9 +3326,7 @@ export default function ProxyLogs() {
                                   </div>
                                 </div>
 
-                                {detailLog.billingDetails &&
-                                  detailLog.billingDetails.usage
-                                    .cacheReadTokens > 0 && (
+                                {detailLog.billingDetails && (
                                     <div style={{ display: "flex", gap: 6 }}>
                                       <span
                                         style={{
@@ -3278,17 +3335,20 @@ export default function ProxyLogs() {
                                           flexShrink: 0,
                                         }}
                                       >
-                                        缓存 Tokens
+                                        命中缓存 Tokens
                                       </span>
                                       <span>
-                                        {detailLog.billingDetails.usage.cacheReadTokens.toLocaleString()}
+                                        {formatProxyLogTokenValue(
+                                          toFiniteNumber(
+                                            detailLog.billingDetails.usage
+                                              ?.cacheReadTokens,
+                                          ),
+                                        )}
                                       </span>
                                     </div>
                                   )}
 
-                                {detailLog.billingDetails &&
-                                  detailLog.billingDetails.usage
-                                    .cacheCreationTokens > 0 && (
+                                {detailLog.billingDetails && (
                                     <div style={{ display: "flex", gap: 6 }}>
                                       <span
                                         style={{
@@ -3300,7 +3360,12 @@ export default function ProxyLogs() {
                                         缓存创建 Tokens
                                       </span>
                                       <span>
-                                        {detailLog.billingDetails.usage.cacheCreationTokens.toLocaleString()}
+                                        {formatProxyLogTokenValue(
+                                          toFiniteNumber(
+                                            detailLog.billingDetails.usage
+                                              ?.cacheCreationTokens,
+                                          ),
+                                        )}
                                       </span>
                                     </div>
                                   )}

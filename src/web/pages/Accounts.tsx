@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useLocation, useNavigate } from "react-router-dom";
 import { api } from "../api.js";
 import CenteredModal from "../components/CenteredModal.js";
@@ -39,6 +40,21 @@ import { getSiteInitializationPreset } from "../../shared/siteInitializationPres
 import { parseBatchApiKeys } from "../../shared/apiKeyBatch.js";
 
 type ConnectionsSegment = "session" | "apikey" | "tokens";
+
+type AccountCredentialPopoverState = {
+  account: any;
+  left: number;
+  top: number;
+};
+
+type AccountCredentialEditForm = {
+  accountId: number;
+  username: string;
+  password: string;
+};
+
+const ACCOUNT_CREDENTIAL_POPOVER_WIDTH = 360;
+const ACCOUNT_CREDENTIAL_POPOVER_GAP = 10;
 
 const ACCOUNT_SEGMENTS: Array<{
   value: ConnectionsSegment;
@@ -104,6 +120,18 @@ function resolveConnectionsSegment(search: string): ConnectionsSegment {
   return "session";
 }
 
+function formatAccountCacheHitRate(value: unknown): string {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) return "-";
+  return `${numeric.toFixed(2).replace(/\.?0+$/, "")}%`;
+}
+
+function formatAccountCacheTokens(value: unknown): string {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return "0";
+  return Math.trunc(numeric).toLocaleString();
+}
+
 export default function Accounts() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -137,6 +165,11 @@ export default function Accounts() {
   );
   const [embeddedTokenActions, setEmbeddedTokenActions] =
     useState<React.ReactNode>(null);
+  const [credentialPopover, setCredentialPopover] =
+    useState<AccountCredentialPopoverState | null>(null);
+  const [credentialEditForm, setCredentialEditForm] =
+    useState<AccountCredentialEditForm | null>(null);
+  const [credentialSaving, setCredentialSaving] = useState(false);
   const [selectedAccountIds, setSelectedAccountIds] = useState<number[]>([]);
   const [batchActionLoading, setBatchActionLoading] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<null | {
@@ -192,6 +225,8 @@ export default function Accounts() {
   });
   const rowRefs = useRef<Map<number, HTMLTableRowElement>>(new Map());
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const credentialPopoverCloseTimerRef =
+    useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastRebindTargetRef = useRef<any | null>(null);
   const modelModalRequestSeqRef = useRef(0);
   const toast = useToast();
@@ -200,11 +235,9 @@ export default function Accounts() {
   const isRebindSub2Api =
     (activeRebindTarget?.site?.platform || "").toLowerCase() === "sub2api";
 
-  const load = async (forceRefresh = false) => {
+  const load = async (_forceRefresh = false) => {
     try {
-      const snapshot = await api.getAccountsSnapshot(
-        forceRefresh ? { refresh: true } : undefined,
-      );
+      const snapshot = await api.getAccountsSnapshot({ refresh: true });
       const nextAccounts = Array.isArray(snapshot?.accounts)
         ? snapshot.accounts
         : [];
@@ -378,6 +411,9 @@ export default function Accounts() {
     return () => {
       if (highlightTimerRef.current) {
         clearTimeout(highlightTimerRef.current);
+      }
+      if (credentialPopoverCloseTimerRef.current) {
+        clearTimeout(credentialPopoverCloseTimerRef.current);
       }
     };
   }, []);
@@ -931,6 +967,139 @@ export default function Accounts() {
     };
   };
 
+  const resolveLoginCredential = (account: any) => {
+    const credential = account?.loginCredential || {};
+    return {
+      username: String(credential.username || account?.username || "").trim(),
+      password: typeof credential.password === "string" ? credential.password : "",
+      available: Boolean(credential.available && credential.password),
+    };
+  };
+
+  const copyAccountCredential = async (
+    event: React.MouseEvent<HTMLButtonElement>,
+    value: string,
+    label: string,
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!value) {
+      toast.info(`${label}为空，无法复制`);
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(value);
+      toast.success(`${label}已复制`);
+    } catch {
+      toast.error(`${label}复制失败`);
+    }
+  };
+
+  const clearCredentialPopoverCloseTimer = () => {
+    if (!credentialPopoverCloseTimerRef.current) return;
+    clearTimeout(credentialPopoverCloseTimerRef.current);
+    credentialPopoverCloseTimerRef.current = null;
+  };
+
+  const scheduleCredentialPopoverClose = () => {
+    clearCredentialPopoverCloseTimer();
+    credentialPopoverCloseTimerRef.current = setTimeout(() => {
+      setCredentialPopover(null);
+      setCredentialEditForm(null);
+      credentialPopoverCloseTimerRef.current = null;
+    }, 180);
+  };
+
+  const showCredentialPopover = (
+    event: React.MouseEvent<HTMLElement> | React.FocusEvent<HTMLElement>,
+    account: any,
+  ) => {
+    if (typeof window === "undefined") return;
+    clearCredentialPopoverCloseTimer();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const left = Math.max(
+      8,
+      Math.min(
+        rect.left,
+        window.innerWidth - ACCOUNT_CREDENTIAL_POPOVER_WIDTH - 8,
+      ),
+    );
+    const top = Math.max(
+      8,
+      rect.top - ACCOUNT_CREDENTIAL_POPOVER_GAP,
+    );
+    setCredentialPopover({ account, left, top });
+    setCredentialEditForm((current) =>
+      current?.accountId === account?.id ? current : null,
+    );
+  };
+
+  const startCredentialEdit = (account: any) => {
+    const credential = resolveLoginCredential(account);
+    setCredentialEditForm({
+      accountId: account.id,
+      username: credential.username,
+      password: credential.password,
+    });
+  };
+
+  const saveCredentialEdit = async () => {
+    if (!credentialPopover || !credentialEditForm) return;
+    const username = credentialEditForm.username.trim();
+    if (!username) {
+      toast.error("账号不能为空");
+      return;
+    }
+    setCredentialSaving(true);
+    try {
+      await api.updateAccount(credentialEditForm.accountId, {
+        username,
+        loginUsername: username,
+        loginPassword: credentialEditForm.password,
+      });
+      const updatedCredential = {
+        username,
+        password: credentialEditForm.password,
+        available: Boolean(username && credentialEditForm.password),
+      };
+      const applyLocalUpdate = (account: any) =>
+        account?.id === credentialEditForm.accountId
+          ? {
+              ...account,
+              username,
+              loginCredential: updatedCredential,
+            }
+          : account;
+
+      setAccounts((current) => current.map(applyLocalUpdate));
+      setCredentialPopover((current) =>
+        current?.account?.id === credentialEditForm.accountId
+          ? { ...current, account: applyLocalUpdate(current.account) }
+          : current,
+      );
+      setCredentialEditForm(null);
+      toast.success("登录凭据已保存");
+    } catch (e: any) {
+      toast.error(e?.message || "保存登录凭据失败");
+    } finally {
+      setCredentialSaving(false);
+    }
+  };
+
+  const renderConnectionName = (account: any) => {
+    return (
+      <div
+        className="account-name-hover"
+        onMouseEnter={(event) => showCredentialPopover(event, account)}
+        onMouseLeave={scheduleCredentialPopoverClose}
+        onFocus={(event) => showCredentialPopover(event, account)}
+        onBlur={scheduleCredentialPopoverClose}
+      >
+        <div className="account-name-text">{resolveAccountDisplayName(account)}</div>
+      </div>
+    );
+  };
+
   const openEditPanel = (account: any) => {
     const managedAuth = extractManagedSub2ApiAuth(account);
     const proxyUrl = parseAccountExtraConfig(account)?.proxyUrl || "";
@@ -1354,73 +1523,75 @@ export default function Accounts() {
         {activeSegment === "tokens" && embeddedTokenActions}
       </div>
 
-      <ResponsiveFilterPanel
-        isMobile={isMobile}
-        mobileOpen={showMobileTools}
-        onMobileClose={() => setShowMobileTools(false)}
-        mobileTitle="连接排序与操作"
-        mobileContent={
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              <div style={{ fontSize: 12, color: "var(--color-text-muted)" }}>
-                排序方式
+      {activeSegment !== "tokens" && (
+        <ResponsiveFilterPanel
+          isMobile={isMobile}
+          mobileOpen={showMobileTools}
+          onMobileClose={() => setShowMobileTools(false)}
+          mobileTitle="连接排序与操作"
+          mobileContent={
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <div style={{ fontSize: 12, color: "var(--color-text-muted)" }}>
+                  排序方式
+                </div>
+                <ModernSelect
+                  value={sortMode}
+                  onChange={(nextValue) => setSortMode(nextValue as SortMode)}
+                  options={[
+                    { value: "custom", label: "自定义排序" },
+                    { value: "balance-desc", label: "余额高到低" },
+                    { value: "balance-asc", label: "余额低到高" },
+                  ]}
+                  placeholder="自定义排序"
+                />
               </div>
-              <ModernSelect
-                value={sortMode}
-                onChange={(nextValue) => setSortMode(nextValue as SortMode)}
-                options={[
-                  { value: "custom", label: "自定义排序" },
-                  { value: "balance-desc", label: "余额高到低" },
-                  { value: "balance-asc", label: "余额低到高" },
-                ]}
-                placeholder="自定义排序"
-              />
-            </div>
-            {activeSegment === "session" && (
+              {activeSegment === "session" && (
+                <button
+                  onClick={async () => {
+                    setShowMobileTools(false);
+                    await withLoading(
+                      "checkin-all",
+                      () => api.triggerCheckinAll(),
+                      "已触发全部签到",
+                    );
+                  }}
+                  disabled={actionLoading["checkin-all"]}
+                  className="btn btn-ghost"
+                  style={{ border: "1px solid var(--color-border)" }}
+                >
+                  {actionLoading["checkin-all"] ? (
+                    <>
+                      <span className="spinner spinner-sm" />
+                      {tr("签到中...")}
+                    </>
+                  ) : (
+                    tr("全部签到")
+                  )}
+                </button>
+              )}
               <button
                 onClick={async () => {
                   setShowMobileTools(false);
-                  await withLoading(
-                    "checkin-all",
-                    () => api.triggerCheckinAll(),
-                    "已触发全部签到",
-                  );
+                  await handleRefreshRuntimeHealth();
                 }}
-                disabled={actionLoading["checkin-all"]}
+                disabled={actionLoading["health-refresh"]}
                 className="btn btn-ghost"
                 style={{ border: "1px solid var(--color-border)" }}
               >
-                {actionLoading["checkin-all"] ? (
+                {actionLoading["health-refresh"] ? (
                   <>
                     <span className="spinner spinner-sm" />
-                    {tr("签到中...")}
+                    {tr("刷新状态中...")}
                   </>
                 ) : (
-                  tr("全部签到")
+                  tr("刷新账户状态")
                 )}
               </button>
-            )}
-            <button
-              onClick={async () => {
-                setShowMobileTools(false);
-                await handleRefreshRuntimeHealth();
-              }}
-              disabled={actionLoading["health-refresh"]}
-              className="btn btn-ghost"
-              style={{ border: "1px solid var(--color-border)" }}
-            >
-              {actionLoading["health-refresh"] ? (
-                <>
-                  <span className="spinner spinner-sm" />
-                  {tr("刷新状态中...")}
-                </>
-              ) : (
-                tr("刷新账户状态")
-              )}
-            </button>
-          </div>
-        }
-      />
+            </div>
+          }
+        />
+      )}
 
       <div
         style={{
@@ -2755,7 +2926,7 @@ export default function Accounts() {
                     return (
                       <MobileCard
                         key={a.id}
-                        title={resolveAccountDisplayName(a)}
+                        title={renderConnectionName(a)}
                         headerActions={
                           <div
                             style={{
@@ -2903,6 +3074,23 @@ export default function Accounts() {
                                 }}
                               >
                                 -{(a.todaySpend || 0).toFixed(2)}
+                              </div>
+                            </div>
+                          }
+                        />
+                        <MobileField
+                          label="缓存命中率"
+                          value={
+                            <div>
+                              <div>{formatAccountCacheHitRate(a.cacheHitRate)}</div>
+                              <div
+                                style={{
+                                  fontSize: 11,
+                                  color: "var(--color-text-muted)",
+                                  fontWeight: 500,
+                                }}
+                              >
+                                缓存 {formatAccountCacheTokens(a.cacheReadTokens)}
                               </div>
                             </div>
                           }
@@ -3101,6 +3289,7 @@ export default function Accounts() {
                       <th>运行健康状态</th>
                       <th>余额</th>
                       <th>已用</th>
+                      <th>缓存命中率</th>
                       <th>签到</th>
                       <th
                         className="accounts-actions-col"
@@ -3138,9 +3327,7 @@ export default function Accounts() {
                             />
                           </td>
                           <td style={{ color: "var(--color-text-primary)" }}>
-                            <div style={{ fontWeight: 600 }}>
-                              {resolveAccountDisplayName(a)}
-                            </div>
+                            {renderConnectionName(a)}
                             <div
                               style={{ display: "flex", gap: 4, marginTop: 4 }}
                             >
@@ -3253,6 +3440,23 @@ export default function Accounts() {
                               }}
                             >
                               -{(a.todaySpend || 0).toFixed(2)}
+                            </div>
+                          </td>
+                          <td
+                            style={{
+                              fontVariantNumeric: "tabular-nums",
+                              fontSize: 12,
+                            }}
+                          >
+                            <div>{formatAccountCacheHitRate(a.cacheHitRate)}</div>
+                            <div
+                              style={{
+                                fontSize: 11,
+                                color: "var(--color-text-muted)",
+                                fontWeight: 500,
+                              }}
+                            >
+                              缓存 {formatAccountCacheTokens(a.cacheReadTokens)}
                             </div>
                           </td>
                           <td>
@@ -3455,6 +3659,150 @@ export default function Accounts() {
           </div>
         </>
       )}
+
+      {credentialPopover && typeof document !== "undefined"
+        ? createPortal(
+          (() => {
+            const credential = resolveLoginCredential(credentialPopover.account);
+            const isEditing =
+              credentialEditForm?.accountId === credentialPopover.account?.id;
+            return (
+              <div
+                className="account-credential-popover account-credential-popover-portal"
+                style={{
+                  left: credentialPopover.left,
+                  top: credentialPopover.top,
+                }}
+                onMouseEnter={clearCredentialPopoverCloseTimer}
+                onMouseLeave={scheduleCredentialPopoverClose}
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="account-credential-title-row">
+                  <div className="account-credential-title">登录凭据</div>
+                  {!isEditing ? (
+                    <button
+                      type="button"
+                      className="account-credential-copy"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        startCredentialEdit(credentialPopover.account);
+                      }}
+                    >
+                      编辑
+                    </button>
+                  ) : null}
+                </div>
+                {isEditing && credentialEditForm ? (
+                  <>
+                    <label className="account-credential-field">
+                      <span className="account-credential-label">账号</span>
+                      <input
+                        className="account-credential-input"
+                        value={credentialEditForm.username}
+                        onChange={(event) =>
+                          setCredentialEditForm((current) =>
+                            current
+                              ? { ...current, username: event.target.value }
+                              : current,
+                          )
+                        }
+                        placeholder="输入登录账号"
+                      />
+                    </label>
+                    <label className="account-credential-field">
+                      <span className="account-credential-label">密码</span>
+                      <input
+                        className="account-credential-input"
+                        type="text"
+                        value={credentialEditForm.password}
+                        onChange={(event) =>
+                          setCredentialEditForm((current) =>
+                            current
+                              ? { ...current, password: event.target.value }
+                              : current,
+                          )
+                        }
+                        placeholder="输入登录密码"
+                      />
+                    </label>
+                    <div className="account-credential-actions">
+                      <button
+                        type="button"
+                        className="account-credential-copy"
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          setCredentialEditForm(null);
+                        }}
+                        disabled={credentialSaving}
+                      >
+                        取消
+                      </button>
+                      <button
+                        type="button"
+                        className="account-credential-save"
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          saveCredentialEdit();
+                        }}
+                        disabled={credentialSaving}
+                      >
+                        {credentialSaving ? "保存中" : "保存"}
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="account-credential-row">
+                      <span className="account-credential-label">账号</span>
+                      <span className="account-credential-value">
+                        {credential.username || "未保存"}
+                      </span>
+                      <button
+                        type="button"
+                        className="account-credential-copy"
+                        onClick={(event) =>
+                          copyAccountCredential(
+                            event,
+                            credential.username,
+                            "账号",
+                          )
+                        }
+                        disabled={!credential.username}
+                      >
+                        复制
+                      </button>
+                    </div>
+                    <div className="account-credential-row">
+                      <span className="account-credential-label">密码</span>
+                      <span className="account-credential-value is-secret">
+                        {credential.available ? credential.password : "未保存"}
+                      </span>
+                      <button
+                        type="button"
+                        className="account-credential-copy"
+                        onClick={(event) =>
+                          copyAccountCredential(
+                            event,
+                            credential.password,
+                            "密码",
+                          )
+                        }
+                        disabled={!credential.available}
+                      >
+                        复制
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            );
+          })(),
+          document.body,
+        )
+        : null}
 
       <AccountModelsModal
         modelModal={modelModal}

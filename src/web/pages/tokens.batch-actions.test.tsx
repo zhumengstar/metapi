@@ -12,6 +12,7 @@ const { apiMock } = vi.hoisted(() => ({
     getAccountsSnapshot: vi.fn(),
     getAccountTokenGroups: vi.fn(),
     batchUpdateAccountTokens: vi.fn(),
+    testAccountTokenModelAvailability: vi.fn(),
   },
 }));
 
@@ -38,6 +39,7 @@ describe('Tokens batch actions', () => {
         tokenMasked: 'sk-***1',
         enabled: true,
         isDefault: false,
+        modelNames: ['gpt-5.5', 'claude-sonnet-4-6'],
         account: { username: 'alpha' },
         site: { name: 'Site A', url: 'https://site-a.example.com' },
       },
@@ -48,6 +50,7 @@ describe('Tokens batch actions', () => {
         tokenMasked: 'sk-***2',
         enabled: true,
         isDefault: false,
+        modelNames: ['gpt-4o-mini'],
         account: { username: 'alpha' },
         site: { name: 'Site A', url: 'https://site-a.example.com' },
       },
@@ -67,6 +70,15 @@ describe('Tokens batch actions', () => {
       successIds: [1, 2],
       failedItems: [],
     });
+    apiMock.testAccountTokenModelAvailability.mockImplementation(async ({ model, tokenIds }: { model: string; tokenIds: number[] }) => ({
+      success: true,
+      results: tokenIds.map((tokenId) => ({
+        tokenId,
+        model,
+        available: true,
+        checkedAt: '2026-06-20T00:00:00.000Z',
+      })),
+    }));
   });
 
   afterEach(() => {
@@ -141,6 +153,55 @@ describe('Tokens batch actions', () => {
 
       const checkbox = root.root.find((node) => node.props['data-testid'] === 'token-select-1');
       expect(checkbox.props.checked).toBe(true);
+    } finally {
+      root?.unmount();
+    }
+  });
+
+  it('uses gpt-5.5 or the first token model when batch testing without an input model', async () => {
+    let root!: WebTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <ToastProvider>
+            <MemoryRouter initialEntries={['/accounts?segment=tokens']}>
+              <TokensPanel />
+            </MemoryRouter>
+          </ToastProvider>,
+        );
+      });
+      await flushMicrotasks();
+
+      const checkboxA = root.root.find((node) => node.props['data-testid'] === 'token-select-1');
+      const checkboxB = root.root.find((node) => node.props['data-testid'] === 'token-select-2');
+      await act(async () => {
+        checkboxA.props.onChange({ target: { checked: true } });
+        checkboxB.props.onChange({ target: { checked: true } });
+      });
+      await flushMicrotasks();
+
+      const batchTestButton = root.root
+        .findAll((node) => node.type === 'button')
+        .find((node) => Array.isArray(node.children) && node.children.includes('批量检测'));
+
+      expect(batchTestButton).toBeTruthy();
+      expect(batchTestButton!.props.disabled).toBe(false);
+      expect(batchTestButton!.props.title).toBe('未输入模型时默认检测 gpt-5.5，没有则检测令牌的第一个模型');
+
+      await act(async () => {
+        batchTestButton!.props.onClick();
+      });
+      await flushMicrotasks();
+
+      expect(apiMock.testAccountTokenModelAvailability).toHaveBeenCalledTimes(2);
+      expect(apiMock.testAccountTokenModelAvailability).toHaveBeenNthCalledWith(1, {
+        model: 'gpt-5.5',
+        tokenIds: [1],
+      });
+      expect(apiMock.testAccountTokenModelAvailability).toHaveBeenNthCalledWith(2, {
+        model: 'gpt-4o-mini',
+        tokenIds: [2],
+      });
     } finally {
       root?.unmount();
     }
