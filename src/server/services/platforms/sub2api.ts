@@ -15,6 +15,11 @@ function normalizeBaseUrl(baseUrl: string): string {
   return stripTrailingSlashes(baseUrl || '');
 }
 
+type Sub2ApiGroupEntry = {
+  id?: number;
+  name: string;
+};
+
 /**
  * Sub2API adapter.
  *
@@ -285,7 +290,7 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
     return items;
   }
 
-  private parseGroupItems(payload: any): string[] {
+  private parseGroupEntries(payload: any): Sub2ApiGroupEntry[] {
     const source = payload?.data ?? payload;
     const rawItems = (() => {
       if (Array.isArray(source)) return source;
@@ -296,37 +301,38 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
       return [];
     })();
 
-    const groups: string[] = [];
+    const groups: Sub2ApiGroupEntry[] = [];
     for (const item of rawItems) {
       if (item == null) continue;
       if (typeof item === 'number' && Number.isFinite(item) && item > 0) {
-        groups.push(String(Math.trunc(item)));
+        const id = Math.trunc(item);
+        groups.push({ id, name: String(id) });
         continue;
       }
       if (typeof item === 'string') {
         const normalized = item.trim();
-        if (normalized) groups.push(normalized);
+        if (normalized) groups.push({ name: normalized });
         continue;
       }
       if (typeof item !== 'object') continue;
 
+      const group = (item as any).group && typeof (item as any).group === 'object' && !Array.isArray((item as any).group)
+        ? (item as any).group
+        : null;
       const numericCandidates = [
         (item as any).group_id,
         (item as any).groupId,
         (item as any).id,
         (item as any).value,
+        group?.id,
       ];
-      let picked = '';
+      let pickedId: number | undefined;
       for (const candidate of numericCandidates) {
         const parsed = Number.parseInt(String(candidate), 10);
         if (Number.isFinite(parsed) && parsed > 0) {
-          picked = String(parsed);
+          pickedId = parsed;
           break;
         }
-      }
-      if (picked) {
-        groups.push(picked);
-        continue;
       }
 
       const textCandidates = [
@@ -336,16 +342,33 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
         (item as any).title,
         (item as any).label,
         (item as any).code,
+        group?.name,
+        group?.title,
       ];
+      let pickedName = '';
       for (const candidate of textCandidates) {
         if (typeof candidate !== 'string') continue;
         const normalized = candidate.trim();
         if (!normalized) continue;
-        groups.push(normalized);
+        pickedName = normalized;
         break;
+      }
+      if (pickedId || pickedName) {
+        groups.push({ id: pickedId, name: pickedName || String(pickedId) });
       }
     }
 
+    const seen = new Set<string>();
+    return groups.filter((item) => {
+      const key = `${item.id || ''}:${item.name}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  private parseGroupItems(payload: any): string[] {
+    const groups = this.parseGroupEntries(payload).map((item) => item.name).filter(Boolean);
     return Array.from(new Set(groups));
   }
 
@@ -377,6 +400,40 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
     }
 
     return [];
+  }
+
+  private async resolveGroupIdByName(baseUrl: string, accessToken: string, groupName: string): Promise<number | null> {
+    const normalizedGroupName = groupName.trim();
+    if (!normalizedGroupName) return null;
+    const directGroupId = this.parsePositiveInteger(normalizedGroupName);
+    if (directGroupId) return directGroupId;
+
+    const endpoints = [
+      '/api/v1/groups/available',
+      '/api/v1/groups?page=1&page_size=100',
+      '/api/v1/groups',
+      '/api/v1/group?page=1&page_size=100',
+      '/api/v1/group',
+    ];
+    const headers = this.buildAuthHeader(accessToken);
+    const normalize = (value: string) => value.trim().toLowerCase();
+    const target = normalize(normalizedGroupName);
+    for (const endpoint of endpoints) {
+      try {
+        const res = await this.fetchJson<any>(`${baseUrl}${endpoint}`, { headers });
+        const parsed = (() => {
+          try {
+            return this.parseSub2ApiEnvelope<any>(res, endpoint);
+          } catch {
+            return res;
+          }
+        })();
+        const group = this.parseGroupEntries(parsed).find((item) => normalize(item.name) === target);
+        if (group?.id) return group.id;
+      } catch {}
+    }
+
+    return null;
   }
 
   private parseGroupIdsFromTokenPayload(payload: any): string[] {
@@ -822,8 +879,14 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
       name: (options?.name || '').trim() || 'metapi',
     };
 
-    const groupId = Number.parseInt((options?.group || '').trim(), 10);
-    if (Number.isFinite(groupId) && groupId > 0) {
+    const requestedGroup = (options?.group || '').trim();
+    const groupId = requestedGroup
+      ? await this.resolveGroupIdByName(normalizedBase, accessToken, requestedGroup)
+      : null;
+    if (requestedGroup && !groupId) {
+      return false;
+    }
+    if (groupId) {
       payload.group_id = groupId;
     }
 

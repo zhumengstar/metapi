@@ -567,7 +567,7 @@ describe('Sub2ApiAdapter', () => {
     });
 
     const groups = await adapter.getUserGroups(baseUrl, 'jwt-token');
-    expect(groups).toEqual(['1', '2']);
+    expect(groups).toEqual(['default', 'vip']);
   });
 
   it('fetches user groups from /api/v1/groups/available', async () => {
@@ -588,7 +588,7 @@ describe('Sub2ApiAdapter', () => {
     });
 
     const groups = await adapter.getUserGroups(baseUrl, 'jwt-token');
-    expect(groups).toEqual(['5', '6']);
+    expect(groups).toEqual(['basic', 'pro']);
   });
 
   it('falls back to infer groups from /api/v1/keys when group endpoint is unavailable', async () => {
@@ -656,6 +656,48 @@ describe('Sub2ApiAdapter', () => {
     });
 
     const created = await adapter.createApiToken(baseUrl, 'jwt-token', undefined, { name: 'metapi-e2e' });
+    expect(created).toBe(true);
+  });
+
+  it('resolves group name to group_id when creating api key', async () => {
+    await startServer((req, res) => {
+      if (req.url === '/api/v1/groups/available') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          code: 0,
+          message: 'success',
+          data: [
+            { id: 3, name: 'pro' },
+            { id: 8, name: '生图' },
+          ],
+        }));
+        return;
+      }
+      if (req.url === '/api/v1/keys' && req.method === 'POST') {
+        let rawBody = '';
+        req.on('data', (chunk) => { rawBody += chunk; });
+        req.on('end', () => {
+          const body = JSON.parse(rawBody || '{}');
+          expect(body.name).toBe('metapi-e2e');
+          expect(body.group_id).toBe(8);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            code: 0,
+            message: 'success',
+            data: {
+              id: 1,
+              key: 'sk-created',
+              name: body.name,
+              group_id: body.group_id,
+            },
+          }));
+        });
+        return;
+      }
+      res.writeHead(404).end();
+    });
+
+    const created = await adapter.createApiToken(baseUrl, 'jwt-token', undefined, { name: 'metapi-e2e', group: '生图' });
     expect(created).toBe(true);
   });
 
