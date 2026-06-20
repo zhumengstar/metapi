@@ -35,6 +35,10 @@ import { parseProxyLogMessageMeta } from "../../services/proxyLogMessage.js";
 import { requiresManagedAccountTokens } from "../../services/accountExtraConfig.js";
 import { ACCOUNT_TOKEN_VALUE_STATUS_READY } from "../../services/accountTokenService.js";
 import {
+  normalizeTokenGroupLookupKey,
+  resolveTokenGroupLabel,
+} from "../../services/tokenGroupNames.js";
+import {
   formatLocalDateTime,
   formatUtcSqlDateTime,
   getLocalDayRangeUtc,
@@ -1447,27 +1451,6 @@ export async function statsRoutes(app: FastifyInstance) {
     "/api/models/token-candidates",
     { preHandler: [limitModelTokenCandidatesRead] },
     async () => {
-      const resolveTokenGroupLabel = (
-        tokenGroup: string | null,
-        tokenName: string | null,
-      ): string | null => {
-        const explicit = (tokenGroup || "").trim();
-        if (explicit) return explicit;
-
-        const name = (tokenName || "").trim();
-        if (!name) return null;
-        const normalized = name.toLowerCase();
-        if (
-          normalized === "default" ||
-          normalized === "默认" ||
-          /^default($|[-_\s])/.test(normalized)
-        ) {
-          return "default";
-        }
-        if (/^token-\d+$/.test(normalized)) return null;
-        return name;
-      };
-
       // Load global allowed models whitelist
       const globalAllowedModels = new Set(
         config.globalAllowedModels
@@ -1586,7 +1569,8 @@ export async function statsRoutes(app: FastifyInstance) {
               new Map<string, string>(),
             );
           }
-          const groupKey = resolvedTokenGroup.toLowerCase();
+          const groupKey = normalizeTokenGroupLookupKey(resolvedTokenGroup);
+          if (!groupKey) continue;
           if (
             !coveredGroupsByAccountModel.get(accountModelKey)!.has(groupKey)
           ) {
@@ -1702,7 +1686,8 @@ export async function statsRoutes(app: FastifyInstance) {
             for (const rawGroup of model.enableGroups || []) {
               const group = String(rawGroup || "").trim();
               if (!group) continue;
-              const groupKey = group.toLowerCase();
+              const groupKey = normalizeTokenGroupLookupKey(group);
+              if (!groupKey) continue;
               if (!groups.has(groupKey)) groups.set(groupKey, group);
             }
             if (groups.size === 0) continue;

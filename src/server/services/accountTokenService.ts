@@ -2,6 +2,7 @@
 import { db, schema } from '../db/index.js';
 import { getInsertedRowId } from '../db/insertHelpers.js';
 import { getCredentialModeFromExtraConfig } from './accountExtraConfig.js';
+import { resolveTokenGroupLabel, tokenGroupLabelsMatch } from './tokenGroupNames.js';
 
 type UpstreamApiToken = {
   name?: string | null;
@@ -136,17 +137,7 @@ export function isUsableAccountToken(token: AccountTokenRow | null | undefined):
 }
 
 function normalizeTokenGroup(value: string | null | undefined, tokenName?: string | null): string | null {
-  const explicit = (value || '').trim();
-  if (explicit.length > 0) return explicit;
-
-  const name = (tokenName || '').trim();
-  if (!name) return null;
-  const normalized = name.toLowerCase();
-  if (normalized === 'default' || normalized === '默认' || /^default($|[-_\s])/.test(normalized)) {
-    return 'default';
-  }
-  if (/^token-\d+$/.test(normalized)) return null;
-  return name;
+  return resolveTokenGroupLabel(value, tokenName);
 }
 
 function sameTokenGroup(
@@ -155,7 +146,10 @@ function sameTokenGroup(
   rightGroup: string | null | undefined,
   rightName: string | null | undefined,
 ): boolean {
-  return normalizeTokenGroup(leftGroup, leftName) === normalizeTokenGroup(rightGroup, rightName);
+  return tokenGroupLabelsMatch(
+    normalizeTokenGroup(leftGroup, leftName),
+    normalizeTokenGroup(rightGroup, rightName),
+  );
 }
 
 async function updateAccountApiToken(accountId: number, tokenValue: string | null) {

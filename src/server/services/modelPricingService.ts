@@ -4,6 +4,7 @@ import {
   buildNewApiCookieCandidates,
   fetchJsonWithShieldCookieRetry,
 } from './platforms/newApiShield.js';
+import { normalizeTokenGroupLookupKey } from './tokenGroupNames.js';
 
 const PRICE_CACHE_TTL_MS = 10 * 60 * 1000;
 const PRICE_CACHE_FAILURE_TTL_MS = 60 * 1000;
@@ -184,6 +185,106 @@ function normalizeGroupRatio(raw: unknown): Record<string, number> {
   }
 
   return result;
+}
+
+type GroupEntry = { id?: number; name: string };
+
+function parsePositiveInteger(value: unknown): number | null {
+  const parsed = Number.parseInt(String(value ?? '').trim(), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function unwrapArrayPayload(payload: unknown): unknown[] {
+  const source = unwrapPayload(payload);
+  if (Array.isArray(source)) return source;
+  if (!source || typeof source !== 'object') return [];
+  const object = source as Record<string, unknown>;
+  if (Array.isArray(object.items)) return object.items;
+  if (Array.isArray(object.list)) return object.list;
+  if (Array.isArray(object.groups)) return object.groups;
+  if (Array.isArray(object.data)) return object.data;
+  return [];
+}
+
+function parseGroupEntries(payload: unknown): GroupEntry[] {
+  const entries: GroupEntry[] = [];
+  for (const item of unwrapArrayPayload(payload)) {
+    if (item == null) continue;
+    if (typeof item === 'number') {
+      const id = parsePositiveInteger(item);
+      if (id) entries.push({ id, name: String(id) });
+      continue;
+    }
+    if (typeof item === 'string') {
+      const name = item.trim();
+      if (name) entries.push({ name });
+      continue;
+    }
+    if (typeof item !== 'object') continue;
+
+    const raw = item as Record<string, unknown>;
+    const nestedGroup = raw.group && typeof raw.group === 'object' && !Array.isArray(raw.group)
+      ? raw.group as Record<string, unknown>
+      : null;
+    const id = [
+      raw.group_id,
+      raw.groupId,
+      raw.id,
+      raw.value,
+      nestedGroup?.id,
+    ].map(parsePositiveInteger).find((candidate): candidate is number => !!candidate);
+    const name = [
+      raw.name,
+      raw.group_name,
+      raw.groupName,
+      raw.title,
+      raw.label,
+      raw.code,
+      nestedGroup?.name,
+      nestedGroup?.title,
+    ].find((candidate): candidate is string => typeof candidate === 'string' && candidate.trim().length > 0)?.trim();
+
+    if (id || name) entries.push({ id: id ?? undefined, name: name || String(id) });
+  }
+
+  const seen = new Set<string>();
+  return entries.filter((entry) => {
+    const key = `${entry.id || ''}:${entry.name}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function renameGroupLabel(group: string, groupNameById: Map<number, string>): string {
+  const id = parsePositiveInteger(group);
+  if (!id) return group;
+  return groupNameById.get(id) || group;
+}
+
+function renamePricingDataGroups(data: PricingData, groupEntries: GroupEntry[]): PricingData {
+  const groupNameById = new Map<number, string>();
+  for (const entry of groupEntries) {
+    if (!entry.id || !entry.name.trim()) continue;
+    groupNameById.set(entry.id, entry.name.trim());
+  }
+  if (groupNameById.size === 0) return data;
+
+  const groupRatio: Record<string, number> = {};
+  for (const [group, ratio] of Object.entries(data.groupRatio)) {
+    const renamed = renameGroupLabel(group, groupNameById);
+    if (!(renamed in groupRatio)) groupRatio[renamed] = ratio;
+  }
+
+  const models = new Map<string, PricingModel>();
+  for (const [name, model] of data.models.entries()) {
+    const enableGroups = Array.from(new Set(
+      model.enableGroups.map((group) => renameGroupLabel(group, groupNameById)),
+    ));
+    models.set(name, { ...model, enableGroups });
+  }
+
+  return { models, groupRatio };
 }
 
 function normalizeStringArray(raw: unknown): string[] {
@@ -400,7 +501,24 @@ async function fetchCommonPricing(baseUrl: string, token?: string, sitePlatform?
   const headers: Record<string, string> = {};
   if (token) headers.Authorization = `Bearer ${token}`;
   const payload = await fetchJson(`${baseUrl}/api/pricing`, { headers });
-  return normalizeCommonPricingPayload(payload);
+  const data = normalizeCommonPricingPayload(payload);
+  if (!data || normalizedPlatform !== 'sub2api' || !token) return data;
+
+  for (const endpoint of [
+    '/api/v1/groups/available',
+    '/api/v1/groups?page=1&page_size=100',
+    '/api/v1/groups',
+    '/api/v1/group?page=1&page_size=100',
+    '/api/v1/group',
+  ]) {
+    try {
+      const groupPayload = await fetchJson(`${baseUrl}${endpoint}`, { headers });
+      const groupEntries = parseGroupEntries(groupPayload);
+      if (groupEntries.length > 0) return renamePricingDataGroups(data, groupEntries);
+    } catch {}
+  }
+
+  return data;
 }
 
 async function fetchOneHubPricing(baseUrl: string, token?: string): Promise<PricingData | null> {
@@ -725,15 +843,35 @@ export function calculateModelUsageCost(
 function buildModelPricingCatalogFromData(pricingData: PricingData): ModelPricingCatalog {
   const groups = Array.from(new Set([DEFAULT_GROUP, ...Object.keys(pricingData.groupRatio)]));
   const defaultMultiplier = pricingData.groupRatio[DEFAULT_GROUP] || 1;
+  const groupRatioByLookupKey = new Map<string, number>();
+  const groupLabelByLookupKey = new Map<string, string>();
+  for (const [group, ratio] of Object.entries(pricingData.groupRatio)) {
+    const key = normalizeTokenGroupLookupKey(group);
+    if (key && !groupRatioByLookupKey.has(key)) groupRatioByLookupKey.set(key, ratio);
+  }
+  for (const group of groups) {
+    const key = normalizeTokenGroupLookupKey(group);
+    if (key && !groupLabelByLookupKey.has(key)) groupLabelByLookupKey.set(key, group);
+  }
 
   const models: ModelPricingCatalogEntry[] = Array.from(pricingData.models.values())
     .map((model) => {
       const allowedGroups = Array.from(new Set([...(model.enableGroups || []), DEFAULT_GROUP]));
-      const modelGroups = groups.filter((group) => allowedGroups.includes(group));
+      const seenGroupKeys = new Set<string>();
+      const modelGroups = allowedGroups
+        .map((group) => {
+          const key = normalizeTokenGroupLookupKey(group);
+          if (!key || seenGroupKeys.has(key)) return null;
+          seenGroupKeys.add(key);
+          return groupLabelByLookupKey.get(key) || null;
+        })
+        .filter((group): group is string => !!group);
       const effectiveGroups = modelGroups.length > 0 ? modelGroups : [DEFAULT_GROUP];
 
       const groupPricing = effectiveGroups.reduce<Record<string, ModelGroupPricing>>((acc, group) => {
-        const multiplier = pricingData.groupRatio[group] || defaultMultiplier;
+        const multiplier = pricingData.groupRatio[group]
+          || groupRatioByLookupKey.get(normalizeTokenGroupLookupKey(group))
+          || defaultMultiplier;
         if (model.quotaType === 1) {
           const perCall = calculatePerCallPricing(model.modelPrice, multiplier);
           acc[group] = {
