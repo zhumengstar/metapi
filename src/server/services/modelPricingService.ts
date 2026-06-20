@@ -200,14 +200,12 @@ function normalizeGroupRatio(raw: unknown): Record<string, number> {
   const result: Record<string, number> = {};
   if (raw && typeof raw === 'object') {
     for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
-      const ratio = toNumber(value, 1);
+      const ratio = toNumber(value, Number.NaN);
       if (ratio > 0) result[key] = ratio;
     }
   }
 
-  if (Object.keys(result).length === 0) {
-    result[DEFAULT_GROUP] = 1;
-  } else if (!(DEFAULT_GROUP in result)) {
+  if (Object.keys(result).length > 0 && !(DEFAULT_GROUP in result)) {
     result[DEFAULT_GROUP] = 1;
   }
 
@@ -375,7 +373,10 @@ function normalizeOneHubPricingPayload(availablePayload: unknown, groupPayload: 
   const groupRatioSource: Record<string, number> = {};
   if (groupMap && typeof groupMap === 'object') {
     for (const [key, group] of Object.entries(groupMap as Record<string, any>)) {
-      groupRatioSource[key] = toNumber(group?.ratio, 1);
+      groupRatioSource[key] = toNumber(
+        group && typeof group === 'object' ? group.ratio : group,
+        Number.NaN,
+      );
     }
   }
 

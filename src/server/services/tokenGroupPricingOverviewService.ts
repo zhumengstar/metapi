@@ -291,14 +291,15 @@ async function fetchPublicSiteGroups(site: SiteRow): Promise<{
 
 function summarizePricing(catalog: ModelPricingCatalog | null, groups: string[], ratioOverride: Record<string, number> = {}) {
   const ratio = { ...(catalog?.groupRatio || {}), ...ratioOverride };
+  const groupRatio = groups.reduce<Record<string, number | null>>((acc, group) => {
+    const value = ratio[group];
+    acc[group] = Number.isFinite(value) && value > 0 ? value : null;
+    return acc;
+  }, {});
   return {
-    available: !!catalog || Object.keys(ratioOverride).length > 0,
+    available: Object.values(groupRatio).some((value) => value !== null),
     modelCount: catalog?.models.length || 0,
-    groupRatio: groups.reduce<Record<string, number | null>>((acc, group) => {
-      const value = ratio[group];
-      acc[group] = Number.isFinite(value) && value > 0 ? value : null;
-      return acc;
-    }, {}),
+    groupRatio,
     allGroupRatio: ratio,
   };
 }
@@ -323,7 +324,7 @@ function createGroupRowsFromAccount(item: TokenGroupPricingOverviewAccount): Tok
     ratio: item.pricing.groupRatio[group] ?? null,
     groupSource: item.groupSource,
     groupError: item.groupError,
-    pricingAvailable: item.pricing.available,
+    pricingAvailable: item.pricing.groupRatio[group] !== null,
     modelCount: item.pricing.modelCount,
     modelNames: [],
     tokens: newestTokenForGroup(item.tokens, group),
@@ -352,7 +353,7 @@ function createGroupRowsFromSite(input: {
     ratio: pricing.groupRatio[group] ?? null,
     groupSource: input.groupResult.source,
     groupError: input.groupResult.error,
-    pricingAvailable: pricing.available,
+    pricingAvailable: pricing.groupRatio[group] !== null,
     modelCount: pricing.modelCount,
     modelNames: [],
     tokens: [],
@@ -405,7 +406,7 @@ function withCatalogGroupModels(
     ...row,
     modelNames,
     modelCount: modelNames.length,
-    pricingAvailable: !!catalog || row.pricingAvailable,
+    pricingAvailable: row.pricingAvailable,
   };
 }
 

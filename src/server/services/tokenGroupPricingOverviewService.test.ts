@@ -122,4 +122,43 @@ describe('tokenGroupPricingOverviewService', () => {
       pricingAvailable: true,
     });
   });
+
+  it('does not mark upstream groups as ratio available when no ratio is returned', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'sub2api',
+      url: 'https://sub2api.example.com',
+      platform: 'sub2api',
+    }).returning().get();
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'hlcpbbb',
+      accessToken: 'access-token',
+      status: 'active',
+    }).returning().get();
+
+    getUserGroupDetailsMock.mockResolvedValue([
+      { group: '纯pro倍率', name: '纯pro倍率' },
+    ]);
+
+    const overview = await buildTokenGroupPricingOverview({ refresh: true });
+    const row = overview.groupRows.find((item) => item.account?.id === account.id && item.group === '纯pro倍率');
+
+    expect(row).toMatchObject({
+      ratio: null,
+      pricingAvailable: false,
+    });
+
+    const storedRow = await db.select()
+      .from(schema.tokenGroupPricing)
+      .where(and(
+        eq(schema.tokenGroupPricing.siteId, site.id),
+        eq(schema.tokenGroupPricing.sourceKey, `account:${account.id}`),
+        eq(schema.tokenGroupPricing.group, '纯pro倍率'),
+      ))
+      .get();
+    expect(storedRow).toMatchObject({
+      ratio: 0,
+      pricingAvailable: false,
+    });
+  });
 });

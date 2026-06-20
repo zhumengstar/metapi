@@ -79,4 +79,55 @@ describe('modelPricingService anyrouter pricing', () => {
     expect(fetchMock.mock.calls[1][1]?.headers?.Cookie || '').toContain('cdn_sec_tc=challenge-seed');
     expect(fetchMock.mock.calls[1][1]?.headers?.Cookie || '').toContain(`acw_sc__v2=${ANYROUTER_CHALLENGE_ACW}`);
   });
+
+  it('parses one-hub numeric group ratios without defaulting them to one', async () => {
+    const availableResponse = () => new Response(JSON.stringify({
+      data: {
+        'gpt-test': {
+          price: { type: 'tokens', input: 1, output: 2 },
+          groups: ['vip'],
+        },
+      },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+    });
+    const groupResponse = () => new Response(JSON.stringify({
+      data: {
+        default: 1,
+        vip: 2.5,
+      },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+    });
+    fetchMock
+      .mockResolvedValueOnce(availableResponse())
+      .mockResolvedValueOnce(groupResponse())
+      .mockResolvedValueOnce(availableResponse())
+      .mockResolvedValueOnce(groupResponse());
+
+    const catalog = await fetchModelPricingCatalog({
+      site: {
+        id: 903,
+        url: 'https://one-hub.example.com',
+        platform: 'done-hub',
+      },
+      account: {
+        id: 78,
+        accessToken: 'access-token',
+      },
+      modelName: 'gpt-test',
+      totalTokens: 0,
+    });
+
+    expect(catalog?.groupRatio).toMatchObject({
+      default: 1,
+      vip: 2.5,
+    });
+    expect(catalog?.models[0]?.groupPricing?.vip).toMatchObject({
+      inputPerMillion: 5,
+      outputPerMillion: 10,
+    });
+  });
 });
