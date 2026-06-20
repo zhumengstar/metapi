@@ -173,6 +173,34 @@ function buildTokenDeleteTaskDetailMessage(results: AccountTokenDeleteResult[]):
   ].join('\n');
 }
 
+function buildTokenDeleteEventMessage(result: AccountTokenDeleteResult): string {
+  const target = buildDeleteTokenLabel(result);
+  const upstream = result.upstreamDeleted
+    ? '原站点删除成功'
+    : (result.upstreamAttempted
+      ? `原站点删除失败：${result.message || '未知错误'}`
+      : `跳过原站点删除：${result.upstreamSkippedReason || '无需删除'}`);
+  const local = result.localDeleted ? '本地删除成功' : '本地未删除';
+  const status = result.success ? '删除成功' : `删除失败：${result.message || '未知错误'}`;
+  return `${target}: ${status}；${upstream}；${local}`;
+}
+
+async function appendTokenDeleteEvent(result: AccountTokenDeleteResult) {
+  const title = result.success ? '账号令牌删除成功' : '账号令牌删除失败';
+  const level = result.success ? 'info' : 'error';
+  try {
+    await db.insert(schema.events).values({
+      type: 'token',
+      title,
+      message: buildTokenDeleteEventMessage(result),
+      level,
+      relatedId: result.tokenId,
+      relatedType: 'account_token',
+      createdAt: new Date().toISOString(),
+    }).run();
+  } catch {}
+}
+
 function isSiteDisabled(status?: string | null): boolean {
   return (status || 'active') === 'disabled';
 }
@@ -724,7 +752,9 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       .get();
     if (!row) {
       appendDeleteLog(options.taskId, `令牌 #${tokenId} 删除失败：令牌不存在`);
-      return { ...baseResult, message: '令牌不存在' };
+      const result = { ...baseResult, message: '令牌不存在' };
+      await appendTokenDeleteEvent(result);
+      return result;
     }
 
     const existing = row.account_tokens;
@@ -741,7 +771,9 @@ export async function accountTokensRoutes(app: FastifyInstance) {
 
     if (isApiKeyConnection(row.accounts)) {
       appendDeleteLog(options.taskId, `${tokenLabel} 删除失败：API Key 连接不支持管理账号令牌`);
-      return { ...labeledResult, message: 'API Key 连接不支持管理账号令牌' };
+      const result = { ...labeledResult, message: 'API Key 连接不支持管理账号令牌' };
+      await appendTokenDeleteEvent(result);
+      return result;
     }
 
     const adapter = getAdapter(site.platform);
@@ -778,19 +810,23 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       } catch (error: any) {
         const message = error?.message || '站点删除令牌失败，本地未删除';
         appendDeleteLog(options.taskId, `${tokenLabel} 原站点删除失败：${message}`);
-        return {
+        const result = {
           ...labeledResult,
           upstreamAttempted: true,
           message,
         };
+        await appendTokenDeleteEvent(result);
+        return result;
       }
       if (!upstreamDeleted) {
         appendDeleteLog(options.taskId, `${tokenLabel} 原站点删除失败：站点删除令牌失败，本地未删除`);
-        return {
+        const result = {
           ...labeledResult,
           upstreamAttempted: true,
           message: '站点删除令牌失败，本地未删除',
         };
+        await appendTokenDeleteEvent(result);
+        return result;
       }
       appendDeleteLog(options.taskId, `${tokenLabel} 原站点删除成功`);
     } else {
@@ -803,7 +839,7 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     }
     appendDeleteLog(options.taskId, `${tokenLabel} 本地令牌已删除`);
 
-    return {
+    const result = {
       ...labeledResult,
       success: true,
       upstreamAttempted: shouldDeleteUpstream,
@@ -811,6 +847,8 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       upstreamSkippedReason: upstreamSkippedReason || undefined,
       localDeleted: true,
     };
+    await appendTokenDeleteEvent(result);
+    return result;
   };
 
   const executeDeleteAccountTokens = async (ids: number[], taskId?: string | null): Promise<AccountTokenDeleteTaskResult> => {

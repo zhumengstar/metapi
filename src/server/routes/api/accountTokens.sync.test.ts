@@ -824,6 +824,14 @@ describe('account tokens sync routes with site status', () => {
     const removed = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, token.id)).get();
     expect(removed).toBeUndefined();
     expect(task?.logs.some((entry) => entry.message.includes('原站点删除成功'))).toBe(true);
+    const events = await db.select().from(schema.events).where(eq(schema.events.type, 'token')).all();
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        title: '账号令牌删除成功',
+        message: expect.stringContaining('原站点删除成功'),
+        relatedType: 'account_token',
+      }),
+    ]));
   });
 
   it('keeps local token when upstream deletion fails', async () => {
@@ -853,6 +861,14 @@ describe('account tokens sync routes with site status', () => {
 
     const existing = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, token.id)).get();
     expect(existing).toBeDefined();
+    const events = await db.select().from(schema.events).where(eq(schema.events.type, 'token')).all();
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        title: '账号令牌删除失败',
+        message: expect.stringContaining('本地未删除'),
+        relatedType: 'account_token',
+      }),
+    ]));
   });
 
   it('rejects retrieving token value when stored token is masked', async () => {
@@ -1077,5 +1093,13 @@ describe('account tokens sync routes with site status', () => {
     const removed = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, token.id)).get();
     expect(removed).toBeUndefined();
     expect(task?.logs.some((entry) => entry.message.includes('跳过原站点删除'))).toBe(true);
+    const events = await db.select().from(schema.events).where(eq(schema.events.type, 'token')).all();
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        title: '账号令牌删除成功',
+        message: expect.stringContaining('跳过原站点删除'),
+        relatedType: 'account_token',
+      }),
+    ]));
   });
 });

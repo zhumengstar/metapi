@@ -173,6 +173,14 @@ describe('account token batch routes', () => {
     const remaining = await db.select().from(schema.accountTokens).all();
     expect(remaining.map((item) => item.id)).toEqual([2]);
     expect(task?.logs.some((entry) => entry.message.includes('原站点删除成功'))).toBe(true);
+    const events = await db.select().from(schema.events).where(eq(schema.events.type, 'token')).all();
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        title: '账号令牌删除成功',
+        message: expect.stringContaining('原站点删除成功'),
+        relatedType: 'account_token',
+      }),
+    ]));
   });
 
   it('accepts the edit-panel payload when updating account token metadata without changing token value', async () => {
