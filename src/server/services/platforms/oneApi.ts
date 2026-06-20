@@ -1,4 +1,4 @@
-import { ApiTokenInfo, BasePlatformAdapter, CheckinResult, BalanceInfo, CreateApiTokenOptions } from './base.js';
+import { ApiTokenInfo, BasePlatformAdapter, CheckinResult, BalanceInfo, CreateApiTokenOptions, type DeleteApiTokenOptions } from './base.js';
 
 type CreateApiTokenPayload = {
   name: string;
@@ -17,6 +17,32 @@ export class OneApiAdapter extends BasePlatformAdapter {
   private normalizeTokenKeyForCompare(value?: string | null): string {
     const trimmed = (value || '').trim();
     return trimmed.startsWith('Bearer ') ? trimmed.slice(7).trim() : trimmed;
+  }
+
+  private resolveCreatedToken(payload: any, options?: CreateApiTokenOptions): ApiTokenInfo | null {
+    const containers = [payload?.data, payload?.token, payload?.api_token, payload];
+    for (const item of containers) {
+      if (!item) continue;
+      const candidates = typeof item === 'string'
+        ? [item]
+        : [item?.key, item?.token, item?.api_key, item?.apiKey, item?.access_token];
+      for (const candidate of candidates) {
+        if (typeof candidate !== 'string') continue;
+        const key = this.normalizeTokenKeyForCompare(candidate);
+        if (!key || key.includes('*') || key.includes('•')) continue;
+        return {
+          name: typeof item?.name === 'string' && item.name.trim()
+            ? item.name.trim()
+            : ((options?.name || '').trim() || 'metapi'),
+          key,
+          enabled: true,
+          tokenGroup: typeof item?.group === 'string' && item.group.trim()
+            ? item.group.trim()
+            : ((options?.group || '').trim() || null),
+        };
+      }
+    }
+    return null;
   }
 
   private buildDefaultTokenPayload(options?: CreateApiTokenOptions): CreateApiTokenPayload {
@@ -187,7 +213,12 @@ export class OneApiAdapter extends BasePlatformAdapter {
         headers: { Authorization: `Bearer ${accessToken}` },
         body: JSON.stringify(this.buildDefaultTokenPayload(options)),
       });
-      return !!res?.success;
+      if (res?.success) {
+        const created = this.resolveCreatedToken(res, options);
+        if (created) options?.onCreatedToken?.(created);
+        return true;
+      }
+      return false;
     } catch {
       return false;
     }
@@ -197,20 +228,34 @@ export class OneApiAdapter extends BasePlatformAdapter {
     baseUrl: string,
     accessToken: string,
     tokenKey: string,
+    _platformUserId?: number,
+    options?: DeleteApiTokenOptions,
   ): Promise<boolean> {
     const targetKey = this.normalizeTokenKeyForCompare(tokenKey);
     if (!targetKey) return false;
+    const targetName = (options?.name || '').trim();
+    const targetGroup = (options?.group || '').trim();
+    const sameOptionalText = (left: unknown, right: string): boolean => (
+      !!right && String(left || '').trim() === right
+    );
 
     const headers = { Authorization: `Bearer ${accessToken}` };
     let tokenId: number | null = null;
+    let upstreamListReadable = false;
     try {
       const res = await this.fetchJson<any>(`${baseUrl}/api/token/?p=0&size=100`, { headers });
+      upstreamListReadable = res?.success === true
+        || Array.isArray(res?.data)
+        || Array.isArray(res?.data?.items)
+        || Array.isArray(res?.items);
       const items = (() => {
         if (Array.isArray(res?.data)) return res.data;
         if (Array.isArray(res?.data?.items)) return res.data.items;
         if (Array.isArray(res?.items)) return res.items;
         return [];
       })();
+      let fallbackByMeta: number | null = null;
+      let fallbackMetaMatches = 0;
       for (const item of items) {
         const key = this.normalizeTokenKeyForCompare(item?.key);
         const id = Number.parseInt(String(item?.id), 10);
@@ -218,12 +263,20 @@ export class OneApiAdapter extends BasePlatformAdapter {
           tokenId = id;
           break;
         }
+        if (!Number.isFinite(id) || id <= 0) continue;
+        const nameMatches = sameOptionalText(item?.name, targetName);
+        const groupMatches = sameOptionalText(item?.group ?? item?.token_group, targetGroup);
+        if (nameMatches && (!targetGroup || groupMatches)) {
+          fallbackByMeta = id;
+          fallbackMetaMatches++;
+        }
       }
+      if (!tokenId && fallbackMetaMatches === 1) tokenId = fallbackByMeta;
     } catch {
       return false;
     }
 
-    if (!tokenId) return true;
+    if (!tokenId) return upstreamListReadable;
 
     try {
       const res = await this.fetchJson<any>(`${baseUrl}/api/token/${tokenId}`, {

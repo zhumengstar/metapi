@@ -79,6 +79,13 @@ export interface SiteAnnouncement {
   rawPayload?: unknown;
 }
 
+export interface UserGroupInfo {
+  group: string;
+  ratio?: number;
+  name?: string | null;
+  description?: string | null;
+}
+
 export interface CreateApiTokenOptions {
   name?: string;
   group?: string;
@@ -88,6 +95,12 @@ export interface CreateApiTokenOptions {
   allowIps?: string;
   modelLimitsEnabled?: boolean;
   modelLimits?: string;
+  onCreatedToken?: (token: ApiTokenInfo) => void;
+}
+
+export interface DeleteApiTokenOptions {
+  name?: string | null;
+  group?: string | null;
 }
 
 export interface PlatformAdapter {
@@ -103,8 +116,9 @@ export interface PlatformAdapter {
   getApiTokens(baseUrl: string, accessToken: string, platformUserId?: number): Promise<ApiTokenInfo[]>;
   getSiteAnnouncements(baseUrl: string, accessToken: string, platformUserId?: number): Promise<SiteAnnouncement[]>;
   getUserGroups(baseUrl: string, accessToken: string, platformUserId?: number): Promise<string[]>;
+  getUserGroupDetails(baseUrl: string, accessToken: string, platformUserId?: number): Promise<UserGroupInfo[]>;
   createApiToken(baseUrl: string, accessToken: string, platformUserId?: number, options?: CreateApiTokenOptions): Promise<boolean>;
-  deleteApiToken(baseUrl: string, accessToken: string, tokenKey: string, platformUserId?: number): Promise<boolean>;
+  deleteApiToken(baseUrl: string, accessToken: string, tokenKey: string, platformUserId?: number, options?: DeleteApiTokenOptions): Promise<boolean>;
 }
 
 export abstract class BasePlatformAdapter implements PlatformAdapter {
@@ -210,11 +224,21 @@ export abstract class BasePlatformAdapter implements PlatformAdapter {
     return ['default'];
   }
 
+  async getUserGroupDetails(
+    baseUrl: string,
+    accessToken: string,
+    platformUserId?: number,
+  ): Promise<UserGroupInfo[]> {
+    const groups = await this.getUserGroups(baseUrl, accessToken, platformUserId);
+    return groups.map((group) => ({ group }));
+  }
+
   async deleteApiToken(
     _baseUrl: string,
     _accessToken: string,
     _tokenKey: string,
     _platformUserId?: number,
+    _options?: DeleteApiTokenOptions,
   ): Promise<boolean> {
     return false;
   }

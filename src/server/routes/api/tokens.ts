@@ -22,6 +22,7 @@ import {
   saveRouteDecisionSnapshots,
 } from '../../services/routeDecisionSnapshotStore.js';
 import { clearRouteCooldown } from '../../services/routeCooldownService.js';
+import { buildRouteChannelIdentityKey } from '../../services/routeChannelIdentity.js';
 import {
   refreshAllRouteDecisionSnapshots,
   ROUTE_DECISION_REFRESH_DEDUPE_KEY,
@@ -319,6 +320,15 @@ async function checkTokenBelongsToAccount(tokenId: number, accountId: number): P
   return isUsableAccountToken(row ?? null);
 }
 
+function getRouteChannelIdentityKey(channel: {
+  accountId: number;
+  tokenId?: number | null;
+  oauthRouteUnitId?: number | null;
+  sourceModel?: string | null;
+}): string {
+  return buildRouteChannelIdentityKey(channel);
+}
+
 async function getPatternTokenCandidates(modelPattern: string): Promise<Array<{ tokenId: number; accountId: number; sourceModel: string }>> {
   const rows = await db.select().from(schema.tokenModelAvailability)
     .innerJoin(schema.accountTokens, eq(schema.tokenModelAvailability.tokenId, schema.accountTokens.id))
@@ -403,17 +413,12 @@ async function populateRouteChannelsByModelPattern(routeId: number, modelPattern
     .all();
   const existingPairs = new Set<string>(
     existingChannels
-      .map((channel) => {
-        const tokenId = typeof channel.tokenId === 'number' && Number.isFinite(channel.tokenId) ? channel.tokenId : 0;
-        const sourceModel = (channel.sourceModel || '').trim().toLowerCase();
-        return `${channel.accountId}::${tokenId}::${sourceModel}`;
-      }),
+      .map((channel) => getRouteChannelIdentityKey(channel)),
   );
 
   let created = 0;
   for (const candidate of candidates) {
-    const tokenId = typeof candidate.tokenId === 'number' && Number.isFinite(candidate.tokenId) ? candidate.tokenId : 0;
-    const pairKey = `${candidate.accountId}::${tokenId}::${candidate.sourceModel.trim().toLowerCase()}`;
+    const pairKey = getRouteChannelIdentityKey(candidate);
     if (existingPairs.has(pairKey)) continue;
     await db.insert(schema.routeChannels).values({
       routeId,
@@ -746,11 +751,18 @@ async function fetchChannelsForRouteRows(
 
   const channelsByRoute = new Map<number, any[]>();
   for (const route of routes) {
-    if (isExplicitGroupRoute(route)) {
-      channelsByRoute.set(route.id, route.sourceRouteIds.flatMap((sourceRouteId) => channelsByActualRouteId.get(sourceRouteId) || []));
-      continue;
+    const rawChannels = isExplicitGroupRoute(route)
+      ? route.sourceRouteIds.flatMap((sourceRouteId) => channelsByActualRouteId.get(sourceRouteId) || [])
+      : (channelsByActualRouteId.get(route.id) || []);
+    const dedupedChannels: any[] = [];
+    const seenChannelKeys = new Set<string>();
+    for (const channel of rawChannels) {
+      const channelKey = getRouteChannelIdentityKey(channel);
+      if (seenChannelKeys.has(channelKey)) continue;
+      seenChannelKeys.add(channelKey);
+      dedupedChannels.push(channel);
     }
-    channelsByRoute.set(route.id, channelsByActualRouteId.get(route.id) || []);
+    channelsByRoute.set(route.id, dedupedChannels);
   }
 
   return channelsByRoute;
@@ -877,11 +889,7 @@ export async function tokensRoutes(app: FastifyInstance) {
       .where(eq(schema.routeChannels.routeId, routeId))
       .all();
     const existingPairs = new Set<string>(
-      existingChannels.map((channel) => {
-        const tokenId = typeof channel.tokenId === 'number' && Number.isFinite(channel.tokenId) ? channel.tokenId : 0;
-        const sourceModel = (channel.sourceModel || '').trim().toLowerCase();
-        return `${channel.accountId}::${tokenId}::${sourceModel}`;
-      }),
+      existingChannels.map((channel) => getRouteChannelIdentityKey(channel)),
     );
 
     let created = 0;
@@ -899,8 +907,11 @@ export async function tokensRoutes(app: FastifyInstance) {
         continue;
       }
 
-      const tokenIdForKey = typeof effectiveTokenId === 'number' && Number.isFinite(effectiveTokenId) ? effectiveTokenId : 0;
-      const pairKey = `${item.accountId}::${tokenIdForKey}::${sourceModel.toLowerCase()}`;
+      const pairKey = getRouteChannelIdentityKey({
+        accountId: item.accountId,
+        tokenId: effectiveTokenId,
+        sourceModel,
+      });
       if (existingPairs.has(pairKey)) {
         skipped += 1;
         continue;
@@ -1329,14 +1340,15 @@ export async function tokensRoutes(app: FastifyInstance) {
       return reply.code(400).send({ success: false, message: '该令牌不支持当前模型' });
     }
 
+    const nextIdentityKey = getRouteChannelIdentityKey({
+      accountId: body.accountId,
+      tokenId: effectiveTokenId,
+      sourceModel,
+    });
     const duplicate = (await db.select().from(schema.routeChannels)
       .where(eq(schema.routeChannels.routeId, routeId))
       .all())
-      .some((channel) =>
-        channel.accountId === body.accountId
-        && (channel.tokenId ?? null) === (body.tokenId ?? null)
-        && (channel.sourceModel || '').trim().toLowerCase() === sourceModel.toLowerCase(),
-      );
+      .some((channel) => getRouteChannelIdentityKey(channel) === nextIdentityKey);
     if (duplicate) {
       return reply.code(400).send({ success: false, message: '该来源模型的通道已存在' });
     }
@@ -1344,7 +1356,7 @@ export async function tokensRoutes(app: FastifyInstance) {
     const insertedChannel = await db.insert(schema.routeChannels).values({
       routeId,
       accountId: body.accountId,
-      tokenId: body.tokenId,
+      tokenId: effectiveTokenId,
       sourceModel: sourceModel || null,
       priority: body.priority ?? 0,
       weight: body.weight ?? 10,
@@ -1428,10 +1440,26 @@ export async function tokensRoutes(app: FastifyInstance) {
       return reply.code(400).send({ success: false, message: '该令牌不支持当前模型' });
     }
 
+    const nextSourceModel = body.sourceModel === undefined
+      ? channel.sourceModel
+      : (body.sourceModel === null ? null : String(body.sourceModel).trim() || null);
+    const nextIdentityKey = getRouteChannelIdentityKey({
+      accountId: channel.accountId,
+      tokenId: nextTokenId,
+      oauthRouteUnitId: channel.oauthRouteUnitId,
+      sourceModel: nextSourceModel,
+    });
+    const duplicate = (await db.select().from(schema.routeChannels)
+      .where(eq(schema.routeChannels.routeId, channel.routeId))
+      .all())
+      .some((item) => item.id !== channel.id && getRouteChannelIdentityKey(item) === nextIdentityKey);
+    if (duplicate) {
+      return reply.code(400).send({ success: false, message: '该来源模型的通道已存在' });
+    }
+
     const updates: Record<string, unknown> = { manualOverride: true };
     if (body.sourceModel !== undefined) {
-      if (body.sourceModel === null) updates.sourceModel = null;
-      else updates.sourceModel = String(body.sourceModel).trim() || null;
+      updates.sourceModel = nextSourceModel;
     }
 
     if (body.priority !== undefined) updates.priority = body.priority;

@@ -1,8 +1,14 @@
-import { ApiTokenInfo, BasePlatformAdapter, CheckinResult, BalanceInfo, UserInfo, TokenVerifyResult, CreateApiTokenOptions, type SiteAnnouncement } from './base.js';
+import { ApiTokenInfo, BasePlatformAdapter, CheckinResult, BalanceInfo, UserInfo, TokenVerifyResult, CreateApiTokenOptions, type DeleteApiTokenOptions, type SiteAnnouncement, type UserGroupInfo } from './base.js';
 import type { RequestInit as UndiciRequestInit } from 'undici';
 import { createContext, runInContext } from 'node:vm';
 import { withSiteProxyRequestInit } from '../siteProxy.js';
 import { fetchJsonWithShieldCookieRetry } from './newApiShield.js';
+
+type NewApiTokenInfo = ApiTokenInfo & {
+  upstreamId?: number;
+};
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class NewApiAdapter extends BasePlatformAdapter {
   readonly platformName: string = 'new-api';
@@ -268,26 +274,156 @@ export class NewApiAdapter extends BasePlatformAdapter {
     return trimmed.startsWith('Bearer ') ? trimmed.slice(7).trim() : trimmed;
   }
 
-  private parseGroupKeys(payload: any): string[] {
+  private resolveCreatedToken(payload: any, options?: CreateApiTokenOptions): ApiTokenInfo | null {
+    const containers = [
+      payload?.data,
+      payload?.token,
+      payload?.api_token,
+      payload,
+    ];
+    for (const item of containers) {
+      if (!item) continue;
+      const keyCandidates = typeof item === 'string'
+        ? [item]
+        : [
+          item?.key,
+          item?.token,
+          item?.api_key,
+          item?.apiKey,
+          item?.access_token,
+        ];
+      for (const candidate of keyCandidates) {
+        if (typeof candidate !== 'string') continue;
+        const key = this.normalizeTokenKeyForCompare(candidate);
+        if (!key || key.includes('*') || key.includes('•')) continue;
+        const name = typeof item?.name === 'string' && item.name.trim()
+          ? item.name.trim()
+          : ((options?.name || '').trim() || 'metapi');
+        const tokenGroup = typeof item?.group === 'string' && item.group.trim()
+          ? item.group.trim()
+          : (typeof item?.group_name === 'string' && item.group_name.trim()
+            ? item.group_name.trim()
+            : (typeof item?.token_group === 'string' && item.token_group.trim()
+              ? item.token_group.trim()
+              : ((options?.group || '').trim() || null)));
+        return {
+          name,
+          key,
+          enabled: true,
+          tokenGroup,
+        };
+      }
+    }
+    return null;
+  }
+
+  private normalizeUserGroupDetails(details: UserGroupInfo[]): UserGroupInfo[] {
+    const byGroup = new Map<string, UserGroupInfo>();
+    for (const detail of details) {
+      const group = String(detail.group || '').trim();
+      if (!group) continue;
+      const ratio = Number(detail.ratio);
+      const existing = byGroup.get(group);
+      const normalized: UserGroupInfo = {
+        group,
+        name: detail.name ?? existing?.name ?? null,
+        description: detail.description ?? existing?.description ?? null,
+      };
+      if (Number.isFinite(ratio) && ratio > 0) normalized.ratio = ratio;
+      else if (existing?.ratio !== undefined) normalized.ratio = existing.ratio;
+      byGroup.set(group, normalized);
+    }
+    return Array.from(byGroup.values());
+  }
+
+  private parseUserGroupDetails(payload: any): UserGroupInfo[] {
     if (payload && typeof payload === 'object' && payload?.success === false) {
       return [];
     }
 
+    const readRatio = (source: any): number | undefined => {
+      const value = Number(
+        source?.ratio
+        ?? source?.group_ratio
+        ?? source?.groupRatio
+        ?? source?.倍率
+      );
+      return Number.isFinite(value) && value > 0 ? value : undefined;
+    };
+    const readDescription = (source: any): string | null => {
+      const value = source?.desc ?? source?.description ?? source?.remark ?? source?.备注;
+      return typeof value === 'string' && value.trim() ? value.trim() : null;
+    };
+    const pushDetail = (detail: UserGroupInfo) => {
+      const group = String(detail.group || '').trim();
+      if (!group) return;
+      const normalized: UserGroupInfo = { group };
+      const ratio = Number(detail.ratio);
+      if (Number.isFinite(ratio) && ratio > 0) normalized.ratio = ratio;
+      if (detail.name) normalized.name = detail.name;
+      if (detail.description) normalized.description = detail.description;
+      details.push(normalized);
+    };
+
     const source = payload?.data ?? payload;
+    const details: UserGroupInfo[] = [];
+
     if (Array.isArray(source)) {
-      return source
-        .map((item) => String(item || '').trim())
-        .filter(Boolean);
+      for (const item of source) {
+        if (typeof item === 'string') {
+          const group = item.trim();
+          if (group) pushDetail({ group });
+          continue;
+        }
+        if (!item || typeof item !== 'object') continue;
+        const group = String(item.group ?? item.group_name ?? item.key ?? item.id ?? item.name ?? '').trim();
+        if (!group) continue;
+        pushDetail({
+          group,
+          ratio: readRatio(item),
+          name: typeof item.name === 'string' && item.name.trim() && item.name.trim() !== group ? item.name.trim() : null,
+          description: readDescription(item),
+        });
+      }
+      return this.normalizeUserGroupDetails(details);
     }
 
     if (source && typeof source === 'object') {
-      return Object.keys(source)
-        .map((key) => key.trim())
-        .filter((key) => !['success', 'message', 'code', 'data', 'error'].includes(key.toLowerCase()))
-        .filter(Boolean);
+      for (const [rawKey, rawValue] of Object.entries(source)) {
+        const key = rawKey.trim();
+        if (!key || ['success', 'message', 'code', 'data', 'error'].includes(key.toLowerCase())) continue;
+        if (rawValue && typeof rawValue === 'object') {
+          const value = rawValue as Record<string, unknown>;
+          const group = String(value.group ?? value.group_name ?? value.key ?? key).trim();
+          if (!group) continue;
+          pushDetail({
+            group,
+            ratio: readRatio(value),
+            name: typeof value.name === 'string' && value.name.trim() && value.name.trim() !== group ? value.name.trim() : null,
+            description: readDescription(value),
+          });
+        } else {
+          pushDetail({ group: key, ratio: readRatio({ ratio: rawValue }) });
+        }
+      }
     }
 
-    return [];
+    return this.normalizeUserGroupDetails(details);
+  }
+
+  private mergeUserGroupDetails(primary: UserGroupInfo[], fallback: UserGroupInfo[]): UserGroupInfo[] {
+    const merged: UserGroupInfo[] = [];
+    const seen = new Set<string>();
+    const push = (detail: UserGroupInfo) => {
+      const group = String(detail?.group || '').trim();
+      if (!group || seen.has(group)) return;
+      seen.add(group);
+      merged.push(detail);
+    };
+
+    primary.forEach(push);
+    fallback.forEach(push);
+    return this.normalizeUserGroupDetails(merged);
   }
 
   private resolveGroupFetchErrorMessage(payload: any): string {
@@ -305,8 +441,8 @@ export class NewApiAdapter extends BasePlatformAdapter {
     return message || '拉取分组失败';
   }
 
-  private normalizeTokenItems(items: any[]): ApiTokenInfo[] {
-    const normalized: ApiTokenInfo[] = [];
+  private normalizeTokenItems(items: any[]): NewApiTokenInfo[] {
+    const normalized: NewApiTokenInfo[] = [];
     for (let index = 0; index < items.length; index += 1) {
       const item = items[index];
       const key = typeof item?.key === 'string' ? item.key.trim() : '';
@@ -318,15 +454,91 @@ export class NewApiAdapter extends BasePlatformAdapter {
           ? item.group_name.trim()
           : (typeof item?.token_group === 'string' ? item.token_group.trim() : ''));
       const status = typeof item?.status === 'number' ? item.status : undefined;
-      const tokenInfo: ApiTokenInfo = {
+      const tokenInfo: NewApiTokenInfo = {
         name: rawName || (index === 0 ? 'default' : `token-${index + 1}`),
         key,
         enabled: status === undefined ? true : status === 1,
       };
+      const upstreamId = Number.parseInt(String(item?.id ?? ''), 10);
+      if (Number.isFinite(upstreamId) && upstreamId > 0) {
+        tokenInfo.upstreamId = upstreamId;
+      }
       if (rawGroup) tokenInfo.tokenGroup = rawGroup;
       normalized.push(tokenInfo);
     }
     return normalized;
+  }
+
+  private extractClearTokenKey(payload: any): string | null {
+    const candidates = [
+      payload?.data?.key,
+      payload?.data?.token,
+      payload?.data?.api_key,
+      payload?.data?.apiKey,
+      payload?.key,
+      payload?.token,
+      payload?.api_key,
+      payload?.apiKey,
+    ];
+    for (const candidate of candidates) {
+      if (typeof candidate !== 'string') continue;
+      const key = this.normalizeTokenKeyForCompare(candidate);
+      if (key && !key.includes('*') && !key.includes('•')) return key;
+    }
+    return null;
+  }
+
+  private async fetchTokenClearKeyById(
+    baseUrl: string,
+    tokenId: number,
+    init: UndiciRequestInit,
+  ): Promise<string | null> {
+    const { fetch } = await import('undici');
+    const url = `${baseUrl}/api/token/${tokenId}/key`;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      try {
+        const requestOptions = await withSiteProxyRequestInit(url, {
+          ...init,
+          method: 'POST',
+        });
+        const res = await fetch(url, requestOptions);
+        if (res.status === 429) {
+          const retryAfterSeconds = Number(res.headers.get('retry-after'));
+          const retryDelay = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+            ? retryAfterSeconds * 1000
+            : 1000 * (attempt + 1);
+          await sleep(retryDelay);
+          continue;
+        }
+        if (!res.ok) return null;
+        const text = await res.text();
+        if (!text.trim()) return null;
+        const payload = JSON.parse(text);
+        return this.extractClearTokenKey(payload);
+      } catch {
+        await sleep(500 * (attempt + 1));
+      }
+    }
+    return null;
+  }
+
+  private async hydrateClearTokenKeys(
+    baseUrl: string,
+    tokens: NewApiTokenInfo[],
+    init: UndiciRequestInit,
+  ): Promise<ApiTokenInfo[]> {
+    const hydrated: ApiTokenInfo[] = [];
+    for (const token of tokens) {
+      const next: ApiTokenInfo = { ...token };
+      if (token.upstreamId && (token.key.includes('*') || token.key.includes('•'))) {
+        const clearKey = await this.fetchTokenClearKeyById(baseUrl, token.upstreamId, init);
+        if (clearKey) next.key = clearKey;
+        await sleep(350);
+      }
+      delete (next as NewApiTokenInfo).upstreamId;
+      hydrated.push(next);
+    }
+    return hydrated;
   }
 
   private parseUserInfo(data: any): UserInfo {
@@ -815,7 +1027,7 @@ export class NewApiAdapter extends BasePlatformAdapter {
         if (userId) headers['New-Api-User'] = String(userId);
         const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/token/?p=0&size=100`, { headers });
         const normalized = this.normalizeTokenItems(this.parseTokenItems(res));
-        if (normalized.length > 0) return normalized;
+        if (normalized.length > 0) return this.hydrateClearTokenKeys(baseUrl, normalized, { headers });
       } catch {}
     }
     return [];
@@ -1277,7 +1489,11 @@ export class NewApiAdapter extends BasePlatformAdapter {
         headers: this.authHeaders(accessToken, resolvedUserId || undefined),
         body: payload,
       });
-      if (res?.success) return true;
+      if (res?.success) {
+        const created = this.resolveCreatedToken(res, options);
+        if (created) options?.onCreatedToken?.(created);
+        return true;
+      }
     } catch {}
 
     const cookieUserId = resolvedUserId || await this.probeUserIdByCookie(baseUrl, accessToken);
@@ -1290,17 +1506,22 @@ export class NewApiAdapter extends BasePlatformAdapter {
           headers,
           body: payload,
         });
-        if (res?.success) return true;
+        if (res?.success) {
+          const created = this.resolveCreatedToken(res, options);
+          if (created) options?.onCreatedToken?.(created);
+          return true;
+        }
       } catch {}
     }
 
     return false;
   }
 
-  async getUserGroups(baseUrl: string, accessToken: string, platformUserId?: number): Promise<string[]> {
+  async getUserGroupDetails(baseUrl: string, accessToken: string, platformUserId?: number): Promise<UserGroupInfo[]> {
     const resolvedUserId = platformUserId || await this.discoverUserId(baseUrl, accessToken);
-    const dedupe = (groups: string[]) => Array.from(new Set(groups.map((item) => item.trim()).filter(Boolean)));
     let terminalError: string | null = null;
+    let selfDetails: UserGroupInfo[] = [];
+    let publicDetails: UserGroupInfo[] = [];
 
     try {
       const res = await this.fetchJson<any>(`${baseUrl}/api/user/self/groups`, {
@@ -1309,9 +1530,21 @@ export class NewApiAdapter extends BasePlatformAdapter {
       if (res?.success === false) {
         terminalError = this.resolveGroupFetchErrorMessage(res);
       }
-      const parsed = dedupe(this.parseGroupKeys(res));
-      if (parsed.length > 0) return parsed;
+      selfDetails = this.parseUserGroupDetails(res);
     } catch {}
+
+    try {
+      const res = await this.fetchJson<any>(`${baseUrl}/api/user/groups`, {
+        headers: this.authHeaders(accessToken, resolvedUserId || undefined),
+      });
+      if (res?.success === false) {
+        terminalError = this.resolveGroupFetchErrorMessage(res);
+      }
+      publicDetails = this.parseUserGroupDetails(res);
+    } catch {}
+
+    const mergedAuthDetails = this.mergeUserGroupDetails(selfDetails, publicDetails);
+    if (mergedAuthDetails.length > 0) return mergedAuthDetails;
 
     try {
       const res = await this.fetchJson<any>(`${baseUrl}/api/user_group_map`, {
@@ -1320,7 +1553,7 @@ export class NewApiAdapter extends BasePlatformAdapter {
       if (res?.success === false) {
         terminalError = this.resolveGroupFetchErrorMessage(res);
       }
-      const parsed = dedupe(this.parseGroupKeys(res));
+      const parsed = this.parseUserGroupDetails(res);
       if (parsed.length > 0) return parsed;
     } catch {}
 
@@ -1328,22 +1561,34 @@ export class NewApiAdapter extends BasePlatformAdapter {
     for (const cookie of this.buildCookieCandidates(accessToken)) {
       const headers: Record<string, string> = { Cookie: cookie };
       if (cookieUserId) headers['New-Api-User'] = String(cookieUserId);
+      let cookieSelfDetails: UserGroupInfo[] = [];
+      let cookiePublicDetails: UserGroupInfo[] = [];
 
       try {
         const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/user/self/groups`, { headers });
         if (res?.success === false) {
           terminalError = this.resolveGroupFetchErrorMessage(res);
         }
-        const parsed = dedupe(this.parseGroupKeys(res));
-        if (parsed.length > 0) return parsed;
+        cookieSelfDetails = this.parseUserGroupDetails(res);
       } catch {}
+
+      try {
+        const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/user/groups`, { headers });
+        if (res?.success === false) {
+          terminalError = this.resolveGroupFetchErrorMessage(res);
+        }
+        cookiePublicDetails = this.parseUserGroupDetails(res);
+      } catch {}
+
+      const mergedCookieDetails = this.mergeUserGroupDetails(cookieSelfDetails, cookiePublicDetails);
+      if (mergedCookieDetails.length > 0) return mergedCookieDetails;
 
       try {
         const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/user_group_map`, { headers });
         if (res?.success === false) {
           terminalError = this.resolveGroupFetchErrorMessage(res);
         }
-        const parsed = dedupe(this.parseGroupKeys(res));
+        const parsed = this.parseUserGroupDetails(res);
         if (parsed.length > 0) return parsed;
       } catch {}
     }
@@ -1352,7 +1597,12 @@ export class NewApiAdapter extends BasePlatformAdapter {
       throw new Error(terminalError);
     }
 
-    return ['default'];
+    return [];
+  }
+
+  async getUserGroups(baseUrl: string, accessToken: string, platformUserId?: number): Promise<string[]> {
+    const details = await this.getUserGroupDetails(baseUrl, accessToken, platformUserId);
+    return details.map((detail) => detail.group);
   }
 
   async deleteApiToken(
@@ -1360,28 +1610,45 @@ export class NewApiAdapter extends BasePlatformAdapter {
     accessToken: string,
     tokenKey: string,
     platformUserId?: number,
+    options?: DeleteApiTokenOptions,
   ): Promise<boolean> {
     const targetKey = this.normalizeTokenKeyForCompare(tokenKey);
     if (!targetKey) return false;
     const resolvedUserId = platformUserId || await this.discoverUserId(baseUrl, accessToken);
+    const targetName = (options?.name || '').trim();
+    const targetGroup = (options?.group || '').trim();
+    const sameOptionalText = (left: unknown, right: string): boolean => (
+      !!right && String(left || '').trim() === right
+    );
 
     const pickTokenId = (items: any[]): number | null => {
+      let fallbackByMeta: number | null = null;
+      let fallbackMetaMatches = 0;
       for (const item of items) {
         const key = this.normalizeTokenKeyForCompare(item?.key);
         const id = Number.parseInt(String(item?.id), 10);
         if (key && key === targetKey && Number.isFinite(id) && id > 0) {
           return id;
         }
+        if (!Number.isFinite(id) || id <= 0) continue;
+        const nameMatches = sameOptionalText(item?.name, targetName);
+        const groupMatches = sameOptionalText(item?.group ?? item?.token_group, targetGroup);
+        if (nameMatches && (!targetGroup || groupMatches)) {
+          fallbackByMeta = id;
+          fallbackMetaMatches++;
+        }
       }
-      return null;
+      return fallbackMetaMatches === 1 ? fallbackByMeta : null;
     };
 
     let tokenId: number | null = null;
+    let upstreamListReadable = false;
 
     try {
       const list = await this.fetchJson<any>(`${baseUrl}/api/token/?p=0&size=100`, {
         headers: this.authHeaders(accessToken, resolvedUserId || undefined),
       });
+      upstreamListReadable = this.isTokenListResponse(list);
       tokenId = pickTokenId(this.parseTokenItems(list));
       if (tokenId) {
         const res = await this.fetchJson<any>(`${baseUrl}/api/token/${tokenId}`, {
@@ -1400,6 +1667,7 @@ export class NewApiAdapter extends BasePlatformAdapter {
       try {
         if (!tokenId) {
           const list = await this.fetchJsonRaw<any>(`${baseUrl}/api/token/?p=0&size=100`, { headers });
+          upstreamListReadable = upstreamListReadable || this.isTokenListResponse(list);
           tokenId = pickTokenId(this.parseTokenItems(list));
         }
 
@@ -1413,8 +1681,9 @@ export class NewApiAdapter extends BasePlatformAdapter {
       } catch {}
     }
 
-    // Upstream key already absent means local deletion is safe.
-    if (!tokenId) return true;
+    // Upstream key already absent means local deletion is safe only after the
+    // upstream list was readable and no unique key/name/group match existed.
+    if (!tokenId) return upstreamListReadable;
     return false;
   }
 
@@ -1424,7 +1693,11 @@ export class NewApiAdapter extends BasePlatformAdapter {
         headers: this.authHeaders(accessToken, userId || undefined),
       });
       const normalized = this.normalizeTokenItems(this.parseTokenItems(res));
-      if (normalized.length > 0) return normalized;
+      if (normalized.length > 0) {
+        return this.hydrateClearTokenKeys(baseUrl, normalized, {
+          headers: this.authHeaders(accessToken, userId || undefined),
+        });
+      }
       if (this.isTokenListResponse(res)) return [];
     } catch {}
 

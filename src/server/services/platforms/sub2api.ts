@@ -7,6 +7,7 @@ import {
   SubscriptionPlanSummary,
   SubscriptionSummary,
   type SiteAnnouncement,
+  type UserGroupInfo,
   UserInfo,
 } from './base.js';
 import { stripTrailingSlashes } from '../urlNormalization.js';
@@ -286,6 +287,10 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
   }
 
   private parseGroupItems(payload: any): string[] {
+    return this.parseGroupDetails(payload).map((item) => item.group);
+  }
+
+  private parseGroupDetails(payload: any): UserGroupInfo[] {
     const source = payload?.data ?? payload;
     const rawItems = (() => {
       if (Array.isArray(source)) return source;
@@ -296,16 +301,17 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
       return [];
     })();
 
-    const groups: string[] = [];
+    const groups = new Map<string, UserGroupInfo>();
     for (const item of rawItems) {
       if (item == null) continue;
       if (typeof item === 'number' && Number.isFinite(item) && item > 0) {
-        groups.push(String(Math.trunc(item)));
+        const group = String(Math.trunc(item));
+        groups.set(group, { group });
         continue;
       }
       if (typeof item === 'string') {
         const normalized = item.trim();
-        if (normalized) groups.push(normalized);
+        if (normalized) groups.set(normalized, { group: normalized });
         continue;
       }
       if (typeof item !== 'object') continue;
@@ -324,11 +330,6 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
           break;
         }
       }
-      if (picked) {
-        groups.push(picked);
-        continue;
-      }
-
       const textCandidates = [
         (item as any).name,
         (item as any).group_name,
@@ -337,19 +338,44 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
         (item as any).label,
         (item as any).code,
       ];
+      let name: string | null = null;
       for (const candidate of textCandidates) {
         if (typeof candidate !== 'string') continue;
         const normalized = candidate.trim();
         if (!normalized) continue;
-        groups.push(normalized);
+        name = normalized;
+        if (!picked) picked = normalized;
         break;
+      }
+      if (picked) {
+        const ratio = this.parsePositiveRatio(
+          (item as any).rate_multiplier
+          ?? (item as any).rateMultiplier
+          ?? (item as any).ratio
+          ?? (item as any).multiplier,
+        );
+        groups.set(picked, {
+          group: picked,
+          ...(ratio !== undefined ? { ratio } : {}),
+          ...(name ? { name } : {}),
+          ...(typeof (item as any).description === 'string' && (item as any).description.trim()
+            ? { description: (item as any).description.trim() }
+            : {}),
+        });
+        continue;
       }
     }
 
-    return Array.from(new Set(groups));
+    return Array.from(groups.values());
   }
 
-  private async listGroups(baseUrl: string, accessToken: string): Promise<string[]> {
+  private parsePositiveRatio(raw: unknown): number | undefined {
+    const parsed = typeof raw === 'number' ? raw : Number(String(raw || '').trim());
+    if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+    return Math.round(parsed * 1_000_000) / 1_000_000;
+  }
+
+  private async listGroupDetails(baseUrl: string, accessToken: string): Promise<UserGroupInfo[]> {
     const endpoints = [
       '/api/v1/groups/available',
       '/api/v1/groups?page=1&page_size=100',
@@ -371,12 +397,16 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
             return res;
           }
         })();
-        const groups = this.parseGroupItems(parsed);
+        const groups = this.parseGroupDetails(parsed);
         if (groups.length > 0) return groups;
       } catch {}
     }
 
     return [];
+  }
+
+  private async listGroups(baseUrl: string, accessToken: string): Promise<string[]> {
+    return (await this.listGroupDetails(baseUrl, accessToken)).map((item) => item.group);
   }
 
   private parseGroupIdsFromTokenPayload(payload: any): string[] {
@@ -808,7 +838,18 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
     const inferredFromKeys = await this.inferGroupsFromKeys(normalizedBase, accessToken);
     if (inferredFromKeys.length > 0) return inferredFromKeys;
 
-    return ['default'];
+    return [];
+  }
+
+  override async getUserGroupDetails(baseUrl: string, accessToken: string): Promise<UserGroupInfo[]> {
+    const normalizedBase = normalizeBaseUrl(baseUrl);
+    const directGroups = await this.listGroupDetails(normalizedBase, accessToken);
+    if (directGroups.length > 0) return directGroups;
+
+    const inferredFromKeys = await this.inferGroupsFromKeys(normalizedBase, accessToken);
+    if (inferredFromKeys.length > 0) return inferredFromKeys.map((group) => ({ group }));
+
+    return [];
   }
 
   override async createApiToken(

@@ -35,6 +35,7 @@ import {
   validateGeminiCliOauthConnection,
 } from './platformDiscoveryRegistry.js';
 import { probeRuntimeModel, type RuntimeModelProbeStatus } from './runtimeModelProbe.js';
+import { buildRouteChannelStorageIdentityKey } from './routeChannelIdentity.js';
 
 const API_TOKEN_DISCOVERY_TIMEOUT_MS = 8_000;
 const MODEL_DISCOVERY_TIMEOUT_MS = 12_000;
@@ -1392,15 +1393,9 @@ export async function rebuildTokenRoutesFromAvailability() {
     accountId: number;
     tokenId: number | null;
     oauthRouteUnitId: number | null;
-  }) => (
-    input.oauthRouteUnitId
-      ? `route-unit:${input.oauthRouteUnitId}`
-      : `${input.accountId}:${input.tokenId ?? 'account'}`
-  );
+  }) => buildRouteChannelStorageIdentityKey(input);
   const buildChannelKey = (channel: typeof schema.routeChannels.$inferSelect) => (
-    channel.oauthRouteUnitId
-      ? `route-unit:${channel.oauthRouteUnitId}`
-      : `${channel.accountId}:${channel.tokenId ?? 'account'}`
+    buildRouteChannelStorageIdentityKey(channel)
   );
   const addModelCandidate = (
     modelNameRaw: string | null | undefined,
