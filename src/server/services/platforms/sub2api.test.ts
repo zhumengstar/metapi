@@ -547,6 +547,32 @@ describe('Sub2ApiAdapter', () => {
     expect(await adapter.getApiToken(baseUrl, 'jwt-token')).toBe('sk-active');
   });
 
+  it('uses sub2api group names for numeric api key names and token groups when available', async () => {
+    await startServer((req, res) => {
+      if (req.url === '/api/v1/keys?page=1&page_size=100') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          code: 0,
+          message: 'success',
+          data: {
+            items: [
+              { id: 11, key: 'sk-pro', name: '2', group_id: 2, group_name: '纯pro通道-VIP-超稳定-专用通道', status: 'active' },
+              { id: 12, key: 'sk-legacy', name: 'legacy-token', group_id: 3, status: 'active' },
+            ],
+          },
+        }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+
+    const tokens = await adapter.getApiTokens(baseUrl, 'jwt-token');
+    expect(tokens).toEqual([
+      { key: 'sk-pro', name: '纯pro通道-VIP-超稳定-专用通道', enabled: true, tokenGroup: '纯pro通道-VIP-超稳定-专用通道' },
+      { key: 'sk-legacy', name: 'legacy-token', enabled: true, tokenGroup: '3' },
+    ]);
+  });
+
   it('fetches user groups from /api/v1/groups', async () => {
     await startServer((req, res) => {
       if (req.url === '/api/v1/groups?page=1&page_size=100') {
@@ -567,7 +593,7 @@ describe('Sub2ApiAdapter', () => {
     });
 
     const groups = await adapter.getUserGroups(baseUrl, 'jwt-token');
-    expect(groups).toEqual(['1', '2']);
+    expect(groups).toEqual(['default', 'vip']);
   });
 
   it('fetches user groups from /api/v1/groups/available', async () => {
@@ -588,7 +614,7 @@ describe('Sub2ApiAdapter', () => {
     });
 
     const groups = await adapter.getUserGroups(baseUrl, 'jwt-token');
-    expect(groups).toEqual(['5', '6']);
+    expect(groups).toEqual(['basic', 'pro']);
   });
 
   it('falls back to infer groups from /api/v1/keys when group endpoint is unavailable', async () => {

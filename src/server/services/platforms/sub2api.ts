@@ -264,17 +264,24 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
       if (!key) continue;
       const id = Number.parseInt(String(item?.id), 10);
       if (!Number.isFinite(id) || id <= 0) continue;
-      const name = typeof item?.name === 'string' && item.name.trim()
-        ? item.name.trim()
-        : `token-${id}`;
       const tokenGroup = (() => {
+        const textCandidates = [
+          item?.group_name,
+          item?.groupName,
+          item?.group,
+        ];
+        for (const candidate of textCandidates) {
+          if (typeof candidate !== 'string') continue;
+          const normalized = candidate.trim();
+          if (normalized) return normalized;
+        }
         const fromNumeric = Number.parseInt(String(item?.group_id ?? item?.groupId ?? ''), 10);
-        if (Number.isFinite(fromNumeric) && fromNumeric > 0) return String(fromNumeric);
-        const fromText = typeof item?.group_name === 'string'
-          ? item.group_name.trim()
-          : (typeof item?.group === 'string' ? item.group.trim() : '');
-        return fromText || null;
+        return Number.isFinite(fromNumeric) && fromNumeric > 0 ? String(fromNumeric) : null;
       })();
+      const rawName = typeof item?.name === 'string' ? item.name.trim() : '';
+      const name = rawName && !/^\d+$/.test(rawName)
+        ? rawName
+        : (tokenGroup && !/^\d+$/.test(tokenGroup) ? tokenGroup : rawName || `token-${id}`);
       items.push({
         id,
         key,
@@ -316,20 +323,6 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
       }
       if (typeof item !== 'object') continue;
 
-      const numericCandidates = [
-        (item as any).group_id,
-        (item as any).groupId,
-        (item as any).id,
-        (item as any).value,
-      ];
-      let picked = '';
-      for (const candidate of numericCandidates) {
-        const parsed = Number.parseInt(String(candidate), 10);
-        if (Number.isFinite(parsed) && parsed > 0) {
-          picked = String(parsed);
-          break;
-        }
-      }
       const textCandidates = [
         (item as any).name,
         (item as any).group_name,
@@ -344,8 +337,23 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
         const normalized = candidate.trim();
         if (!normalized) continue;
         name = normalized;
-        if (!picked) picked = normalized;
         break;
+      }
+      let picked = name || '';
+      if (!picked) {
+        const numericCandidates = [
+          (item as any).group_id,
+          (item as any).groupId,
+          (item as any).id,
+          (item as any).value,
+        ];
+        for (const candidate of numericCandidates) {
+          const parsed = Number.parseInt(String(candidate), 10);
+          if (Number.isFinite(parsed) && parsed > 0) {
+            picked = String(parsed);
+            break;
+          }
+        }
       }
       if (picked) {
         const ratio = this.parsePositiveRatio(
