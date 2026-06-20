@@ -83,6 +83,12 @@ const resolveSyncMessage = (result: AccountTokenSyncResult | null | undefined, f
 
 const isMaskedPendingToken = (token: any): boolean => token?.valueStatus === 'masked_pending';
 
+const formatTokenGroupRatio = (token: any): string => {
+  const ratio = Number(token?.tokenGroupRatio);
+  if (!Number.isFinite(ratio) || ratio <= 0) return '-';
+  return `${Number.parseFloat(ratio.toFixed(6))}x`;
+};
+
 const isMaskedPendingSyncResult = (result: AccountTokenSyncResult | null | undefined) =>
   String(result?.reason || '').trim().toLowerCase() === 'upstream_masked_tokens'
   && Number(result?.maskedPending || 0) > 0;
@@ -1231,6 +1237,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                   >
                     <MobileField label="账号" value={token.account?.username || `account-${token.accountId}`} />
                     <MobileField label="分组" value={token.tokenGroup || 'default'} />
+                    <MobileField label="倍率" value={formatTokenGroupRatio(token)} />
                     <MobileField
                       label="状态"
                       value={(
@@ -1327,6 +1334,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                 <th>来源站点</th>
                 <th>账号</th>
                 <th>分组</th>
+                <th>倍率</th>
                 <th>状态</th>
                 <th>默认</th>
                 <th>更新时间</th>
@@ -1380,6 +1388,19 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                     </td>
                     <td>{token.account?.username || `account-${token.accountId}`}</td>
                     <td>{token.tokenGroup || 'default'}</td>
+                    <td>
+                      {token.tokenGroupRatio ? (
+                        <span
+                          className="badge badge-info"
+                          style={{ fontSize: 11 }}
+                          title={token.tokenGroupRatioGroup && token.tokenGroupRatioGroup !== token.tokenGroup ? `匹配分组：${token.tokenGroupRatioGroup}` : undefined}
+                        >
+                          {formatTokenGroupRatio(token)}
+                        </span>
+                      ) : (
+                        <span style={{ color: 'var(--color-text-muted)' }}>-</span>
+                      )}
+                    </td>
                     <td>
                       {isPending ? (
                         <span className="badge badge-warning" style={{ fontSize: 11 }}>待补全</span>

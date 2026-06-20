@@ -12,6 +12,7 @@ const getApiTokenMock = vi.fn();
 const createApiTokenMock = vi.fn();
 const getUserGroupsMock = vi.fn();
 const deleteApiTokenMock = vi.fn();
+const fetchModelPricingCatalogMock = vi.fn();
 
 type AccountTokenServiceModule = typeof import('../../services/accountTokenService.js');
 type BackgroundTaskServiceModule = typeof import('../../services/backgroundTaskService.js');
@@ -25,6 +26,14 @@ vi.mock('../../services/platforms/index.js', () => ({
     deleteApiToken: (...args: unknown[]) => deleteApiTokenMock(...args),
   }),
 }));
+
+vi.mock('../../services/modelPricingService.js', async () => {
+  const actual = await vi.importActual<typeof import('../../services/modelPricingService.js')>('../../services/modelPricingService.js');
+  return {
+    ...actual,
+    fetchModelPricingCatalog: (...args: unknown[]) => fetchModelPricingCatalogMock(...args),
+  };
+});
 
 type DbModule = typeof import('../../db/index.js');
 
@@ -93,6 +102,8 @@ describe('account tokens sync routes with site status', () => {
     createApiTokenMock.mockReset();
     getUserGroupsMock.mockReset();
     deleteApiTokenMock.mockReset();
+    fetchModelPricingCatalogMock.mockReset();
+    fetchModelPricingCatalogMock.mockResolvedValue(null);
     resetBackgroundTasks();
     seedId = 0;
 
@@ -532,6 +543,77 @@ describe('account tokens sync routes with site status', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual([]);
+  });
+
+  it('loads token group ratios from the account pricing catalog', async () => {
+    const { site, account } = await seedAccount({ siteStatus: 'active' });
+    await db.update(schema.sites)
+      .set({ platform: 'sub2api' })
+      .where(eq(schema.sites.id, site.id))
+      .run();
+
+    await db.insert(schema.accountTokens).values([
+      {
+        accountId: account.id,
+        name: '生图-1k',
+        token: 'sk-image-1k',
+        tokenGroup: '生图-1k',
+        enabled: true,
+        isDefault: true,
+      },
+      {
+        accountId: account.id,
+        name: '生图-2k4k',
+        token: 'sk-image-2k4k',
+        tokenGroup: '生图-2k4k',
+        enabled: true,
+        isDefault: false,
+      },
+    ]).run();
+
+    fetchModelPricingCatalogMock.mockResolvedValue({
+      models: [],
+      groupRatio: {
+        '生图（1k）': 0.12,
+        '生图（2k4k）': 0.25,
+        default: 1,
+      },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/account-tokens',
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as Array<{
+      name: string;
+      tokenGroupRatio: number | null;
+      tokenGroupRatioGroup: string | null;
+    }>;
+    expect(body).toEqual([
+      expect.objectContaining({
+        name: '生图-1k',
+        tokenGroupRatio: 0.12,
+        tokenGroupRatioGroup: '生图（1k）',
+      }),
+      expect.objectContaining({
+        name: '生图-2k4k',
+        tokenGroupRatio: 0.25,
+        tokenGroupRatioGroup: '生图（2k4k）',
+      }),
+    ]);
+    expect(fetchModelPricingCatalogMock).toHaveBeenCalledTimes(1);
+    expect(fetchModelPricingCatalogMock).toHaveBeenCalledWith(expect.objectContaining({
+      account: expect.objectContaining({
+        id: account.id,
+        accessToken: account.accessToken,
+      }),
+      site: expect.objectContaining({
+        id: site.id,
+        platform: 'sub2api',
+      }),
+    }));
   });
 
   it('sync-all skips disabled-site accounts and syncs active-site accounts', async () => {

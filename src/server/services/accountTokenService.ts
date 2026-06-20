@@ -2,7 +2,8 @@
 import { db, schema } from '../db/index.js';
 import { getInsertedRowId } from '../db/insertHelpers.js';
 import { getCredentialModeFromExtraConfig } from './accountExtraConfig.js';
-import { resolveTokenGroupLabel, tokenGroupLabelsMatch } from './tokenGroupNames.js';
+import { fetchModelPricingCatalog } from './modelPricingService.js';
+import { normalizeTokenGroupLookupKey, resolveTokenGroupLabel, tokenGroupLabelsMatch } from './tokenGroupNames.js';
 
 type UpstreamApiToken = {
   name?: string | null;
@@ -150,6 +151,53 @@ function sameTokenGroup(
     normalizeTokenGroup(leftGroup, leftName),
     normalizeTokenGroup(rightGroup, rightName),
   );
+}
+
+function resolveTokenGroupRatio(
+  tokenGroup: string | null | undefined,
+  groupRatio: Record<string, number> | null | undefined,
+): { ratio: number | null; matchedGroup: string | null } {
+  const group = (tokenGroup || '').trim();
+  if (!group || !groupRatio) return { ratio: null, matchedGroup: null };
+  if (typeof groupRatio[group] === 'number' && Number.isFinite(groupRatio[group])) {
+    return { ratio: groupRatio[group], matchedGroup: group };
+  }
+
+  const lookupKey = normalizeTokenGroupLookupKey(group);
+  if (!lookupKey) return { ratio: null, matchedGroup: null };
+  for (const [candidateGroup, ratio] of Object.entries(groupRatio)) {
+    if (!Number.isFinite(ratio)) continue;
+    if (normalizeTokenGroupLookupKey(candidateGroup) === lookupKey) {
+      return { ratio, matchedGroup: candidateGroup };
+    }
+  }
+
+  return { ratio: null, matchedGroup: null };
+}
+
+async function fetchGroupRatioForAccount(row: {
+  accounts: Pick<typeof schema.accounts.$inferSelect, 'id' | 'accessToken' | 'apiToken'>;
+  sites: Pick<typeof schema.sites.$inferSelect, 'id' | 'url' | 'platform'>;
+}): Promise<Record<string, number> | null> {
+  try {
+    const catalog = await fetchModelPricingCatalog({
+      site: {
+        id: row.sites.id,
+        url: row.sites.url,
+        platform: row.sites.platform,
+      },
+      account: {
+        id: row.accounts.id,
+        accessToken: row.accounts.accessToken,
+        apiToken: row.accounts.apiToken,
+      },
+      modelName: '__metadata__',
+      totalTokens: 0,
+    });
+    return catalog?.groupRatio || null;
+  } catch {
+    return null;
+  }
 }
 
 async function updateAccountApiToken(accountId: number, tokenValue: string | null) {
@@ -479,14 +527,28 @@ export async function listTokensWithRelations(accountId?: number) {
     ? await base.where(eq(schema.accountTokens.accountId, accountId)).all()
     : await base.all();
 
-  return rows
-    .filter((row) => !isApiKeyConnection(row.accounts))
+  const visibleRows = rows.filter((row) => !isApiKeyConnection(row.accounts));
+  const accountRowsById = new Map<number, (typeof visibleRows)[number]>();
+  for (const row of visibleRows) {
+    if (!accountRowsById.has(row.accounts.id)) accountRowsById.set(row.accounts.id, row);
+  }
+  const accountRows = Array.from(accountRowsById.values());
+  const groupRatiosByAccountId = new Map<number, Record<string, number> | null>();
+  await Promise.all(accountRows.map(async (row) => {
+    groupRatiosByAccountId.set(row.accounts.id, await fetchGroupRatioForAccount(row));
+  }));
+
+  return visibleRows
     .map((row) => {
     const { token, ...tokenMeta } = row.account_tokens;
+    const resolvedTokenGroup = resolveTokenGroupLabel(row.account_tokens.tokenGroup, row.account_tokens.name) || 'default';
+    const ratio = resolveTokenGroupRatio(resolvedTokenGroup, groupRatiosByAccountId.get(row.accounts.id));
     return {
       ...tokenMeta,
       valueStatus: resolveAccountTokenValueStatus(row.account_tokens),
       tokenMasked: maskToken(token, row.sites.platform),
+      tokenGroupRatio: ratio.ratio,
+      tokenGroupRatioGroup: ratio.matchedGroup,
       account: {
         id: row.accounts.id,
         username: row.accounts.username,
