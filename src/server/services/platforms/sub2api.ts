@@ -372,7 +372,30 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
     return Array.from(new Set(groups));
   }
 
-  private async listGroups(baseUrl: string, accessToken: string): Promise<string[]> {
+  private buildGroupNameById(entries: Sub2ApiGroupEntry[]): Map<number, string> {
+    const map = new Map<number, string>();
+    for (const entry of entries) {
+      if (!entry.id || !entry.name.trim()) continue;
+      map.set(entry.id, entry.name.trim());
+    }
+    return map;
+  }
+
+  private applyGroupNamesToTokenItems(
+    items: Array<{ id: number; key: string; name: string; enabled: boolean; tokenGroup: string | null }>,
+    groupNameById: Map<number, string>,
+  ): Array<{ id: number; key: string; name: string; enabled: boolean; tokenGroup: string | null }> {
+    if (groupNameById.size <= 0) return items;
+    return items.map((item) => {
+      const groupId = this.parsePositiveInteger(item.tokenGroup || '');
+      if (!groupId) return item;
+      const groupName = groupNameById.get(groupId);
+      if (!groupName) return item;
+      return { ...item, tokenGroup: groupName };
+    });
+  }
+
+  private async listGroupEntries(baseUrl: string, accessToken: string): Promise<Sub2ApiGroupEntry[]> {
     const endpoints = [
       '/api/v1/groups/available',
       '/api/v1/groups?page=1&page_size=100',
@@ -394,12 +417,16 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
             return res;
           }
         })();
-        const groups = this.parseGroupItems(parsed);
+        const groups = this.parseGroupEntries(parsed);
         if (groups.length > 0) return groups;
       } catch {}
     }
 
     return [];
+  }
+
+  private async listGroups(baseUrl: string, accessToken: string): Promise<string[]> {
+    return Array.from(new Set((await this.listGroupEntries(baseUrl, accessToken)).map((item) => item.name).filter(Boolean)));
   }
 
   private async resolveGroupIdByName(baseUrl: string, accessToken: string, groupName: string): Promise<number | null> {
@@ -408,32 +435,10 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
     const directGroupId = this.parsePositiveInteger(normalizedGroupName);
     if (directGroupId) return directGroupId;
 
-    const endpoints = [
-      '/api/v1/groups/available',
-      '/api/v1/groups?page=1&page_size=100',
-      '/api/v1/groups',
-      '/api/v1/group?page=1&page_size=100',
-      '/api/v1/group',
-    ];
-    const headers = this.buildAuthHeader(accessToken);
     const normalize = (value: string) => value.trim().toLowerCase();
     const target = normalize(normalizedGroupName);
-    for (const endpoint of endpoints) {
-      try {
-        const res = await this.fetchJson<any>(`${baseUrl}${endpoint}`, { headers });
-        const parsed = (() => {
-          try {
-            return this.parseSub2ApiEnvelope<any>(res, endpoint);
-          } catch {
-            return res;
-          }
-        })();
-        const group = this.parseGroupEntries(parsed).find((item) => normalize(item.name) === target);
-        if (group?.id) return group.id;
-      } catch {}
-    }
-
-    return null;
+    const group = (await this.listGroupEntries(baseUrl, accessToken)).find((item) => normalize(item.name) === target);
+    return group?.id || null;
   }
 
   private parseGroupIdsFromTokenPayload(payload: any): string[] {
@@ -564,7 +569,10 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
           headers,
         });
         const data = this.parseSub2ApiEnvelope<any>(res, endpoint);
-        const items = this.parseTokenItems(data);
+        const items = this.applyGroupNamesToTokenItems(
+          this.parseTokenItems(data),
+          this.buildGroupNameById(await this.listGroupEntries(baseUrl, accessToken)),
+        );
         if (items.length > 0) return items;
       } catch {}
     }

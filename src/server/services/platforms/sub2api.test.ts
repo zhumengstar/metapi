@@ -631,6 +631,45 @@ describe('Sub2ApiAdapter', () => {
     expect(groups).toEqual(['7', '9']);
   });
 
+  it('maps token group_id to group name when listing api keys', async () => {
+    await startServer((req, res) => {
+      if (req.url === '/api/v1/keys?page=1&page_size=100') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          code: 0,
+          message: 'success',
+          data: {
+            items: [
+              { id: 21, key: 'sk-pro', name: 'pro-token', group_id: 8, status: 'active' },
+            ],
+          },
+        }));
+        return;
+      }
+      if (req.url === '/api/v1/groups/available') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          code: 0,
+          message: 'success',
+          data: [
+            { id: 8, name: '生图' },
+          ],
+        }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+
+    const tokens = await adapter.getApiTokens(baseUrl, 'jwt-token');
+    expect(tokens).toEqual([
+      expect.objectContaining({
+        key: 'sk-pro',
+        name: 'pro-token',
+        tokenGroup: '生图',
+      }),
+    ]);
+  });
+
   it('creates api key via /api/v1/keys', async () => {
     await startServer((req, res) => {
       if (req.url === '/api/v1/keys' && req.method === 'POST') {
