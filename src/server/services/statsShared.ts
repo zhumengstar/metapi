@@ -20,6 +20,20 @@ export function proxyCostSqlExpression() {
   `;
 }
 
+export function siteRechargeRatioSqlExpression() {
+  return sql<number>`
+    case
+      when coalesce(${schema.sites.rechargeRatio}, 1) > 0
+        then coalesce(${schema.sites.rechargeRatio}, 1)
+      else 1
+    end
+  `;
+}
+
+export function proxyActualCostSqlExpression() {
+  return sql<number>`(${proxyCostSqlExpression()}) / ${siteRechargeRatioSqlExpression()}`;
+}
+
 export function toRoundedMicroNumber(value: number | null | undefined): number {
   return Math.round(Number(value || 0) * 1_000_000) / 1_000_000;
 }

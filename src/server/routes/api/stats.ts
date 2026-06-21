@@ -28,16 +28,25 @@ import {
   withProxyLogSelectFields,
 } from "../../services/proxyLogStore.js";
 import {
+  calculateCacheHitRatePercent,
+  readBillingUsageToken,
+  resolveBillablePromptTokensForCacheStats,
+} from "../../services/billingUsageCacheStats.js";
+import {
   getProxyDebugTraceDetail,
   listProxyDebugTraces,
 } from "../../services/proxyDebugTraceStore.js";
 import { parseProxyLogMessageMeta } from "../../services/proxyLogMessage.js";
 import { requiresManagedAccountTokens } from "../../services/accountExtraConfig.js";
-import { ACCOUNT_TOKEN_VALUE_STATUS_READY } from "../../services/accountTokenService.js";
+import {
+  ACCOUNT_TOKEN_VALUE_STATUS_READY,
+  normalizeAccountTokenGroupRatioKey,
+} from "../../services/accountTokenService.js";
 import {
   normalizeTokenGroupLookupKey,
   resolveTokenGroupLabel,
 } from "../../services/tokenGroupNames.js";
+import { isSuccessfulManualTokenModelTest } from "../../services/tokenModelAvailabilityStatus.js";
 import {
   formatLocalDateTime,
   formatUtcSqlDateTime,
@@ -57,6 +66,7 @@ import { getSiteStatsSnapshot } from "../../services/siteStatsSnapshotService.js
 import {
   runUsageAggregationProjectionPass,
 } from "../../services/usageAggregationService.js";
+import { normalizeRechargeRatio, toActualAmount } from "../../services/siteBilling.js";
 
 function parseBooleanFlag(raw?: string): boolean {
   if (!raw) return false;
@@ -580,6 +590,11 @@ function mapProxyLogRow(
       id?: number | null;
       name?: string | null;
       url?: string | null;
+      rechargeRatio?: number | null;
+    } | null;
+    account_tokens: {
+      id?: number | null;
+      tokenGroup?: string | null;
     } | null;
     downstream_api_keys: {
       id?: number | null;
@@ -588,22 +603,11 @@ function mapProxyLogRow(
       tags?: string | null;
     } | null;
   },
-  options?: { includeBillingDetails?: boolean },
+  options?: {
+    includeBillingDetails?: boolean;
+    tokenGroupFallbacks?: Map<string, { group: string | null; ratio: number | null }>;
+  },
 ) {
-  const readBillingUsageToken = (
-    details: Record<string, unknown> | null,
-    key: string,
-  ): number | null => {
-    const usage = details?.usage;
-    if (!usage || typeof usage !== "object" || Array.isArray(usage)) return null;
-    const raw = (usage as Record<string, unknown>)[key];
-    if (typeof raw === "number" && Number.isFinite(raw)) return raw;
-    if (typeof raw === "string") {
-      const parsed = Number(raw.trim());
-      if (Number.isFinite(parsed)) return parsed;
-    }
-    return null;
-  };
   const clientMeta = resolveProxyLogClientMeta(row.proxy_logs);
   const legacyMeta = parseProxyLogMessageMeta(
     typeof row.proxy_logs.errorMessage === "string"
@@ -614,18 +618,67 @@ function mapProxyLogRow(
     row.proxy_logs.billingDetails,
   );
   const cacheReadTokens = readBillingUsageToken(billingDetails, "cacheReadTokens");
-  const promptTokens = typeof row.proxy_logs.promptTokens === "number"
+  const rawPromptTokens = typeof row.proxy_logs.promptTokens === "number"
     ? row.proxy_logs.promptTokens
     : readBillingUsageToken(billingDetails, "promptTokens");
-  const cacheHitRate =
-    typeof cacheReadTokens === "number"
-    && typeof promptTokens === "number"
-    && cacheReadTokens + promptTokens > 0
-      ? Math.round((cacheReadTokens / (cacheReadTokens + promptTokens)) * 10_000) / 100
+  const billablePromptTokens = resolveBillablePromptTokensForCacheStats({
+    billingDetails,
+    promptTokens: rawPromptTokens,
+    cacheReadTokens,
+  });
+  const cacheHitRate = calculateCacheHitRatePercent({
+    cacheReadTokens,
+    billablePromptTokens,
+  });
+  const pricing = billingDetails?.pricing;
+  const rawTokenGroupRatio = pricing && typeof pricing === "object" && !Array.isArray(pricing)
+    ? (pricing as Record<string, unknown>).groupRatio
+    : null;
+  const tokenGroupRatio = typeof rawTokenGroupRatio === "number" && Number.isFinite(rawTokenGroupRatio)
+    ? rawTokenGroupRatio
+    : typeof rawTokenGroupRatio === "string" && Number.isFinite(Number(rawTokenGroupRatio.trim()))
+      ? Number(rawTokenGroupRatio.trim())
       : null;
+  const fallbackTokenGroupKey = typeof row.proxy_logs.accountId === "number" && tokenGroupRatio != null
+    ? `${row.proxy_logs.accountId}:${normalizeAccountTokenGroupRatioKey(tokenGroupRatio)}`
+    : "";
+  const ratioTokenGroupFallback = fallbackTokenGroupKey
+    ? options?.tokenGroupFallbacks?.get(fallbackTokenGroupKey) || null
+    : null;
+  const modelFallbackKey = typeof row.proxy_logs.accountId === "number"
+    ? `${row.proxy_logs.accountId}:model:${String(row.proxy_logs.modelRequested || "").trim().toLowerCase()}`
+    : "";
+  const modelTokenGroupFallback = modelFallbackKey
+    ? options?.tokenGroupFallbacks?.get(modelFallbackKey) || null
+    : null;
+  const tokenGroupFallback = ratioTokenGroupFallback?.group || modelTokenGroupFallback?.group || null;
+  const resolvedTokenGroupRatio = tokenGroupRatio ?? ratioTokenGroupFallback?.ratio ?? modelTokenGroupFallback?.ratio ?? null;
+  const selectedToken = billingDetails?.selectedToken;
+  const billingTokenGroup = selectedToken && typeof selectedToken === "object" && !Array.isArray(selectedToken)
+    ? String((selectedToken as Record<string, unknown>).tokenGroup || "").trim() || null
+    : null;
+  const accountId = typeof row.proxy_logs.accountId === "number" ? row.proxy_logs.accountId : null;
+  const selectedTokenGroup = row.account_tokens?.tokenGroup || billingTokenGroup || null;
+  const selectedTokenGroupKey = accountId && selectedTokenGroup
+    ? `${accountId}:group:${normalizeTokenGroupLookupKey(selectedTokenGroup)}`
+    : "";
+  const selectedTokenGroupFallback = selectedTokenGroupKey
+    ? options?.tokenGroupFallbacks?.get(selectedTokenGroupKey) || null
+    : null;
+  const { billingDetails: _rawBillingDetails, ...proxyLogFields } = row.proxy_logs;
+  const rechargeRatio = normalizeRechargeRatio(row.sites?.rechargeRatio);
+  const actualEstimatedCost = typeof row.proxy_logs.estimatedCost === "number"
+    ? toActualAmount(row.proxy_logs.estimatedCost, rechargeRatio)
+    : row.proxy_logs.estimatedCost;
+  const actualBillingDetails = options?.includeBillingDetails
+    ? convertBillingDetailsToActualAmount(billingDetails, rechargeRatio)
+    : undefined;
 
   return {
-    ...row.proxy_logs,
+    ...proxyLogFields,
+    rawEstimatedCost: row.proxy_logs.estimatedCost,
+    estimatedCost: actualEstimatedCost,
+    rechargeRatio,
     isStream:
       row.proxy_logs.isStream == null ? null : Boolean(row.proxy_logs.isStream),
     firstByteLatencyMs:
@@ -636,7 +689,7 @@ function mapProxyLogRow(
     cacheHitRate,
     ...(options?.includeBillingDetails
       ? {
-          billingDetails,
+          billingDetails: actualBillingDetails,
         }
       : {}),
     clientFamily: clientMeta.clientFamily,
@@ -648,11 +701,200 @@ function mapProxyLogRow(
     siteId: row.sites?.id || null,
     siteName: row.sites?.name || null,
     siteUrl: row.sites?.url || null,
+    tokenGroup: selectedTokenGroup || tokenGroupFallback,
+    tokenGroupRatio: selectedTokenGroupFallback?.ratio ?? resolvedTokenGroupRatio,
     downstreamKeyId: row.downstream_api_keys?.id || null,
     downstreamKeyName: row.downstream_api_keys?.name || null,
     downstreamKeyGroupName: row.downstream_api_keys?.groupName || null,
     downstreamKeyTags: parseDownstreamKeyTags(row.downstream_api_keys?.tags),
   };
+}
+
+function convertBillingDetailsToActualAmount(
+  billingDetails: ReturnType<typeof parseProxyLogBillingDetails>,
+  rechargeRatio: unknown,
+) {
+  if (!billingDetails) return billingDetails;
+  const ratio = normalizeRechargeRatio(rechargeRatio);
+  const breakdown = billingDetails.breakdown && typeof billingDetails.breakdown === "object"
+    ? billingDetails.breakdown as Record<string, unknown>
+    : null;
+  if (!breakdown) return billingDetails;
+  return {
+    ...billingDetails,
+    breakdown: {
+      ...breakdown,
+      inputPerMillion: toActualAmount(breakdown.inputPerMillion, ratio),
+      outputPerMillion: toActualAmount(breakdown.outputPerMillion, ratio),
+      cacheReadPerMillion: toActualAmount(breakdown.cacheReadPerMillion, ratio),
+      cacheCreationPerMillion: toActualAmount(breakdown.cacheCreationPerMillion, ratio),
+      inputCost: toActualAmount(breakdown.inputCost, ratio),
+      outputCost: toActualAmount(breakdown.outputCost, ratio),
+      cacheReadCost: toActualAmount(breakdown.cacheReadCost, ratio),
+      cacheCreationCost: toActualAmount(breakdown.cacheCreationCost, ratio),
+      totalCost: toActualAmount(breakdown.totalCost, ratio),
+    },
+  };
+}
+
+function readProxyLogTokenGroupRatioFromBillingDetails(rawBillingDetails?: string | null): number | null {
+  const billingDetails = parseProxyLogBillingDetails(rawBillingDetails);
+  const pricing = billingDetails?.pricing;
+  const rawTokenGroupRatio = pricing && typeof pricing === "object" && !Array.isArray(pricing)
+    ? (pricing as Record<string, unknown>).groupRatio
+    : null;
+  if (typeof rawTokenGroupRatio === "number" && Number.isFinite(rawTokenGroupRatio)) return rawTokenGroupRatio;
+  if (typeof rawTokenGroupRatio === "string") {
+    const parsed = Number(rawTokenGroupRatio.trim());
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+async function loadProxyLogTokenGroupFallbacks(rows: Array<{
+  proxy_logs: Record<string, unknown> & { billingDetails?: string | null };
+  account_tokens: { tokenGroup?: string | null } | null;
+}>): Promise<Map<string, { group: string | null; ratio: number | null }>> {
+  const wanted = new Map<number, Set<string>>();
+  const wantedModels = new Map<number, Set<string>>();
+  const wantedGroups = new Map<number, Set<string>>();
+  for (const row of rows) {
+    const accountId = typeof row.proxy_logs.accountId === "number" ? row.proxy_logs.accountId : null;
+    if (!accountId) continue;
+    const tokenGroup = String(row.account_tokens?.tokenGroup || "").trim();
+    if (tokenGroup) {
+      const set = wantedGroups.get(accountId) || new Set<string>();
+      set.add(tokenGroup);
+      wantedGroups.set(accountId, set);
+      continue;
+    }
+    const ratio = readProxyLogTokenGroupRatioFromBillingDetails(row.proxy_logs.billingDetails);
+    const ratioKey = normalizeAccountTokenGroupRatioKey(ratio);
+    if (ratioKey) {
+      const set = wanted.get(accountId) || new Set<string>();
+      set.add(ratioKey);
+      wanted.set(accountId, set);
+    }
+    const modelName = String(row.proxy_logs.modelRequested || "").trim().toLowerCase();
+    if (modelName) {
+      const set = wantedModels.get(accountId) || new Set<string>();
+      set.add(modelName);
+      wantedModels.set(accountId, set);
+    }
+  }
+  if (wanted.size === 0 && wantedModels.size === 0 && wantedGroups.size === 0) return new Map();
+
+  const accountIds = Array.from(new Set([...wanted.keys(), ...wantedModels.keys(), ...wantedGroups.keys()]));
+  const preferenceRows = await db.select({
+    accountId: schema.accountTokenGroupPreferences.accountId,
+    tokenGroup: schema.accountTokenGroupPreferences.tokenGroup,
+    groupRatioKey: schema.accountTokenGroupPreferences.groupRatioKey,
+  })
+    .from(schema.accountTokenGroupPreferences)
+    .all();
+  const tokenRows = await db.select({
+    accountId: schema.accountTokens.accountId,
+    tokenGroup: schema.accountTokens.tokenGroup,
+  })
+    .from(schema.accountTokens)
+    .all();
+
+  const tokenGroupsByAccount = new Map<number, Set<string>>();
+  const ratioByAccountGroup = new Map<string, number>();
+  for (const row of tokenRows) {
+    if (!accountIds.includes(row.accountId)) continue;
+    const tokenGroup = String(row.tokenGroup || "").trim();
+    if (!tokenGroup) continue;
+    const set = tokenGroupsByAccount.get(row.accountId) || new Set<string>();
+    set.add(tokenGroup);
+    tokenGroupsByAccount.set(row.accountId, set);
+  }
+
+  const pricingRows = await db.select({
+    accountId: schema.tokenGroupPricing.accountId,
+    group: schema.tokenGroupPricing.group,
+    groupName: schema.tokenGroupPricing.groupName,
+    ratio: schema.tokenGroupPricing.ratio,
+  })
+    .from(schema.tokenGroupPricing)
+    .all();
+  for (const row of pricingRows) {
+    if (!row.accountId || !accountIds.includes(row.accountId)) continue;
+    const ratio = Number(row.ratio);
+    if (!Number.isFinite(ratio) || ratio <= 0) continue;
+    for (const value of [row.group, row.groupName]) {
+      const group = String(value || "").trim();
+      if (!group) continue;
+      ratioByAccountGroup.set(`${row.accountId}:${group.toLowerCase()}`, ratio);
+    }
+  }
+
+  const result = new Map<string, { group: string | null; ratio: number | null }>();
+  for (const [accountId, groups] of wantedGroups) {
+    for (const group of groups) {
+      const groupKey = normalizeTokenGroupLookupKey(group);
+      if (!groupKey) continue;
+      result.set(`${accountId}:group:${groupKey}`, {
+        group,
+        ratio: ratioByAccountGroup.get(`${accountId}:${group.toLowerCase()}`) ?? null,
+      });
+    }
+  }
+
+  const candidatesByKey = new Map<string, Set<string>>();
+  for (const row of preferenceRows) {
+    if (!wanted.get(row.accountId)?.has(row.groupRatioKey)) continue;
+    const tokenGroup = String(row.tokenGroup || "").trim();
+    if (!tokenGroup) continue;
+    const tokenGroups = tokenGroupsByAccount.get(row.accountId);
+    if (tokenGroups && !tokenGroups.has(tokenGroup)) continue;
+    const key = `${row.accountId}:${row.groupRatioKey}`;
+    const set = candidatesByKey.get(key) || new Set<string>();
+    set.add(tokenGroup);
+    candidatesByKey.set(key, set);
+  }
+
+  for (const [key, groups] of candidatesByKey) {
+    if (groups.size === 1) {
+      const group = Array.from(groups)[0]!;
+      const [accountId] = key.split(":");
+      result.set(key, {
+        group,
+        ratio: ratioByAccountGroup.get(`${accountId}:${group.toLowerCase()}`) ?? null,
+      });
+    }
+  }
+
+  const modelRows = await db.select({
+    accountId: schema.accountTokens.accountId,
+    tokenGroup: schema.accountTokens.tokenGroup,
+    modelName: schema.tokenModelAvailability.modelName,
+  })
+    .from(schema.tokenModelAvailability)
+    .innerJoin(schema.accountTokens, eq(schema.tokenModelAvailability.tokenId, schema.accountTokens.id))
+    .all();
+  const modelCandidatesByKey = new Map<string, Set<string>>();
+  for (const row of modelRows) {
+    if (!accountIds.includes(row.accountId)) continue;
+    const modelName = String(row.modelName || "").trim().toLowerCase();
+    if (!wantedModels.get(row.accountId)?.has(modelName)) continue;
+    const tokenGroup = String(row.tokenGroup || "").trim();
+    if (!tokenGroup) continue;
+    const key = `${row.accountId}:model:${modelName}`;
+    const set = modelCandidatesByKey.get(key) || new Set<string>();
+    set.add(tokenGroup);
+    modelCandidatesByKey.set(key, set);
+  }
+  for (const [key, groups] of modelCandidatesByKey) {
+    if (groups.size !== 1) continue;
+    const group = Array.from(groups)[0]!;
+    const [accountId] = key.split(":");
+    result.set(key, {
+      group,
+      ratio: ratioByAccountGroup.get(`${accountId}:${group.toLowerCase()}`) ?? null,
+    });
+  }
+  return result;
 }
 
 function buildProxyLogModelAnalysisSelectFields() {
@@ -758,6 +1000,11 @@ export async function statsRoutes(app: FastifyInstance) {
               id: schema.sites.id,
               name: schema.sites.name,
               url: schema.sites.url,
+              rechargeRatio: schema.sites.rechargeRatio,
+            },
+            account_tokens: {
+              id: schema.accountTokens.id,
+              tokenGroup: schema.accountTokens.tokenGroup,
             },
             downstream_api_keys: {
               id: schema.downstreamApiKeys.id,
@@ -772,6 +1019,14 @@ export async function statsRoutes(app: FastifyInstance) {
             eq(schema.proxyLogs.accountId, schema.accounts.id),
           )
           .leftJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+          .leftJoin(
+            schema.routeChannels,
+            eq(schema.proxyLogs.channelId, schema.routeChannels.id),
+          )
+          .leftJoin(
+            schema.accountTokens,
+            eq(schema.routeChannels.tokenId, schema.accountTokens.id),
+          )
           .leftJoin(
             schema.downstreamApiKeys,
             eq(
@@ -798,6 +1053,11 @@ export async function statsRoutes(app: FastifyInstance) {
         id?: number | null;
         name?: string | null;
         url?: string | null;
+        rechargeRatio?: number | null;
+      } | null;
+      account_tokens: {
+        id?: number | null;
+        tokenGroup?: string | null;
       } | null;
       downstream_api_keys: {
         id?: number | null;
@@ -826,8 +1086,10 @@ export async function statsRoutes(app: FastifyInstance) {
     }
     const totalRow = await totalQuery.get();
 
+    const tokenGroupFallbacks = await loadProxyLogTokenGroupFallbacks(listRows);
+
     return {
-      items: listRows.map((row) => mapProxyLogRow(row)),
+      items: listRows.map((row) => mapProxyLogRow(row, { tokenGroupFallbacks })),
       total: Number(totalRow?.total || 0),
       page: Math.floor(offset / limit) + 1,
       pageSize: limit,
@@ -918,7 +1180,7 @@ export async function statsRoutes(app: FastifyInstance) {
             totalCount: sql<number>`count(*)`,
             successCount: sql<number>`coalesce(sum(case when ${schema.proxyLogs.status} = 'success' then 1 else 0 end), 0)`,
             failedCount: sql<number>`coalesce(sum(case when coalesce(${schema.proxyLogs.status}, '') <> 'success' then 1 else 0 end), 0)`,
-            totalCost: sql<number>`coalesce(sum(coalesce(${schema.proxyLogs.estimatedCost}, 0)), 0)`,
+            totalCost: sql<number>`coalesce(sum(coalesce(${schema.proxyLogs.estimatedCost}, 0) / case when coalesce(${schema.sites.rechargeRatio}, 1) > 0 then coalesce(${schema.sites.rechargeRatio}, 1) else 1 end), 0)`,
             totalTokensAll: sql<number>`coalesce(sum(coalesce(${schema.proxyLogs.totalTokens}, 0)), 0)`,
           })
           .from(schema.proxyLogs)
@@ -1012,6 +1274,10 @@ export async function statsRoutes(app: FastifyInstance) {
               proxy_logs: fields,
               accounts: schema.accounts,
               sites: schema.sites,
+              account_tokens: {
+                id: schema.accountTokens.id,
+                tokenGroup: schema.accountTokens.tokenGroup,
+              },
               downstream_api_keys: {
                 id: schema.downstreamApiKeys.id,
                 name: schema.downstreamApiKeys.name,
@@ -1025,6 +1291,14 @@ export async function statsRoutes(app: FastifyInstance) {
               eq(schema.proxyLogs.accountId, schema.accounts.id),
             )
             .leftJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+            .leftJoin(
+              schema.routeChannels,
+              eq(schema.proxyLogs.channelId, schema.routeChannels.id),
+            )
+            .leftJoin(
+              schema.accountTokens,
+              eq(schema.routeChannels.tokenId, schema.accountTokens.id),
+            )
             .leftJoin(
               schema.downstreamApiKeys,
               eq(
@@ -1045,6 +1319,11 @@ export async function statsRoutes(app: FastifyInstance) {
               id?: number | null;
               name?: string | null;
               url?: string | null;
+              rechargeRatio?: number | null;
+            } | null;
+            account_tokens: {
+              id?: number | null;
+              tokenGroup?: string | null;
             } | null;
             downstream_api_keys: {
               id?: number | null;
@@ -1059,7 +1338,11 @@ export async function statsRoutes(app: FastifyInstance) {
         return reply.code(404).send({ message: "proxy log not found" });
       }
 
-      return mapProxyLogRow(row, { includeBillingDetails: true });
+      const tokenGroupFallbacks = await loadProxyLogTokenGroupFallbacks([row]);
+      return mapProxyLogRow(row, {
+        includeBillingDetails: true,
+        tokenGroupFallbacks,
+      });
     },
   );
 
@@ -1162,7 +1445,6 @@ export async function statsRoutes(app: FastifyInstance) {
         .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
         .where(
           and(
-            eq(schema.tokenModelAvailability.available, true),
             eq(schema.accountTokens.enabled, true),
             eq(
               schema.accountTokens.valueStatus,
@@ -1336,7 +1618,7 @@ export async function statsRoutes(app: FastifyInstance) {
         const a = row.accounts;
         const s = row.sites;
         if (
-          !m.available ||
+          !isSuccessfulManualTokenModelTest(m) ||
           !t.enabled ||
           a.status !== "active" ||
           s.status !== "active"
@@ -1503,7 +1785,6 @@ export async function statsRoutes(app: FastifyInstance) {
         .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
         .where(
           and(
-            eq(schema.tokenModelAvailability.available, true),
             eq(schema.accountTokens.enabled, true),
             eq(
               schema.accountTokens.valueStatus,
@@ -1583,6 +1864,7 @@ export async function statsRoutes(app: FastifyInstance) {
       let hasAnyTokenGroupSignals = false;
 
       for (const row of rows) {
+        if (!isSuccessfulManualTokenModelTest(row.token_model_availability)) continue;
         const modelName = (row.token_model_availability.modelName || "").trim();
         if (!modelName) continue;
         const accountModelKey = `${row.accounts.id}::${modelName.toLowerCase()}`;

@@ -64,9 +64,11 @@ type SiteRow = {
   useSystemProxy?: boolean;
   customHeaders?: string | null;
   globalWeight?: number;
+  rechargeRatio?: number;
   isPinned?: boolean;
   sortOrder?: number;
   totalBalance?: number;
+  actualBalance?: number;
   subscriptionSummary?: SiteSubscriptionSummary | null;
   createdAt?: string;
   postRefreshProbeEnabled?: boolean;
@@ -191,11 +193,18 @@ function buildSubscriptionTooltip(summary?: SiteSubscriptionSummary | null): str
 
 function SiteBalanceDisplay(props: {
   balance?: number | null;
+  actualBalance?: number | null;
+  rechargeRatio?: number | null;
   summary?: SiteSubscriptionSummary | null;
   align?: 'start' | 'end';
+  onEditRatio?: () => void;
 }) {
-  const { balance, summary, align = 'start' } = props;
+  const { balance, actualBalance, rechargeRatio, summary, align = 'start', onEditRatio } = props;
   const walletBalanceText = formatUsd(balance);
+  const actualBalanceText = formatUsd(typeof actualBalance === 'number' ? actualBalance : balance);
+  const ratioText = Number.isFinite(Number(rechargeRatio)) && Number(rechargeRatio) > 0
+    ? `充值比例 ${Number(rechargeRatio).toFixed(4).replace(/\.?0+$/, '')}`
+    : '充值比例 1';
   const subscriptionValue = buildSubscriptionInlineValue(summary);
   const tooltip = buildSubscriptionTooltip(summary);
 
@@ -203,7 +212,32 @@ function SiteBalanceDisplay(props: {
     <div
       className={`site-balance-inline ${align === 'end' ? 'align-end' : ''}`.trim()}
     >
-      <span className="site-balance-primary">{walletBalanceText}</span>
+      <button
+        type="button"
+        className="site-balance-primary"
+        onClick={(event) => {
+          if (!onEditRatio) return;
+          event.stopPropagation();
+          onEditRatio();
+        }}
+        data-tooltip={`${ratioText} | 总余额 ${walletBalanceText} | 实际余额 ${actualBalanceText}`}
+        data-tooltip-align={align === 'end' ? 'end' : 'start'}
+        data-tooltip-side="top"
+        style={{
+          border: 0,
+          padding: 0,
+          background: 'transparent',
+          color: 'inherit',
+          cursor: onEditRatio ? 'pointer' : 'default',
+          font: 'inherit',
+          textDecoration: onEditRatio ? 'underline' : 'none',
+          textUnderlineOffset: 2,
+        }}
+      >
+        总 {walletBalanceText}
+      </button>
+      <span className="site-balance-divider">/</span>
+      <span className="site-balance-subscription">实 {actualBalanceText}</span>
       {subscriptionValue ? (
         <>
           <span className="site-balance-divider">/</span>
@@ -258,7 +292,7 @@ export default function Sites() {
   const navigate = useNavigate();
   const [sites, setSites] = useState<SiteRow[]>([]);
   const [loaded, setLoaded] = useState(false);
-  const [sortMode, setSortMode] = useState<SortMode>('custom');
+  const [sortMode, setSortMode] = useState<SortMode>('actual-balance-desc');
   const [highlightSiteId, setHighlightSiteId] = useState<number | null>(null);
   const [editor, setEditor] = useState<SiteEditorState | null>(null);
   const apiEndpointDraftIdRef = useRef(0);
@@ -328,6 +362,14 @@ export default function Sites() {
   const probeLogEndRef = useRef<HTMLDivElement | null>(null);
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [disabledModelSearch, setDisabledModelSearch] = useState('');
+  const [ratioEditor, setRatioEditor] = useState<{
+    siteId: number;
+    siteName: string;
+    totalBalance: number;
+    actualBalance: number;
+    value: string;
+  } | null>(null);
+  const [ratioSaving, setRatioSaving] = useState(false);
   const initializationPresetOptions = useMemo(() => listSiteInitializationPresets(), []);
   const selectedInitializationPreset = useMemo(
     () => getSiteInitializationPreset(selectedInitializationPresetId),
@@ -420,7 +462,12 @@ export default function Sites() {
   }, []);
 
   const sortedSites = useMemo(
-    () => sortItemsForDisplay(sites, sortMode, (site) => site.totalBalance || 0),
+    () => sortItemsForDisplay(sites, sortMode, (site) => {
+      if (sortMode === 'actual-balance-desc' || sortMode === 'actual-balance-asc') {
+        return typeof site.actualBalance === 'number' ? site.actualBalance : site.totalBalance || 0;
+      }
+      return site.totalBalance || 0;
+    }),
     [sites, sortMode],
   );
   const allVisibleSitesSelected = sortedSites.length > 0 && sortedSites.every((site) => selectedSiteIds.includes(site.id));
@@ -483,6 +530,47 @@ export default function Sites() {
     setEditor(null);
     setForm(createEmptySiteForm());
     setSelectedInitializationPresetId(null);
+  };
+
+  const openRatioEditor = (site: SiteRow) => {
+    setRatioEditor({
+      siteId: site.id,
+      siteName: site.name || `#${site.id}`,
+      totalBalance: Number(site.totalBalance || 0),
+      actualBalance: Number(typeof site.actualBalance === 'number' ? site.actualBalance : site.totalBalance || 0),
+      value: String(Number(site.rechargeRatio || 1)),
+    });
+  };
+
+  const saveRechargeRatio = async () => {
+    if (!ratioEditor) return;
+    const ratio = Number(ratioEditor.value);
+    if (!Number.isFinite(ratio) || ratio <= 0) {
+      toast.error('充值比例必须是大于 0 的数字');
+      return;
+    }
+
+    setRatioSaving(true);
+    try {
+      const updated = await api.updateSite(ratioEditor.siteId, {
+        rechargeRatio: Number(ratio.toFixed(6)),
+      });
+      setSites((current) => current.map((site) => (
+        site.id === ratioEditor.siteId
+          ? {
+            ...site,
+            ...updated,
+            rechargeRatio: Number(ratio.toFixed(6)),
+          }
+          : site
+      )));
+      toast.success('充值比例已保存');
+      setRatioEditor(null);
+    } catch (error: any) {
+      toast.error(error?.message || '保存充值比例失败');
+    } finally {
+      setRatioSaving(false);
+    }
   };
 
   const scrollToEditorTop = () => {
@@ -746,6 +834,11 @@ export default function Sites() {
       toast.error('全局权重必须是大于 0 的数字');
       return;
     }
+    const parsedRechargeRatio = Number(form.rechargeRatio);
+    if (!Number.isFinite(parsedRechargeRatio) || parsedRechargeRatio <= 0) {
+      toast.error('充值比例必须是大于 0 的数字');
+      return;
+    }
     const serializedCustomHeaders = serializeSiteCustomHeaders(form.customHeaders);
     if (!serializedCustomHeaders.valid) {
       toast.error(serializedCustomHeaders.error || '自定义请求头格式不正确');
@@ -768,6 +861,7 @@ export default function Sites() {
       apiEndpoints: serializedApiEndpoints.apiEndpoints,
       customHeaders: serializedCustomHeaders.customHeaders,
       globalWeight: Number(parsedGlobalWeight.toFixed(3)),
+      rechargeRatio: Number(parsedRechargeRatio.toFixed(6)),
       postRefreshProbeEnabled: probeEnabled,
       postRefreshProbeModel: probeModel.trim(),
       postRefreshProbeScope: probeScope,
@@ -1174,11 +1268,13 @@ export default function Sites() {
                 value={sortMode}
                 onChange={(nextValue) => setSortMode(nextValue as SortMode)}
                 options={[
-                  { value: 'custom', label: '自定义排序' },
+                  { value: 'actual-balance-desc', label: '实际余额高到低' },
+                  { value: 'actual-balance-asc', label: '实际余额低到高' },
                   { value: 'balance-desc', label: '余额高到低' },
                   { value: 'balance-asc', label: '余额低到高' },
+                  { value: 'custom', label: '自定义排序' },
                 ]}
-                placeholder="自定义排序"
+                placeholder="实际余额高到低"
               />
             </div>
           )}
@@ -1201,11 +1297,13 @@ export default function Sites() {
                 value={sortMode}
                 onChange={(nextValue) => setSortMode(nextValue as SortMode)}
                 options={[
-                  { value: 'custom', label: '自定义排序' },
+                  { value: 'actual-balance-desc', label: '实际余额高到低' },
+                  { value: 'actual-balance-asc', label: '实际余额低到高' },
                   { value: 'balance-desc', label: '余额高到低' },
                   { value: 'balance-asc', label: '余额低到高' },
+                  { value: 'custom', label: '自定义排序' },
                 ]}
-                placeholder="自定义排序"
+                placeholder="实际余额高到低"
               />
             </div>
             <button
@@ -1933,7 +2031,99 @@ export default function Sites() {
                 越大越容易被路由选中。建议 0.5-3，默认 1。
               </div>
             </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <input
+                placeholder="充值比例（默认 1，上游金额 ÷ 比例 = 实际金额）"
+                value={form.rechargeRatio}
+                onChange={(e) => setForm((prev) => ({ ...prev, rechargeRatio: e.target.value }))}
+                style={formInputStyle}
+              />
+              <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
+                例如比例 10：上游余额 100 会显示实际余额 10。
+              </div>
+            </div>
           </ResponsiveFormGrid>
+        </CenteredModal>
+      )}
+
+      {ratioEditor && (
+        <CenteredModal
+          open
+          onClose={() => {
+            if (!ratioSaving) setRatioEditor(null);
+          }}
+          title={(
+            <div style={{ fontSize: 14, fontWeight: 600 }}>
+              设置充值比例
+            </div>
+          )}
+          maxWidth={460}
+          bodyStyle={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 14,
+          }}
+          footer={(
+            <>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                disabled={ratioSaving}
+                onClick={() => setRatioEditor(null)}
+                style={{ border: '1px solid var(--color-border)' }}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary"
+                disabled={ratioSaving}
+                onClick={saveRechargeRatio}
+              >
+                {ratioSaving ? '保存中...' : '保存'}
+              </button>
+            </>
+          )}
+        >
+          <div style={{ fontSize: 13, color: 'var(--color-text-muted)' }}>
+            {ratioEditor.siteName}
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 12 }}>
+            <div className="metric-card" style={{ padding: 12 }}>
+              <div className="metric-label">总余额</div>
+              <div className="metric-value" style={{ fontSize: 20 }}>{formatUsd(ratioEditor.totalBalance)}</div>
+            </div>
+            <div className="metric-card" style={{ padding: 12 }}>
+              <div className="metric-label">当前实际余额</div>
+              <div className="metric-value" style={{ fontSize: 20 }}>{formatUsd(ratioEditor.actualBalance)}</div>
+            </div>
+          </div>
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--color-text-secondary)' }}>
+              充值比例
+            </span>
+            <input
+              value={ratioEditor.value}
+              onChange={(event) => setRatioEditor((current) => (
+                current ? { ...current, value: event.target.value } : current
+              ))}
+              placeholder="例如 10"
+              inputMode="decimal"
+              style={formInputStyle}
+              autoFocus
+            />
+          </label>
+          <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
+            计算方式：实际余额 = 总余额 ÷ 充值比例。当前输入预估为{' '}
+            <strong style={{ color: 'var(--color-text-primary)' }}>
+              {formatUsd(
+                Number.isFinite(Number(ratioEditor.value)) && Number(ratioEditor.value) > 0
+                  ? ratioEditor.totalBalance / Number(ratioEditor.value)
+                  : 0,
+              )}
+            </strong>
+            。
+          </div>
         </CenteredModal>
       )}
 
@@ -2028,8 +2218,11 @@ export default function Sites() {
                       value={(
                         <SiteBalanceDisplay
                           balance={site.totalBalance}
+                          actualBalance={site.actualBalance}
+                          rechargeRatio={site.rechargeRatio}
                           summary={site.subscriptionSummary}
                           align="end"
+                          onEditRatio={() => openRatioEditor(site)}
                         />
                       )}
                     />
@@ -2170,7 +2363,7 @@ export default function Sites() {
                   </th>
                   <th>名称</th>
                   <th>外部签到站URL</th>
-                  <th>总余额</th>
+                  <th>余额 / 实际余额</th>
                   <th>状态</th>
                   <th>系统代理</th>
                   <th>权重</th>
@@ -2244,7 +2437,10 @@ export default function Sites() {
                     <td className="site-balance-cell">
                       <SiteBalanceDisplay
                         balance={site.totalBalance}
+                        actualBalance={site.actualBalance}
+                        rechargeRatio={site.rechargeRatio}
                         summary={site.subscriptionSummary}
+                        onEditRatio={() => openRatioEditor(site)}
                       />
                     </td>
                     <td>

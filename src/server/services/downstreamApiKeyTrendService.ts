@@ -1,5 +1,6 @@
 import { and, asc, eq, sql, type SQL, type SQLWrapper } from 'drizzle-orm';
 import { db, runtimeDbDialect, schema } from '../db/index.js';
+import { proxyActualCostSqlExpression } from './statsShared.js';
 import {
   formatUtcSqlDateTime,
   getResolvedTimeZone,
@@ -243,9 +244,11 @@ async function readAllRangeTrendBuckets(
       createdAt: schema.proxyLogs.createdAt,
       status: schema.proxyLogs.status,
       totalTokens: schema.proxyLogs.totalTokens,
-      totalCost: schema.proxyLogs.estimatedCost,
+      totalCost: proxyActualCostSqlExpression(),
     })
       .from(schema.proxyLogs)
+      .leftJoin(schema.accounts, eq(schema.proxyLogs.accountId, schema.accounts.id))
+      .leftJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
       .where(and(...whereClauses))
       .orderBy(asc(schema.proxyLogs.createdAt), asc(schema.proxyLogs.id))
       .limit(ALL_RANGE_CHUNK_SIZE)
@@ -286,9 +289,11 @@ async function readWindowedTrendBuckets(
     successRequests: sql<number>`coalesce(sum(case when ${schema.proxyLogs.status} = 'success' then 1 else 0 end), 0)`,
     failedRequests: sql<number>`coalesce(sum(case when ${schema.proxyLogs.status} = 'success' then 0 else 1 end), 0)`,
     totalTokens: sql<number>`coalesce(sum(coalesce(${schema.proxyLogs.totalTokens}, 0)), 0)`,
-    totalCost: sql<number>`coalesce(sum(coalesce(${schema.proxyLogs.estimatedCost}, 0)), 0)`,
+    totalCost: sql<number>`coalesce(sum(${proxyActualCostSqlExpression()}), 0)`,
   })
     .from(schema.proxyLogs)
+    .leftJoin(schema.accounts, eq(schema.proxyLogs.accountId, schema.accounts.id))
+    .leftJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
     .where(and(...whereClauses))
     .groupBy(bucketTs)
     .orderBy(bucketTs)

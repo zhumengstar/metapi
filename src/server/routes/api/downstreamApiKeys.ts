@@ -10,6 +10,7 @@ import {
   toPersistenceJson,
 } from '../../services/downstreamApiKeyService.js';
 import { formatUtcSqlDateTime } from '../../services/localTimeService.js';
+import { proxyActualCostSqlExpression } from '../../services/statsShared.js';
 import type { DownstreamExcludedCredentialRef } from '../../services/downstreamPolicyTypes.js';
 import {
   readDownstreamApiKeyTrendBuckets,
@@ -305,9 +306,11 @@ export async function downstreamApiKeysRoutes(app: FastifyInstance) {
         successRequests: sql<number>`coalesce(sum(case when ${schema.proxyLogs.status} = 'success' then 1 else 0 end), 0)`,
         failedRequests: sql<number>`coalesce(sum(case when ${schema.proxyLogs.status} = 'success' then 0 else 1 end), 0)`,
         totalTokens: sql<number>`coalesce(sum(coalesce(${schema.proxyLogs.totalTokens}, 0)), 0)`,
-        totalCost: sql<number>`coalesce(sum(coalesce(${schema.proxyLogs.estimatedCost}, 0)), 0)`,
+        totalCost: sql<number>`coalesce(sum(${proxyActualCostSqlExpression()}), 0)`,
       })
         .from(schema.proxyLogs)
+        .leftJoin(schema.accounts, eq(schema.proxyLogs.accountId, schema.accounts.id))
+        .leftJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
         .where(and(
           inArray(schema.proxyLogs.downstreamApiKeyId, ids),
           ...(sinceUtc ? [sql`${schema.proxyLogs.createdAt} >= ${sinceUtc}`] : []),
@@ -393,9 +396,11 @@ export async function downstreamApiKeysRoutes(app: FastifyInstance) {
         successRequests: sql<number>`coalesce(sum(case when ${schema.proxyLogs.status} = 'success' then 1 else 0 end), 0)`,
         failedRequests: sql<number>`coalesce(sum(case when ${schema.proxyLogs.status} = 'success' then 0 else 1 end), 0)`,
         totalTokens: sql<number>`coalesce(sum(coalesce(${schema.proxyLogs.totalTokens}, 0)), 0)`,
-        totalCost: sql<number>`coalesce(sum(coalesce(${schema.proxyLogs.estimatedCost}, 0)), 0)`,
+        totalCost: sql<number>`coalesce(sum(${proxyActualCostSqlExpression()}), 0)`,
       })
         .from(schema.proxyLogs)
+        .leftJoin(schema.accounts, eq(schema.proxyLogs.accountId, schema.accounts.id))
+        .leftJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
         .where(and(
           eq(schema.proxyLogs.downstreamApiKeyId, id),
           ...(sinceUtc ? [sql`${schema.proxyLogs.createdAt} >= ${sinceUtc}`] : []),

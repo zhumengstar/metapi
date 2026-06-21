@@ -15,6 +15,7 @@ import {
   parseSiteDisabledModelsPayload,
   parseSiteUpdatePayload,
 } from '../../contracts/siteRoutePayloads.js';
+import { parseRechargeRatioInput, toActualAmount } from '../../services/siteBilling.js';
 import { getSiteInitializationPreset } from '../../../shared/siteInitializationPresets.js';
 import { normalizeSiteApiEndpointBaseUrl } from '../../services/siteApiEndpointService.js';
 import { analyzePrimarySiteUrl } from '../../../shared/sitePrimaryUrl.js';
@@ -252,7 +253,7 @@ async function loadSiteApiEndpointsBySiteIds(siteIds: number[]) {
   return bySiteId;
 }
 
-async function attachSiteApiEndpoints<T extends { id: number }>(siteRows: T[]) {
+async function attachSiteApiEndpoints<T extends typeof schema.sites.$inferSelect>(siteRows: T[]) {
   const bySiteId = await loadSiteApiEndpointsBySiteIds(siteRows.map((row) => row.id));
   return siteRows.map((row) => ({
     ...row,
@@ -453,6 +454,7 @@ export async function sitesRoutes(app: FastifyInstance) {
     return siteRowsWithApiEndpoints.map((site) => ({
       ...site,
       totalBalance: Math.round((totalBalanceBySiteId[site.id] || 0) * 1_000_000) / 1_000_000,
+      actualBalance: toActualAmount(totalBalanceBySiteId[site.id] || 0, site.rechargeRatio),
       subscriptionSummary: subscriptionBySiteId[site.id] || null,
     }));
   });
@@ -477,6 +479,7 @@ export async function sitesRoutes(app: FastifyInstance) {
       isPinned,
       sortOrder,
       globalWeight,
+      rechargeRatio,
       apiEndpoints,
     } = createBody;
     const normalizedStatus = normalizeSiteStatus(status);
@@ -506,6 +509,10 @@ export async function sitesRoutes(app: FastifyInstance) {
     const normalizedGlobalWeight = normalizeGlobalWeight(globalWeight);
     if (globalWeight !== undefined && normalizedGlobalWeight === null) {
       return reply.code(400).send({ error: 'Invalid globalWeight value. Expected a positive number.' });
+    }
+    const normalizedRechargeRatio = rechargeRatio === undefined ? 1 : parseRechargeRatioInput(rechargeRatio);
+    if (normalizedRechargeRatio === null) {
+      return reply.code(400).send({ error: 'Invalid rechargeRatio value. Expected a positive number.' });
     }
     const normalizedCustomHeaders = parseSiteCustomHeadersInput(customHeaders);
     if (!normalizedCustomHeaders.valid) {
@@ -565,6 +572,7 @@ export async function sitesRoutes(app: FastifyInstance) {
           isPinned: normalizedPinned ?? false,
           sortOrder: normalizedSortOrder ?? (maxSortOrder + 1),
           globalWeight: normalizedGlobalWeight ?? 1,
+          rechargeRatio: normalizedRechargeRatio,
         }).run();
         const siteId = getInsertedRowId(siteInsert);
         if (siteId && normalizedApiEndpoints.present && normalizedApiEndpoints.apiEndpoints.length > 0) {
@@ -647,6 +655,11 @@ export async function sitesRoutes(app: FastifyInstance) {
     if (body.globalWeight !== undefined && normalizedGlobalWeight === null) {
       return reply.code(400).send({ error: 'Invalid globalWeight value. Expected a positive number.' });
     }
+    const rechargeRatioInput = (body as Record<string, unknown>).rechargeRatio;
+    const normalizedRechargeRatio = rechargeRatioInput === undefined ? null : parseRechargeRatioInput(rechargeRatioInput);
+    if (rechargeRatioInput !== undefined && normalizedRechargeRatio === null) {
+      return reply.code(400).send({ error: 'Invalid rechargeRatio value. Expected a positive number.' });
+    }
     const normalizedCustomHeaders = parseSiteCustomHeadersInput(body.customHeaders);
     if (!normalizedCustomHeaders.valid) {
       return reply.code(400).send({ error: normalizedCustomHeaders.error || 'Invalid customHeaders.' });
@@ -688,6 +701,7 @@ export async function sitesRoutes(app: FastifyInstance) {
     if (body.isPinned !== undefined) updates.isPinned = normalizedPinned;
     if (body.sortOrder !== undefined) updates.sortOrder = normalizedSortOrder;
     if (body.globalWeight !== undefined) updates.globalWeight = normalizedGlobalWeight;
+    if (rechargeRatioInput !== undefined) updates.rechargeRatio = normalizedRechargeRatio;
     const anyBody = body as Record<string, unknown>;
     if (anyBody.postRefreshProbeEnabled !== undefined) updates.postRefreshProbeEnabled = anyBody.postRefreshProbeEnabled === true || anyBody.postRefreshProbeEnabled === 1;
     if (anyBody.postRefreshProbeModel !== undefined) updates.postRefreshProbeModel = String(anyBody.postRefreshProbeModel || '').trim();

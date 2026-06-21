@@ -383,6 +383,63 @@ function renderDownstreamKeySummary(log: ProxyLogRenderItem) {
   return parts.length > 0 ? parts.join("，") : null;
 }
 
+function formatProxyLogTokenGroupRatio(value: number | null | undefined) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return `${formatCompactNumber(value, 4)}x`;
+}
+
+function renderProxyLogSiteCell(
+  log: Pick<
+    ProxyLogRenderItem,
+    "siteName" | "tokenGroup" | "tokenGroupRatio"
+  >,
+  options: {
+    siteId?: number;
+    badgeStyle?: React.CSSProperties;
+    compact?: boolean;
+  } = {},
+) {
+  const tokenGroup = String(log.tokenGroup || "").trim();
+  const tokenGroupRatio = formatProxyLogTokenGroupRatio(log.tokenGroupRatio);
+  return (
+    <div
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 6,
+        flexWrap: options.compact ? "wrap" : "nowrap",
+        maxWidth: "100%",
+      }}
+    >
+      <SiteBadgeLink
+        siteId={options.siteId}
+        siteName={log.siteName}
+        badgeStyle={options.badgeStyle}
+      />
+      {tokenGroup ? (
+        <span
+          className="badge badge-muted"
+          style={{
+            fontSize: 10,
+            maxWidth: 148,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+          title={tokenGroup}
+        >
+          {tokenGroup}
+        </span>
+      ) : null}
+      {tokenGroupRatio ? (
+        <span className="badge badge-info" style={{ fontSize: 10 }}>
+          {tokenGroupRatio}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
 function buildBillingProcessLines(log: ProxyLogRenderItem) {
   const detail = log.billingDetails;
   if (!detail) return [];
@@ -2670,13 +2727,13 @@ export default function ProxyLogs() {
                   }
                 >
                   <div className="mobile-inline-meta-row">
-                    <SiteBadgeLink
-                      siteId={siteIdByName.get(
+                    {renderProxyLogSiteCell(detailLog, {
+                      siteId: siteIdByName.get(
                         String(log.siteName || "").trim(),
-                      )}
-                      siteName={log.siteName}
-                      badgeStyle={{ fontSize: 11 }}
-                    />
+                      ),
+                      badgeStyle: { fontSize: 11 },
+                      compact: true,
+                    })}
                     {clientDisplay.primary ? (
                       <span
                         className="badge badge-muted"
@@ -2768,13 +2825,13 @@ export default function ProxyLogs() {
                       <MobileField
                         label="站点"
                         value={
-                          <SiteBadgeLink
-                            siteId={siteIdByName.get(
+                          renderProxyLogSiteCell(detailLog, {
+                            siteId: siteIdByName.get(
                               String(log.siteName || "").trim(),
-                            )}
-                            siteName={log.siteName}
-                            badgeStyle={{ fontSize: 11 }}
-                          />
+                            ),
+                            badgeStyle: { fontSize: 11 },
+                            compact: true,
+                          })
                         }
                       />
                       {streamModeLabel ? (
@@ -3006,13 +3063,12 @@ export default function ProxyLogs() {
                           color: "var(--color-text-secondary)",
                         }}
                       >
-                        <SiteBadgeLink
-                          siteId={siteIdByName.get(
+                        {renderProxyLogSiteCell(detailLog, {
+                          siteId: siteIdByName.get(
                             String(log.siteName || "").trim(),
-                          )}
-                          siteName={log.siteName}
-                          badgeStyle={{ fontSize: 11 }}
-                        />
+                          ),
+                          badgeStyle: { fontSize: 11 },
+                        })}
                       </td>
                       <td
                         style={{

@@ -327,6 +327,25 @@ function newestTokenForGroup(tokens: TokenGroupPricingOverviewToken[], group: st
   return matched[0] ? [matched[0]] : [];
 }
 
+function normalizeGroupLookupKey(value: unknown): string {
+  return String(value || '').trim().replace(/\s+/g, '').toLowerCase();
+}
+
+function tokenMatchesGroup(token: TokenGroupPricingOverviewToken, group: string): boolean {
+  if (token.group === group || token.name === group) return true;
+  const groupLookup = normalizeGroupLookupKey(group);
+  if (!groupLookup) return false;
+  return normalizeGroupLookupKey(token.group) === groupLookup
+    || normalizeGroupLookupKey(token.name) === groupLookup;
+}
+
+function newestTokenForGroupLoose(tokens: TokenGroupPricingOverviewToken[], group: string): TokenGroupPricingOverviewToken[] {
+  const exact = newestTokenForGroup(tokens, group);
+  if (exact.length > 0) return exact;
+  const matched = tokens.filter((token) => tokenMatchesGroup(token, group)).sort(latestTokenFirst);
+  return matched[0] ? [matched[0]] : [];
+}
+
 function createGroupRowsFromAccount(item: TokenGroupPricingOverviewAccount): TokenGroupPricingOverviewGroupRow[] {
   return item.groups.map((group) => ({
     id: `${item.site.id}:${item.account.id}:${group}`,
@@ -339,7 +358,7 @@ function createGroupRowsFromAccount(item: TokenGroupPricingOverviewAccount): Tok
     pricingAvailable: item.pricing.groupRatio[group] !== null,
     modelCount: item.pricing.modelCount,
     modelNames: [],
-    tokens: newestTokenForGroup(item.tokens, group),
+    tokens: newestTokenForGroupLoose(item.tokens, group),
   }));
 }
 
@@ -409,7 +428,7 @@ function attachTokensToGroupRow(
   tokensByAccountId: Map<number, TokenGroupPricingOverviewToken[]>,
 ): TokenGroupPricingOverviewGroupRow {
   if (!row.account) return row;
-  const tokens = newestTokenForGroup(tokensByAccountId.get(row.account.id) || [], row.group);
+  const tokens = newestTokenForGroupLoose(tokensByAccountId.get(row.account.id) || [], row.group);
   return { ...row, tokens };
 }
 
@@ -779,18 +798,6 @@ async function syncAccountTokensFromLoginRows(rows: Array<{ accounts: AccountRow
         TOKEN_SYNC_TIMEOUT_MS,
         `token sync timeout (${Math.round(TOKEN_SYNC_TIMEOUT_MS / 1000)}s)`,
       );
-
-      if (tokens.length === 0) {
-        const fallback = await withTimeout(
-          () => withAccountProxyOverride(accountProxyUrl,
-            () => adapter.getApiToken(row.sites.url, accessToken, platformUserId)),
-          TOKEN_SYNC_TIMEOUT_MS,
-          `token sync timeout (${Math.round(TOKEN_SYNC_TIMEOUT_MS / 1000)}s)`,
-        );
-        if (fallback && supportsImplicitDefaultGroup(row.sites.platform)) {
-          tokens = [{ name: 'default', key: fallback, enabled: true, tokenGroup: 'default' }];
-        }
-      }
 
       if (tokens.length === 0) {
         summary.skipped += 1;

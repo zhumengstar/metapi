@@ -1,4 +1,4 @@
-export type SortMode = 'custom' | 'balance-desc' | 'balance-asc';
+export type SortMode = 'custom' | 'balance-desc' | 'balance-asc' | 'actual-balance-desc' | 'actual-balance-asc';
 
 type SortableBase = {
   id: number;
@@ -35,7 +35,7 @@ export function sortItemsForDisplay<T extends SortableBase>(
     const aBalance = Number.isFinite(getBalance(a)) ? getBalance(a) : 0;
     const bBalance = Number.isFinite(getBalance(b)) ? getBalance(b) : 0;
     if (aBalance !== bBalance) {
-      return mode === 'balance-desc' ? bBalance - aBalance : aBalance - bBalance;
+      return mode.endsWith('-desc') ? bBalance - aBalance : aBalance - bBalance;
     }
 
     return customComparator(a, b);

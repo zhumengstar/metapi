@@ -20,6 +20,7 @@ import {
 } from "./snapshotCacheService.js";
 import { estimateRewardWithTodayIncomeFallback } from "./todayIncomeRewardService.js";
 import { createAdminSnapshotPersistence } from "./adminSnapshotStore.js";
+import { normalizeRechargeRatio, toActualAmount } from "./siteBilling.js";
 
 export type AccountCapabilities = {
   canCheckin: boolean;
@@ -29,6 +30,9 @@ export type AccountCapabilities = {
 
 export type AccountOverviewRow = typeof schema.accounts.$inferSelect & {
   site: typeof schema.sites.$inferSelect;
+  rawBalance: number;
+  rawBalanceUsed: number;
+  rechargeRatio: number;
   credentialMode: AccountCredentialMode;
   capabilities: AccountCapabilities;
   loginCredential: {
@@ -205,6 +209,11 @@ async function loadAccountsSnapshotPayload(): Promise<AccountsSnapshotPayload> {
         : null;
       return {
         ...row.accounts,
+        rawBalance: Number(row.accounts.balance || 0),
+        rawBalanceUsed: Number(row.accounts.balanceUsed || 0),
+        balance: toActualAmount(row.accounts.balance || 0, row.sites.rechargeRatio),
+        balanceUsed: toActualAmount(row.accounts.balanceUsed || 0, row.sites.rechargeRatio),
+        rechargeRatio: normalizeRechargeRatio(row.sites.rechargeRatio),
         site: row.sites,
         credentialMode,
         capabilities,
@@ -214,8 +223,7 @@ async function loadAccountsSnapshotPayload(): Promise<AccountsSnapshotPayload> {
           available: !!(relogin?.username && loginPassword),
         },
         todaySpend:
-          Math.round((spendByAccount[row.accounts.id] || 0) * 1_000_000) /
-          1_000_000,
+          toActualAmount(spendByAccount[row.accounts.id] || 0, row.sites.rechargeRatio),
         todayReward:
           Math.round(
             estimateRewardWithTodayIncomeFallback({

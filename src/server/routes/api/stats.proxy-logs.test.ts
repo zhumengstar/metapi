@@ -30,6 +30,10 @@ describe("stats proxy logs routes", () => {
   beforeEach(async () => {
     await db.delete(schema.proxyLogs).run();
     await db.delete(schema.downstreamApiKeys).run();
+    await db.delete(schema.routeChannels).run();
+    await db.delete(schema.accountTokens).run();
+    await db.delete(schema.tokenGroupPricing).run();
+    await db.delete(schema.tokenRoutes).run();
     await db.delete(schema.accounts).run();
     await db.delete(schema.sites).run();
   });
@@ -198,6 +202,357 @@ describe("stats proxy logs routes", () => {
       failedCount: 2,
       totalCost: 0.6,
       totalTokensAll: 49,
+    });
+  });
+
+  it("returns the account token group and actual billing group ratio for proxy logs", async () => {
+    const site = await db
+      .insert(schema.sites)
+      .values({
+        name: "group-site",
+        url: "https://group-site.example.com",
+        platform: "new-api",
+      })
+      .returning()
+      .get();
+    const account = await db
+      .insert(schema.accounts)
+      .values({
+        siteId: site.id,
+        username: "group-user",
+        accessToken: "group-token",
+        status: "active",
+      })
+      .returning()
+      .get();
+    const token = await db
+      .insert(schema.accountTokens)
+      .values({
+        accountId: account.id,
+        name: "high-cache",
+        token: "sk-group-token",
+        tokenGroup: "高缓存",
+        valueStatus: "ready",
+        enabled: true,
+      })
+      .returning()
+      .get();
+    const route = await db
+      .insert(schema.tokenRoutes)
+      .values({
+        modelPattern: "gpt-5.5",
+        enabled: true,
+      })
+      .returning()
+      .get();
+    const channel = await db
+      .insert(schema.routeChannels)
+      .values({
+        routeId: route.id,
+        accountId: account.id,
+        tokenId: token.id,
+        enabled: true,
+      })
+      .returning()
+      .get();
+
+    await db
+      .insert(schema.proxyLogs)
+      .values({
+        routeId: route.id,
+        channelId: channel.id,
+        accountId: account.id,
+        modelRequested: "gpt-5.5",
+        modelActual: "gpt-5.5",
+        status: "success",
+        promptTokens: 100,
+        completionTokens: 20,
+        totalTokens: 120,
+        estimatedCost: 0.12,
+        createdAt: formatUtcSqlDateTime(new Date("2026-03-09T08:06:00.000Z")),
+        billingDetails: JSON.stringify({
+          pricing: { groupRatio: 0.9 },
+          usage: { promptTokens: 100, completionTokens: 20 },
+          breakdown: { totalCost: 0.12 },
+        }),
+      })
+      .run();
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/stats/proxy-logs?limit=20",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as {
+      items: Array<Record<string, unknown>>;
+    };
+    expect(body.items[0]).toMatchObject({
+      siteName: "group-site",
+      tokenGroup: "高缓存",
+      tokenGroupRatio: 0.9,
+    });
+    expect(body.items[0]).not.toHaveProperty("billingDetails");
+  });
+
+  it("calculates cache hit rate from cache tokens and billable prompt tokens", async () => {
+    const site = await db
+      .insert(schema.sites)
+      .values({
+        name: "cache-site",
+        url: "https://cache-site.example.com",
+        platform: "new-api",
+      })
+      .returning()
+      .get();
+    const account = await db
+      .insert(schema.accounts)
+      .values({
+        siteId: site.id,
+        username: "cache-user",
+        accessToken: "cache-token",
+        status: "active",
+      })
+      .returning()
+      .get();
+
+    await db
+      .insert(schema.proxyLogs)
+      .values({
+        accountId: account.id,
+        modelRequested: "gpt-5.5",
+        modelActual: "gpt-5.5",
+        status: "success",
+        promptTokens: 1500,
+        completionTokens: 20,
+        totalTokens: 1520,
+        estimatedCost: 0.12,
+        createdAt: formatUtcSqlDateTime(new Date("2026-03-09T08:05:00.000Z")),
+        billingDetails: JSON.stringify({
+          usage: {
+            promptTokens: 1500,
+            billablePromptTokens: 1000,
+            cacheReadTokens: 500,
+            completionTokens: 20,
+          },
+        }),
+      })
+      .run();
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/stats/proxy-logs?limit=20",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as {
+      items: Array<Record<string, unknown>>;
+    };
+    expect(body.items[0]).toMatchObject({
+      cacheReadTokens: 500,
+      cacheHitRate: 33.33,
+    });
+  });
+
+  it("prefers the selected account token group ratio over billing detail ratio for proxy logs", async () => {
+    const site = await db
+      .insert(schema.sites)
+      .values({
+        name: "pricing-site",
+        url: "https://pricing-site.example.com",
+        platform: "new-api",
+      })
+      .returning()
+      .get();
+    const account = await db
+      .insert(schema.accounts)
+      .values({
+        siteId: site.id,
+        username: "pricing-user",
+        accessToken: "pricing-token",
+        status: "active",
+      })
+      .returning()
+      .get();
+    const token = await db
+      .insert(schema.accountTokens)
+      .values({
+        accountId: account.id,
+        name: "生图专用分组",
+        token: "sk-pricing-token",
+        tokenGroup: "生图专用分组",
+        valueStatus: "ready",
+        enabled: true,
+      })
+      .returning()
+      .get();
+    await db.insert(schema.tokenGroupPricing).values({
+      siteId: site.id,
+      accountId: account.id,
+      sourceKey: `account:${account.id}`,
+      group: "生图专用分组",
+      groupName: "生图专用分组",
+      ratio: 0.9,
+      source: "upstream",
+      pricingAvailable: true,
+    }).run();
+    const route = await db
+      .insert(schema.tokenRoutes)
+      .values({
+        modelPattern: "gpt-5.5",
+        enabled: true,
+      })
+      .returning()
+      .get();
+    const channel = await db
+      .insert(schema.routeChannels)
+      .values({
+        routeId: route.id,
+        accountId: account.id,
+        tokenId: token.id,
+        enabled: true,
+      })
+      .returning()
+      .get();
+
+    await db
+      .insert(schema.proxyLogs)
+      .values({
+        routeId: route.id,
+        channelId: channel.id,
+        accountId: account.id,
+        modelRequested: "gpt-5.5",
+        modelActual: "gpt-5.5",
+        status: "success",
+        promptTokens: 100,
+        completionTokens: 20,
+        totalTokens: 120,
+        estimatedCost: 0.12,
+        createdAt: formatUtcSqlDateTime(new Date("2026-03-09T08:06:30.000Z")),
+        billingDetails: JSON.stringify({
+          pricing: { groupRatio: 1 },
+          usage: { promptTokens: 100, completionTokens: 20 },
+          breakdown: { totalCost: 0.12 },
+        }),
+      })
+      .run();
+
+    const listResponse = await app.inject({
+      method: "GET",
+      url: "/api/stats/proxy-logs?limit=20",
+    });
+
+    expect(listResponse.statusCode).toBe(200);
+    const listBody = listResponse.json() as {
+      items: Array<Record<string, unknown>>;
+    };
+    expect(listBody.items[0]).toMatchObject({
+      siteName: "pricing-site",
+      tokenGroup: "生图专用分组",
+      tokenGroupRatio: 0.9,
+    });
+
+    const detailResponse = await app.inject({
+      method: "GET",
+      url: `/api/stats/proxy-logs/${listBody.items[0]?.id}`,
+    });
+
+    expect(detailResponse.statusCode).toBe(200);
+    expect(detailResponse.json()).toMatchObject({
+      siteName: "pricing-site",
+      tokenGroup: "生图专用分组",
+      tokenGroupRatio: 0.9,
+    });
+  });
+
+  it("falls back to the unique account token group preference when route channels do not bind tokens", async () => {
+    const site = await db
+      .insert(schema.sites)
+      .values({
+        name: "fallback-site",
+        url: "https://fallback-site.example.com",
+        platform: "new-api",
+      })
+      .returning()
+      .get();
+    const account = await db
+      .insert(schema.accounts)
+      .values({
+        siteId: site.id,
+        username: "fallback-user",
+        accessToken: "fallback-token",
+        status: "active",
+      })
+      .returning()
+      .get();
+    await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: "pro-cache",
+      token: "sk-pro-cache",
+      tokenGroup: "PRO缓存",
+      valueStatus: "ready",
+      enabled: false,
+    }).run();
+    await db.insert(schema.accountTokenGroupPreferences).values({
+      accountId: account.id,
+      tokenGroup: "PRO缓存",
+      groupRatio: 0.9,
+      groupRatioKey: "0.9",
+      enabled: false,
+    }).run();
+    const route = await db
+      .insert(schema.tokenRoutes)
+      .values({
+        modelPattern: "gpt-5.5",
+        enabled: true,
+      })
+      .returning()
+      .get();
+    const channel = await db
+      .insert(schema.routeChannels)
+      .values({
+        routeId: route.id,
+        accountId: account.id,
+        enabled: true,
+      })
+      .returning()
+      .get();
+
+    await db
+      .insert(schema.proxyLogs)
+      .values({
+        routeId: route.id,
+        channelId: channel.id,
+        accountId: account.id,
+        modelRequested: "gpt-5.5",
+        modelActual: "gpt-5.5",
+        status: "success",
+        promptTokens: 100,
+        completionTokens: 20,
+        totalTokens: 120,
+        estimatedCost: 0.12,
+        createdAt: formatUtcSqlDateTime(new Date("2026-03-09T08:07:00.000Z")),
+        billingDetails: JSON.stringify({
+          pricing: { groupRatio: 0.9 },
+          usage: { promptTokens: 100, completionTokens: 20 },
+          breakdown: { totalCost: 0.12 },
+        }),
+      })
+      .run();
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/stats/proxy-logs?limit=20",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as {
+      items: Array<Record<string, unknown>>;
+    };
+    expect(body.items[0]).toMatchObject({
+      siteName: "fallback-site",
+      tokenGroup: "PRO缓存",
+      tokenGroupRatio: 0.9,
     });
   });
 

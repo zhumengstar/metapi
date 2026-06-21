@@ -8,6 +8,10 @@ import {
 } from '../db/index.js';
 import { and, eq, isNull } from 'drizzle-orm';
 import { mergeAccountCacheUsageStats } from './accountExtraConfig.js';
+import {
+  readBillingUsageToken,
+  resolveBillablePromptTokensForCacheStats,
+} from './billingUsageCacheStats.js';
 
 export type ProxyLogInsertInput = {
   routeId?: number | null;
@@ -206,55 +210,55 @@ function readNonNegativeInt(value: unknown): number {
   return 0;
 }
 
-function readBillingUsageToken(details: Record<string, unknown> | null, key: string): number {
-  const usage = details?.usage;
-  if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return 0;
-  return readNonNegativeInt((usage as Record<string, unknown>)[key]);
-}
-
 async function accumulateAccountCacheUsage(input: ProxyLogInsertInput): Promise<void> {
-  if (input.accountId == null) return;
-  const billingDetails = parseProxyLogBillingDetails(input.billingDetails);
-  const promptTokens = input.promptTokens != null
-    ? readNonNegativeInt(input.promptTokens)
-    : readBillingUsageToken(billingDetails, 'promptTokens');
-  const cacheReadTokens = readBillingUsageToken(billingDetails, 'cacheReadTokens');
-  if (promptTokens <= 0 && cacheReadTokens <= 0) return;
+  try {
+    if (input.accountId == null) return;
+    const billingDetails = parseProxyLogBillingDetails(input.billingDetails);
+    const cacheReadTokens = readBillingUsageToken(billingDetails, 'cacheReadTokens') ?? 0;
+    const promptTokens = resolveBillablePromptTokensForCacheStats({
+      billingDetails,
+      promptTokens: input.promptTokens == null ? null : readNonNegativeInt(input.promptTokens),
+      cacheReadTokens,
+    }) ?? 0;
+    if (promptTokens <= 0 && cacheReadTokens <= 0) return;
 
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const rows = await db
-      .select({
-        id: schema.accounts.id,
-        extraConfig: schema.accounts.extraConfig,
-      })
-      .from(schema.accounts)
-      .where(eq(schema.accounts.id, input.accountId))
-      .limit(1)
-      .all();
-    const account = rows[0];
-    if (!account) return;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const rows = await db
+        .select({
+          id: schema.accounts.id,
+          extraConfig: schema.accounts.extraConfig,
+        })
+        .from(schema.accounts)
+        .where(eq(schema.accounts.id, input.accountId))
+        .limit(1)
+        .all();
+      const account = rows[0];
+      if (!account) return;
 
-    const whereClause = account.extraConfig == null
-      ? and(eq(schema.accounts.id, account.id), isNull(schema.accounts.extraConfig))
-      : and(eq(schema.accounts.id, account.id), eq(schema.accounts.extraConfig, account.extraConfig));
-    const result = await db
-      .update(schema.accounts)
-      .set({
-        extraConfig: mergeAccountCacheUsageStats(account.extraConfig, {
-          promptTokens,
-          cacheReadTokens,
-        }),
-        updatedAt: new Date().toISOString(),
-      })
-      .where(whereClause)
-      .run();
-    const changed = typeof result === 'object'
-      && result !== null
-      && 'changes' in result
-      && typeof result.changes === 'number'
-      ? result.changes
-      : 1;
-    if (changed > 0) return;
+      const whereClause = account.extraConfig == null
+        ? and(eq(schema.accounts.id, account.id), isNull(schema.accounts.extraConfig))
+        : and(eq(schema.accounts.id, account.id), eq(schema.accounts.extraConfig, account.extraConfig));
+      const result = await db
+        .update(schema.accounts)
+        .set({
+          extraConfig: mergeAccountCacheUsageStats(account.extraConfig, {
+            promptTokens,
+            cacheReadTokens,
+          }),
+          updatedAt: new Date().toISOString(),
+        })
+        .where(whereClause)
+        .run();
+      const changed = typeof result === 'object'
+        && result !== null
+        && 'changes' in result
+        && typeof result.changes === 'number'
+        ? result.changes
+        : 1;
+      if (changed > 0) return;
+    }
+  } catch {
+    // Cache hit-rate accumulation is auxiliary; proxy log persistence should still succeed.
   }
 }
 
@@ -321,6 +325,51 @@ export function isMissingProxyLogStreamTimingColumnsError(error: unknown): boole
     );
 }
 
+async function withChannelTokenBillingDetails(
+  billingDetails: unknown,
+  channelId?: number | null,
+): Promise<unknown> {
+  if (!channelId) return billingDetails ?? null;
+  const base = billingDetails && typeof billingDetails === 'object' && !Array.isArray(billingDetails)
+    ? { ...(billingDetails as Record<string, unknown>) }
+    : {};
+  const existing = base.selectedToken;
+  if (existing && typeof existing === 'object' && !Array.isArray(existing)) {
+    const tokenGroup = String((existing as Record<string, unknown>).tokenGroup || '').trim();
+    if (tokenGroup) return base;
+  }
+  let row: {
+    tokenId?: number | null;
+    tokenName?: string | null;
+    tokenGroup?: string | null;
+  } | undefined;
+  try {
+    row = await db.select({
+      tokenId: schema.accountTokens.id,
+      tokenName: schema.accountTokens.name,
+      tokenGroup: schema.accountTokens.tokenGroup,
+    })
+      .from(schema.routeChannels)
+      .leftJoin(schema.accountTokens, eq(schema.routeChannels.tokenId, schema.accountTokens.id))
+      .where(eq(schema.routeChannels.id, channelId))
+      .get();
+  } catch {
+    return billingDetails ?? null;
+  }
+  const tokenGroup = String(row?.tokenGroup || '').trim();
+  const tokenName = String(row?.tokenName || '').trim();
+  const tokenId = Number(row?.tokenId);
+  if (!tokenGroup && !tokenName && !Number.isFinite(tokenId)) return billingDetails ?? null;
+  return {
+    ...base,
+    selectedToken: {
+      tokenId: Number.isFinite(tokenId) ? tokenId : null,
+      tokenName: tokenName || null,
+      tokenGroup: tokenGroup || null,
+    },
+  };
+}
+
 export async function insertProxyLog(input: ProxyLogInsertInput): Promise<void> {
   const baseValues = {
     routeId: input.routeId ?? null,
@@ -339,9 +388,13 @@ export async function insertProxyLog(input: ProxyLogInsertInput): Promise<void> 
     retryCount: input.retryCount ?? 0,
     createdAt: input.createdAt ?? null,
   };
-  const serializedBillingDetails = input.billingDetails == null
+  const enrichedBillingDetails = await withChannelTokenBillingDetails(
+    input.billingDetails ?? null,
+    input.channelId,
+  );
+  const serializedBillingDetails = enrichedBillingDetails == null
     ? null
-    : JSON.stringify(input.billingDetails);
+    : JSON.stringify(enrichedBillingDetails);
   const includeBillingDetails = serializedBillingDetails !== null
     && await hasProxyLogBillingDetailsColumn();
   const includeDownstreamApiKeyId = input.downstreamApiKeyId != null

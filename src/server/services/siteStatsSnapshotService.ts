@@ -42,14 +42,37 @@ async function loadSiteStatsSnapshotPayload(
     db
       .select({
         siteId: schema.siteDayUsage.siteId,
-        totalSpend: sql<number>`coalesce(sum(${schema.siteDayUsage.totalSiteSpend}), 0)`,
+        totalSpend: sql<number>`
+          coalesce(sum(
+            coalesce(${schema.siteDayUsage.totalSiteSpend}, 0)
+            / case
+              when coalesce(${schema.sites.rechargeRatio}, 1) > 0
+                then coalesce(${schema.sites.rechargeRatio}, 1)
+              else 1
+            end
+          ), 0)
+        `,
       })
       .from(schema.siteDayUsage)
+      .innerJoin(schema.sites, eq(schema.siteDayUsage.siteId, schema.sites.id))
       .groupBy(schema.siteDayUsage.siteId)
       .all(),
     db
-      .select()
+      .select({
+        siteId: schema.siteDayUsage.siteId,
+        localDay: schema.siteDayUsage.localDay,
+        totalCalls: schema.siteDayUsage.totalCalls,
+        totalSiteSpend: sql<number>`
+          coalesce(${schema.siteDayUsage.totalSiteSpend}, 0)
+          / case
+            when coalesce(${schema.sites.rechargeRatio}, 1) > 0
+              then coalesce(${schema.sites.rechargeRatio}, 1)
+            else 1
+          end
+        `,
+      })
       .from(schema.siteDayUsage)
+      .innerJoin(schema.sites, eq(schema.siteDayUsage.siteId, schema.sites.id))
       .where(sql`${schema.siteDayUsage.localDay} >= ${sinceDay}`)
       .all(),
     db
@@ -62,13 +85,22 @@ async function loadSiteStatsSnapshotPayload(
         siteId: schema.sites.id,
         siteName: schema.sites.name,
         platform: schema.sites.platform,
-        totalBalance: sql<number>`coalesce(sum(coalesce(${schema.accounts.balance}, 0)), 0)`,
+        totalBalance: sql<number>`
+          coalesce(sum(
+            coalesce(${schema.accounts.balance}, 0)
+            / case
+              when coalesce(${schema.sites.rechargeRatio}, 1) > 0
+                then coalesce(${schema.sites.rechargeRatio}, 1)
+              else 1
+            end
+          ), 0)
+        `,
         accountCount: sql<number>`count(*)`,
       })
       .from(schema.accounts)
       .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
       .where(eq(schema.sites.status, "active"))
-      .groupBy(schema.sites.id, schema.sites.name, schema.sites.platform)
+      .groupBy(schema.sites.id, schema.sites.name, schema.sites.platform, schema.sites.rechargeRatio)
       .all(),
   ]);
 

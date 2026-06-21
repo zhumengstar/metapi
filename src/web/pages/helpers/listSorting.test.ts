@@ -35,6 +35,16 @@ describe('sortItemsForDisplay', () => {
     const sorted = sortItemsForDisplay(base, 'balance-asc', (item) => item.balance || 0);
     expect(ids(sorted)).toEqual([2, 4, 1, 3]);
   });
+
+  it('sorts by actual balance desc using the provided metric', () => {
+    const rows = [
+      { id: 1, isPinned: false, sortOrder: 0, actualBalance: 5 },
+      { id: 2, isPinned: false, sortOrder: 1, actualBalance: 20 },
+      { id: 3, isPinned: true, sortOrder: 2, actualBalance: 1 },
+    ];
+    const sorted = sortItemsForDisplay(rows, 'actual-balance-desc', (item) => item.actualBalance || 0);
+    expect(ids(sorted)).toEqual([3, 2, 1]);
+  });
 });
 
 describe('buildCustomReorderUpdates', () => {

@@ -15,10 +15,10 @@ import {
 } from "./snapshotCacheService.js";
 import {
   buildSiteAvailabilitySummariesFromHourlyAggregates,
-  proxyCostSqlExpression,
   type SiteAvailabilitySiteRow,
   toRoundedMicroNumber,
 } from "./statsShared.js";
+import { toActualAmount } from "./siteBilling.js";
 import { estimateRewardWithTodayIncomeFallback } from "./todayIncomeRewardService.js";
 import { createAdminSnapshotPersistence } from "./adminSnapshotStore.js";
 import { runUsageAggregationProjectionPass } from "./usageAggregationService.js";
@@ -75,8 +75,8 @@ async function loadDashboardSummaryPayload(): Promise<DashboardSummaryPayload> {
     .where(eq(schema.sites.status, "active"))
     .all();
   const accounts = accountRows.map((row) => row.accounts);
-  const totalBalance = accounts.reduce(
-    (sum, account) => sum + (account.balance || 0),
+  const totalBalance = accountRows.reduce(
+    (sum, row) => sum + toActualAmount(row.accounts.balance || 0, row.sites.rechargeRatio),
     0,
   );
   const activeCount = accounts.filter(
@@ -117,7 +117,16 @@ async function loadDashboardSummaryPayload(): Promise<DashboardSummaryPayload> {
       .all(),
     db
       .select({
-        totalUsed: sql<number>`coalesce(sum(coalesce(${schema.siteDayUsage.totalSiteSpend}, 0)), 0)`,
+        totalUsed: sql<number>`
+          coalesce(sum(
+            coalesce(${schema.siteDayUsage.totalSiteSpend}, 0)
+            / case
+              when coalesce(${schema.sites.rechargeRatio}, 1) > 0
+                then coalesce(${schema.sites.rechargeRatio}, 1)
+              else 1
+            end
+          ), 0)
+        `,
       })
       .from(schema.siteDayUsage)
       .innerJoin(schema.sites, eq(schema.siteDayUsage.siteId, schema.sites.id))
@@ -163,7 +172,16 @@ async function loadDashboardSummaryPayload(): Promise<DashboardSummaryPayload> {
       .get(),
     db
       .select({
-        todaySpend: sql<number>`coalesce(sum(coalesce(${schema.siteDayUsage.totalSiteSpend}, 0)), 0)`,
+        todaySpend: sql<number>`
+          coalesce(sum(
+            coalesce(${schema.siteDayUsage.totalSiteSpend}, 0)
+            / case
+              when coalesce(${schema.sites.rechargeRatio}, 1) > 0
+                then coalesce(${schema.sites.rechargeRatio}, 1)
+              else 1
+            end
+          ), 0)
+        `,
       })
       .from(schema.siteDayUsage)
       .innerJoin(schema.sites, eq(schema.siteDayUsage.siteId, schema.sites.id))
@@ -266,6 +284,7 @@ async function loadDashboardInsightsPayload(): Promise<DashboardInsightsPayload>
           platform: schema.sites.platform,
           sortOrder: schema.sites.sortOrder,
           isPinned: schema.sites.isPinned,
+          rechargeRatio: schema.sites.rechargeRatio,
         })
         .from(schema.sites)
         .where(eq(schema.sites.status, "active"))
@@ -294,6 +313,9 @@ async function loadDashboardInsightsPayload(): Promise<DashboardInsightsPayload>
     },
   );
   const activeSiteIdSet = new Set(sortedSites.map((site) => site.id));
+  const rechargeRatioBySiteId = new Map(
+    activeSites.map((site) => [site.id, site.rechargeRatio]),
+  );
 
   return {
     siteAvailability: buildSiteAvailabilitySummariesFromHourlyAggregates(
@@ -320,7 +342,7 @@ async function loadDashboardInsightsPayload(): Promise<DashboardInsightsPayload>
           totalCalls: row.totalCalls,
           successCalls: row.successCalls,
           totalTokens: row.totalTokens,
-          totalSpend: row.totalSpend,
+          totalSpend: toActualAmount(row.totalSpend, rechargeRatioBySiteId.get(row.siteId)),
           totalLatencyMs: row.totalLatencyMs,
         })),
       { days: 7 },
