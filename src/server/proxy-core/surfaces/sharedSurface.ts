@@ -22,11 +22,22 @@ import { selectProxyChannelForAttempt } from '../channelSelection.js';
 
 type SelectedChannel = Awaited<ReturnType<typeof tokenRouter.selectChannel>>;
 type SurfaceWarningScope = 'chat' | 'responses';
+type SurfaceRawReply = {
+  destroyed?: boolean;
+  writableEnded?: boolean;
+  headersSent?: boolean;
+  setHeader?: (name: string, value: string) => void;
+  write: (chunk: string) => unknown;
+  end: () => unknown;
+  on?: (event: 'close' | 'error', listener: (...args: unknown[]) => void) => unknown;
+};
 
 type SurfaceSelectedChannel = {
   channel: { routeId: number | null; id: number };
   account: { id: number; username?: string | null };
   site: { name?: string | null };
+  token?: { id?: number | null; name?: string | null; tokenGroup?: string | null } | null;
+  tokenName?: string | null;
   actualModel?: string | null;
 };
 
@@ -40,6 +51,60 @@ type SurfaceFailureResponse = {
     };
   };
 };
+
+export function createDetachedSseSink(input: {
+  raw: SurfaceRawReply;
+  ensureHeaders?: () => void;
+}) {
+  let downstreamClosed = Boolean(input.raw.writableEnded);
+  const markClosed = () => {
+    downstreamClosed = true;
+  };
+  input.raw.on?.('error', markClosed);
+
+  const canWrite = () => !downstreamClosed && !input.raw.writableEnded;
+  let headersEnsured = false;
+  const ensureHeaders = () => {
+    if (headersEnsured) return true;
+    if (!canWrite()) return false;
+    try {
+      input.ensureHeaders?.();
+      headersEnsured = true;
+      return true;
+    } catch {
+      markClosed();
+      return false;
+    }
+  };
+  const writeRaw = (chunk: string) => {
+    if (!ensureHeaders()) return;
+    try {
+      input.raw.write(chunk);
+    } catch {
+      markClosed();
+    }
+  };
+
+  return {
+    writeLines(lines: string[]) {
+      for (const line of lines) {
+        writeRaw(line);
+      }
+    },
+    writeRaw,
+    end() {
+      if (!canWrite()) return;
+      try {
+        input.raw.end();
+      } catch {
+        markClosed();
+      }
+    },
+    isDownstreamClosed() {
+      return downstreamClosed;
+    },
+  };
+}
 
 type SurfaceFailureOutcome =
   | { action: 'retry' }
@@ -181,11 +246,37 @@ export function buildSurfaceChannelBusyMessage(waitMs: number): string {
     : 'Channel busy: no session slot available';
 }
 
+function withSelectedTokenBillingDetails(
+  billingDetails: unknown,
+  selected: {
+    token?: { id?: number | null; name?: string | null; tokenGroup?: string | null } | null;
+    tokenName?: string | null;
+  },
+): unknown {
+  const tokenGroup = String(selected.token?.tokenGroup || '').trim();
+  const tokenName = String(selected.token?.name || selected.tokenName || '').trim();
+  const tokenId = Number(selected.token?.id);
+  if (!tokenGroup && !tokenName && !Number.isFinite(tokenId)) return billingDetails ?? null;
+  const base = billingDetails && typeof billingDetails === 'object' && !Array.isArray(billingDetails)
+    ? { ...(billingDetails as Record<string, unknown>) }
+    : {};
+  return {
+    ...base,
+    selectedToken: {
+      tokenId: Number.isFinite(tokenId) ? tokenId : null,
+      tokenName: tokenName || null,
+      tokenGroup: tokenGroup || null,
+    },
+  };
+}
+
 export async function writeSurfaceProxyLog(input: {
   warningScope: string;
   selected: {
     channel: { routeId: number | null; id: number | null };
     account: { id: number | null };
+    token?: { id?: number | null; name?: string | null; tokenGroup?: string | null } | null;
+    tokenName?: string | null;
     actualModel?: string | null;
   };
   modelRequested: string;
@@ -236,7 +327,7 @@ export async function writeSurfaceProxyLog(input: {
       completionTokens: input.completionTokens ?? null,
       totalTokens: input.totalTokens ?? null,
       estimatedCost: input.estimatedCost ?? 0,
-      billingDetails: input.billingDetails ?? null,
+      billingDetails: withSelectedTokenBillingDetails(input.billingDetails ?? null, input.selected),
       clientFamily: input.clientContext?.clientKind || null,
       clientAppId: input.clientContext?.clientAppId || null,
       clientAppName: input.clientContext?.clientAppName || null,
@@ -420,6 +511,8 @@ export async function recordSurfaceSuccess(input: {
     input.latencyMs,
     estimatedCost,
     input.modelName,
+    undefined,
+    resolvedUsage.usageSource === 'unknown' ? 0 : resolvedUsage.promptTokens,
   );
   input.recordDownstreamCost?.(estimatedCost);
   const logTokens = resolvedUsage.usageSource === 'unknown'

@@ -608,8 +608,55 @@ describe('responses proxy codex oauth refresh', () => {
     const [, options] = fetchMock.mock.calls[0] as [string, any];
     const forwardedBody = JSON.parse(options.body);
     expect(String(options.headers.Session_id || options.headers.session_id || '')).toMatch(/^[0-9a-f-]{36}$/i);
-    expect(options.headers.Conversation_id || options.headers.conversation_id).toBeUndefined();
+    expect(options.headers.Conversation_id || options.headers.conversation_id).toBe(options.headers.Session_id || options.headers.session_id);
     expect(forwardedBody.prompt_cache_key).toBe('codex-cache-123');
+  });
+
+  it('reuses codex session headers for the same explicit responses prompt_cache_key', async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'resp_codex_cache_1',
+        object: 'response',
+        model: 'gpt-5.2-codex',
+        status: 'completed',
+        output_text: 'ok cache 1',
+        usage: { input_tokens: 4, output_tokens: 2, total_tokens: 6 },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'resp_codex_cache_2',
+        object: 'response',
+        model: 'gpt-5.2-codex',
+        status: 'completed',
+        output_text: 'ok cache 2',
+        usage: { input_tokens: 4, output_tokens: 2, total_tokens: 6 },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+
+    for (const text of ['hello codex 1', 'hello codex 2']) {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        payload: {
+          model: 'gpt-5.2-codex',
+          prompt_cache_key: 'codex-cache-123',
+          input: text,
+        },
+      });
+      expect(response.statusCode).toBe(200);
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [, firstOptions] = fetchMock.mock.calls[0] as [string, any];
+    const [, secondOptions] = fetchMock.mock.calls[1] as [string, any];
+    expect(firstOptions.headers.Session_id).toBe(secondOptions.headers.Session_id);
+    expect(firstOptions.headers.Conversation_id).toBe(secondOptions.headers.Conversation_id);
+    expect(JSON.parse(firstOptions.body).prompt_cache_key).toBe('codex-cache-123');
+    expect(JSON.parse(secondOptions.body).prompt_cache_key).toBe('codex-cache-123');
   });
 
   it('infers previous_response_id for codex tool-output follow-up turns on the same downstream session', async () => {

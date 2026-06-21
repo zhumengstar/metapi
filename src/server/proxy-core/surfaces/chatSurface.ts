@@ -60,6 +60,7 @@ import {
   buildSurfaceChannelBusyMessage,
   buildSurfaceStickySessionKey,
   clearSurfaceStickyChannel,
+  createDetachedSseSink,
   createSurfaceFailureToolkit,
   createSurfaceDispatchRequest,
   getSurfaceStickyPreferredChannelId,
@@ -611,17 +612,13 @@ export async function handleChatSurfaceRequest(
           });
         };
 
-        const writeLines = (lines: string[]) => {
-          startSseResponse();
-          for (const line of lines) {
-            reply.raw.write(line);
-          }
-        };
+        const sseSink = createDetachedSseSink({
+          raw: reply.raw,
+          ensureHeaders: startSseResponse,
+        });
         const streamResponse = {
           end() {
-            if (streamStarted) {
-              reply.raw.end();
-            }
+            sseSink.end();
           },
         };
         const streamSession = openAiChatTransformer.proxyStream.createSession({
@@ -634,11 +631,8 @@ export async function handleChatSurfaceRequest(
               parsedUsage = mergeProxyUsage(parsedUsage, parseProxyUsage(payload));
             }
           },
-          writeLines,
-          writeRaw: (chunk) => {
-            startSseResponse();
-            reply.raw.write(chunk);
-          },
+          writeLines: sseSink.writeLines,
+          writeRaw: sseSink.writeRaw,
         });
         let rawText = '';
         if (!upstreamContentType.includes('text/event-stream')) {
@@ -1410,7 +1404,7 @@ export async function handleClaudeCountTokensSurfaceRequest(
         latency,
       } = countTokensResult;
 
-      tokenRouter.recordSuccess(selected.channel.id, latency, 0, modelName);
+      tokenRouter.recordSuccess(selected.channel.id, latency, 0, modelName, undefined, 0);
       recordDownstreamCostUsage(request, 0);
       await failureToolkit.log({
         selected,

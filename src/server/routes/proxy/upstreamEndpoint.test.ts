@@ -943,7 +943,7 @@ describe('buildUpstreamEndpointRequest', () => {
     expect(request.headers.Accept).toBe('application/json');
     expect(request.headers.Connection).toBe('Keep-Alive');
     expect(request.body.instructions).toBe(CODEX_DEFAULT_INSTRUCTIONS);
-    expect(request.body.prompt_cache_key).toBeUndefined();
+    expect(request.body.prompt_cache_key).toMatch(/^metapi-codex-/);
     expect(request.body.stream).toBe(false);
     expect(request.body.store).toBe(false);
     expect(request.body.parallel_tool_calls).toBeUndefined();
@@ -1080,7 +1080,7 @@ describe('buildUpstreamEndpointRequest', () => {
 
     expect(request.headers.Session_id).toMatch(/^[0-9a-f-]{36}$/i);
     expect(request.headers.Conversation_id).toBe(request.headers.Session_id);
-    expect(request.body.prompt_cache_key).toBeUndefined();
+    expect(request.body.prompt_cache_key).toMatch(/^metapi-codex-/);
     expect(request.body.instructions).toBe(CODEX_DEFAULT_INSTRUCTIONS);
     expect(request.body.stream).toBe(false);
     expect(request.body.store).toBe(false);

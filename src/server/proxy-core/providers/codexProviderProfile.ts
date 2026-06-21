@@ -1,6 +1,6 @@
 import type { PreparedProviderRequest, PrepareProviderRequestInput, ProviderProfile } from './types.js';
 import { config } from '../../config.js';
-import { buildCodexRuntimeHeaders, getInputHeader } from './headerUtils.js';
+import { buildCodexRuntimeHeaders, getInputHeader, uuidFromSeed } from './headerUtils.js';
 
 function asTrimmedString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
@@ -32,10 +32,16 @@ export const codexProviderProfile: ProviderProfile = {
         || (websocketTransport ? asTrimmedString(config.codexResponsesWebsocketBeta) : null),
     });
 
+    const continuityKey = asTrimmedString(input.codexSessionCacheKey) || null;
+    const body = { ...input.body };
+    if (!asTrimmedString(body.prompt_cache_key) && continuityKey) {
+      body.prompt_cache_key = `metapi-codex-${uuidFromSeed(`metapi:codex:prompt-cache:${continuityKey}`)}`;
+    }
+
     return {
       path: '/responses',
       headers,
-      body: input.body,
+      body,
       runtime: {
         executor: 'codex',
         modelName: input.modelName,

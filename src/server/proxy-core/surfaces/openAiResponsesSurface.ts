@@ -77,6 +77,7 @@ import {
   buildSurfaceChannelBusyMessage,
   buildSurfaceStickySessionKey,
   clearSurfaceStickyChannel,
+  createDetachedSseSink,
   createSurfaceFailureToolkit,
   createSurfaceDispatchRequest,
   getSurfaceStickyPreferredChannelId,
@@ -105,6 +106,22 @@ import {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object';
+}
+
+function asTrimmedString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function deriveResponsesCodexSessionCacheKey(input: {
+  body: Record<string, unknown>;
+  requestedModel: string;
+  proxyToken: string | null;
+}): string | null {
+  const promptCacheKey = asTrimmedString(input.body.prompt_cache_key);
+  if (promptCacheKey) return `${input.requestedModel}:responses:${promptCacheKey}`;
+  const proxyToken = asTrimmedString(input.proxyToken);
+  if (proxyToken) return `${input.requestedModel}:proxy:${proxyToken}`;
+  return null;
 }
 
 function getCodexSessionHeaderValue(headers: Record<string, string>): string {
@@ -401,6 +418,13 @@ export async function handleOpenAiResponsesSurfaceRequest(
       const modelName = selected.actualModel || requestedModel;
       const oauth = getOauthInfoFromAccount(selected.account);
       const isCodexSite = String(selected.site.platform || '').trim().toLowerCase() === 'codex';
+      const codexSessionCacheKey = isCodexSite
+        ? deriveResponsesCodexSessionCacheKey({
+          body: requestEnvelope.parsed.normalizedBody,
+          requestedModel,
+          proxyToken: getProxyAuthContext(request)?.token || null,
+        })
+        : null;
       const codexSessionId = isCodexSite
         ? getCodexSessionHeaderValue(request.headers as Record<string, string>)
         : '';
@@ -564,6 +588,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
             downstreamHeaders: request.headers as Record<string, unknown>,
             providerHeaders: buildProviderHeaders(),
             codexExplicitSessionId: codexSessionId || null,
+            codexSessionCacheKey,
           });
           const upstreamPath = (
             isCompactRequest && endpoint === 'responses'
@@ -922,9 +947,10 @@ export async function handleOpenAiResponsesSurfaceRequest(
             promptTokensIncludeCache: null,
           };
           let upstreamUsagePresent = false;
-          const writeLines = (lines: string[]) => {
-            for (const line of lines) reply.raw.write(line);
-          };
+          const sseSink = createDetachedSseSink({
+            raw: reply.raw,
+            ensureHeaders: startSseResponse,
+          });
           const websocketTransportRequest = isResponsesWebsocketTransportRequest(request.headers as Record<string, unknown>);
           const streamSession = openAiResponsesTransformer.proxyStream.createSession({
             modelName,
@@ -939,10 +965,8 @@ export async function handleOpenAiResponsesSurfaceRequest(
                 }
               }
             },
-            writeLines,
-            writeRaw: (chunk) => {
-              reply.raw.write(chunk);
-            },
+            writeLines: sseSink.writeLines,
+            writeRaw: sseSink.writeRaw,
           });
           if (!upstreamContentType.includes('text/event-stream')) {
             const rawText = await readRuntimeResponseText(upstream);
@@ -950,7 +974,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
               startSseResponse();
               const streamResult = await streamSession.run(
                 createSingleChunkStreamReader(rawText),
-                reply.raw,
+                sseSink,
               );
               const latency = Date.now() - startTime;
 	              if (streamResult.status === 'failed') {
@@ -1103,7 +1127,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                 const terminalEventType = String(collectedPayload.status || '').trim().toLowerCase() === 'incomplete'
                   ? 'response.incomplete'
                   : 'response.completed';
-                writeLines([
+                sseSink.writeLines([
                   `event: response.created\ndata: ${JSON.stringify({ type: 'response.created', response: createdPayload })}\n\n`,
                   `event: ${terminalEventType}\ndata: ${JSON.stringify({ type: terminalEventType, response: collectedPayload })}\n\n`,
                   'data: [DONE]\n\n',
@@ -1111,7 +1135,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                 if (codexSessionStoreKey) {
                   rememberCodexSessionResponseId(codexSessionStoreKey, collectedPayload);
                 }
-                reply.raw.end();
+                sseSink.end();
                 const latency = Date.now() - startTime;
                 await finalizeStreamSuccess(
                   parsedUsage,
@@ -1130,7 +1154,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
 
               const streamResult = await streamSession.run(
                 createSingleChunkStreamReader(rawText),
-                reply.raw,
+                sseSink,
               );
               const latency = Date.now() - startTime;
               if (streamResult.status === 'failed') {
@@ -1191,7 +1215,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
               },
             }
             : baseReader;
-          const streamResult = await streamSession.run(reader, reply.raw);
+          const streamResult = await streamSession.run(reader, sseSink);
           rawText += decoder.decode();
 
           const latency = Date.now() - startTime;

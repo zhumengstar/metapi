@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance } from 'fastify';
+import sharp from 'sharp';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const fetchMock = vi.fn();
@@ -210,6 +211,300 @@ describe('/v1/images/edits route', () => {
     });
     expect(selectNextChannelMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps image generation size unchanged when channel image upscale is disabled', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      created: 1,
+      data: [{ b64_json: 'ZmFrZQ==' }],
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/images/generations',
+      headers: {
+        authorization: 'Bearer sk-demo',
+      },
+      payload: {
+        model: 'gpt-image-1',
+        prompt: 'draw a poster',
+        size: '2048x2048',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const [, requestInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(requestInit.body));
+    expect(body).toMatchObject({
+      model: 'upstream-gpt-image',
+      size: '2048x2048',
+    });
+    expect(body.response_format).toBeUndefined();
+  });
+
+  it('deduplicates concurrent image generation requests even when image upscale is disabled', async () => {
+    let resolveFetch!: (response: Response) => void;
+    fetchMock.mockReturnValueOnce(new Promise<Response>((resolve) => {
+      resolveFetch = resolve;
+    }));
+
+    const payload = {
+      model: 'gpt-image-1',
+      prompt: 'draw a normal concurrent poster 2026-06-21',
+      size: '1024x1024',
+    };
+    const firstRequest = app.inject({
+      method: 'POST',
+      url: '/v1/images/generations',
+      headers: {
+        authorization: 'Bearer sk-demo',
+      },
+      payload,
+    });
+    const secondRequest = app.inject({
+      method: 'POST',
+      url: '/v1/images/generations',
+      headers: {
+        authorization: 'Bearer sk-demo',
+      },
+      payload,
+    });
+    await vi.waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+    resolveFetch(new Response(JSON.stringify({
+      created: 1,
+      data: [{ b64_json: 'bm9ybWFs' }],
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const [firstResponse, secondResponse] = await Promise.all([firstRequest, secondRequest]);
+
+    expect(firstResponse.statusCode).toBe(200);
+    expect(secondResponse.statusCode).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(secondResponse.json()).toEqual(firstResponse.json());
+  });
+
+  it('requests a native image size and upscales b64 output when image upscale is enabled', async () => {
+    const onePixelPng = await sharp({
+      create: {
+        width: 1,
+        height: 1,
+        channels: 4,
+        background: { r: 255, g: 255, b: 255, alpha: 1 },
+      },
+    }).png().toBuffer();
+    selectChannelMock.mockReturnValueOnce({
+      channel: { id: 11, routeId: 22, imageUpscaleEnabled: true },
+      site: { id: 44, name: 'demo-site', url: 'https://upstream.example.com', platform: 'openai' },
+      account: { id: 33, username: 'demo-user' },
+      tokenName: 'default',
+      tokenValue: 'sk-demo',
+      actualModel: 'upstream-gpt-image',
+    });
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      created: 1,
+      data: [{ b64_json: onePixelPng.toString('base64') }],
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/images/generations',
+      headers: {
+        authorization: 'Bearer sk-demo',
+      },
+      payload: {
+        model: 'gpt-image-1',
+        prompt: 'draw a poster',
+        size: '2048x2048',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const [, requestInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(requestInit.body));
+    expect(body).toMatchObject({
+      model: 'upstream-gpt-image',
+      size: '1024x1024',
+      response_format: 'b64_json',
+    });
+    const responseBody = response.json();
+    const output = Buffer.from(responseBody.data[0].b64_json, 'base64');
+    await expect(sharp(output).metadata()).resolves.toMatchObject({
+      width: 2048,
+      height: 2048,
+    });
+  });
+
+  it('upscales image output without adding a padded canvas when aspect ratios differ', async () => {
+    const widePng = await sharp({
+      create: {
+        width: 2,
+        height: 1,
+        channels: 4,
+        background: { r: 255, g: 255, b: 255, alpha: 1 },
+      },
+    }).png().toBuffer();
+    selectChannelMock.mockReturnValueOnce({
+      channel: { id: 11, routeId: 22, imageUpscaleEnabled: true },
+      site: { id: 44, name: 'demo-site', url: 'https://upstream.example.com', platform: 'openai' },
+      account: { id: 33, username: 'demo-user' },
+      tokenName: 'default',
+      tokenValue: 'sk-demo',
+      actualModel: 'upstream-gpt-image',
+    });
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      created: 1,
+      data: [{ b64_json: widePng.toString('base64') }],
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/images/generations',
+      headers: {
+        authorization: 'Bearer sk-demo',
+      },
+      payload: {
+        model: 'gpt-image-1',
+        prompt: 'draw a wide poster',
+        size: '2048x2048',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const responseBody = response.json();
+    const output = Buffer.from(responseBody.data[0].b64_json, 'base64');
+    await expect(sharp(output).metadata()).resolves.toMatchObject({
+      width: 2048,
+      height: 1024,
+    });
+  });
+
+  it('returns a cached upscaled image for repeated image generation requests', async () => {
+    const onePixelPng = await sharp({
+      create: {
+        width: 1,
+        height: 1,
+        channels: 4,
+        background: { r: 32, g: 64, b: 96, alpha: 1 },
+      },
+    }).png().toBuffer();
+    selectChannelMock.mockReturnValue({
+      channel: { id: 11, routeId: 22, imageUpscaleEnabled: true },
+      site: { id: 44, name: 'demo-site', url: 'https://upstream.example.com', platform: 'openai' },
+      account: { id: 33, username: 'demo-user' },
+      tokenName: 'default',
+      tokenValue: 'sk-demo',
+      actualModel: 'upstream-gpt-image',
+    });
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      created: 1,
+      data: [{ b64_json: onePixelPng.toString('base64') }],
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const payload = {
+      model: 'gpt-image-1',
+      prompt: 'draw a cached poster 2026-06-21',
+      size: '2048x2048',
+    };
+    const firstResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/images/generations',
+      headers: {
+        authorization: 'Bearer sk-demo',
+      },
+      payload,
+    });
+    const secondResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/images/generations',
+      headers: {
+        authorization: 'Bearer sk-demo',
+      },
+      payload,
+    });
+
+    expect(firstResponse.statusCode).toBe(200);
+    expect(secondResponse.statusCode).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(secondResponse.json()).toEqual(firstResponse.json());
+  });
+
+  it('deduplicates concurrent image upscale generation requests while the first request is still running', async () => {
+    const onePixelPng = await sharp({
+      create: {
+        width: 1,
+        height: 1,
+        channels: 4,
+        background: { r: 48, g: 96, b: 144, alpha: 1 },
+      },
+    }).png().toBuffer();
+    selectChannelMock.mockReturnValue({
+      channel: { id: 11, routeId: 22, imageUpscaleEnabled: true },
+      site: { id: 44, name: 'demo-site', url: 'https://upstream.example.com', platform: 'openai' },
+      account: { id: 33, username: 'demo-user' },
+      tokenName: 'default',
+      tokenValue: 'sk-demo',
+      actualModel: 'upstream-gpt-image',
+    });
+    let resolveFetch!: (response: Response) => void;
+    fetchMock.mockReturnValueOnce(new Promise<Response>((resolve) => {
+      resolveFetch = resolve;
+    }));
+
+    const payload = {
+      model: 'gpt-image-1',
+      prompt: 'draw a concurrent poster 2026-06-21',
+      size: '2048x2048',
+    };
+    const firstRequest = app.inject({
+      method: 'POST',
+      url: '/v1/images/generations',
+      headers: {
+        authorization: 'Bearer sk-demo',
+      },
+      payload,
+    });
+    const secondRequest = app.inject({
+      method: 'POST',
+      url: '/v1/images/generations',
+      headers: {
+        authorization: 'Bearer sk-demo',
+      },
+      payload,
+    });
+    await vi.waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+    resolveFetch(new Response(JSON.stringify({
+      created: 1,
+      data: [{ b64_json: onePixelPng.toString('base64') }],
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const [firstResponse, secondResponse] = await Promise.all([firstRequest, secondRequest]);
+
+    expect(firstResponse.statusCode).toBe(200);
+    expect(secondResponse.statusCode).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(secondResponse.json()).toEqual(firstResponse.json());
   });
 
   it('keeps returning a successful image edit response when post-success accounting fails', async () => {
