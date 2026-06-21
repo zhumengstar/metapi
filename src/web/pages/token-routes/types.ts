@@ -3,7 +3,7 @@ import type { BrandInfo } from '../../components/BrandIcon.js';
 import type { RouteDecision, RouteDecisionCandidate, RouteMode } from '../../../shared/tokenRouteContract.js';
 export type { RouteDecision, RouteDecisionCandidate, RouteMode } from '../../../shared/tokenRouteContract.js';
 
-export type RouteSortBy = 'modelPattern' | 'channelCount';
+export type RouteSortBy = 'modelPattern' | 'channelCount' | 'usage';
 export type RouteSortDir = 'asc' | 'desc';
 export type GroupFilter = null | '__all__' | number;
 export type RouteRoutingStrategy = 'weighted' | 'round_robin' | 'stable_first';
@@ -38,9 +38,14 @@ export type RouteChannel = {
   priority: number;
   weight: number;
   enabled: boolean;
+  imageUpscaleEnabled?: boolean;
   manualOverride: boolean;
   successCount: number;
   failCount: number;
+  totalCost?: number | null;
+  actualTotalCost?: number | null;
+  totalInputTokens?: number | null;
+  inputCostPerMillion?: number | null;
   cooldownUntil?: string | null;
   account?: {
     username: string | null;
@@ -62,6 +67,7 @@ export type RouteChannel = {
   } | null;
   oauthRouteUnitId?: number | null;
   routeUnit?: RouteChannelRouteUnit | null;
+  modelTestResult?: RouteChannelModelTestResult | null;
 };
 
 export type RouteRow = {
@@ -91,6 +97,8 @@ export type RouteSummaryRow = {
   enabled: boolean;
   channelCount: number;
   enabledChannelCount: number;
+  successCount?: number | null;
+  totalInputTokens?: number | null;
   siteNames: string[];
   decisionSnapshot: RouteDecision | null;
   decisionRefreshedAt: string | null;
@@ -104,6 +112,17 @@ export type ChannelDecisionState = {
   showBar: boolean;
   reasonText: string;
   reasonColor: string;
+};
+
+export type RouteChannelModelTestResult = {
+  tokenId: number | null;
+  model: string;
+  available: boolean;
+  message?: string | null;
+  responseText?: string | null;
+  httpStatus?: number | null;
+  latencyMs?: number | null;
+  checkedAt?: string | null;
 };
 
 export type RouteTokenOption = {
@@ -158,10 +177,15 @@ export type SortableChannelRowProps = {
   tokenOptions: RouteTokenOption[];
   activeTokenId: number;
   isUpdatingToken: boolean;
+  modelName?: string;
+  testingModel?: boolean;
+  modelTestResult?: RouteChannelModelTestResult | null;
   onTokenDraftChange: (channelId: number, tokenId: number) => void;
   onSaveToken: () => void;
   onDeleteChannel: () => void;
   onToggleEnabled: (enabled: boolean) => void;
+  onToggleImageUpscale?: (enabled: boolean) => void;
+  onTestModel?: () => void;
   onSiteBlockModel?: () => void;
 };
 

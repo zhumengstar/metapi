@@ -200,4 +200,84 @@ describe('SortableChannelRow layering', () => {
     ));
     expect(inlineSelect.props.className).toContain('is-inline-menu');
   });
+
+  it('toggles channel status directly from the status badge', () => {
+    const channel = buildChannel({ enabled: true });
+    const onToggleEnabled = vi.fn();
+    const root = create(
+      <DndContext>
+        <SortableContext items={[channel.id]} strategy={verticalListSortingStrategy}>
+          <SortableChannelRow
+            channel={channel}
+            decisionCandidate={undefined}
+            isExactRoute
+            loadingDecision={false}
+            isSavingPriority={false}
+            tokenOptions={[
+              {
+                id: 501,
+                name: 'shared-token',
+                isDefault: true,
+              },
+            ]}
+            activeTokenId={0}
+            isUpdatingToken={false}
+            onTokenDraftChange={vi.fn()}
+            onSaveToken={vi.fn()}
+            onDeleteChannel={vi.fn()}
+            onToggleEnabled={onToggleEnabled}
+            onSiteBlockModel={vi.fn()}
+          />
+        </SortableContext>
+      </DndContext>,
+    );
+
+    const statusButton = root.root.find((node) => (
+      node.type === 'button'
+      && node.props['aria-label'] === '点击禁用此通道'
+    ));
+
+    statusButton.props.onClick({ stopPropagation: vi.fn() });
+    expect(onToggleEnabled).toHaveBeenCalledWith(false);
+  });
+
+  it('can re-enable a disabled channel from the status badge', () => {
+    const channel = buildChannel({ enabled: false });
+    const onToggleEnabled = vi.fn();
+    const root = create(
+      <DndContext>
+        <SortableContext items={[channel.id]} strategy={verticalListSortingStrategy}>
+          <SortableChannelRow
+            channel={channel}
+            decisionCandidate={undefined}
+            isExactRoute
+            loadingDecision={false}
+            isSavingPriority={false}
+            tokenOptions={[
+              {
+                id: 501,
+                name: 'shared-token',
+                isDefault: true,
+              },
+            ]}
+            activeTokenId={0}
+            isUpdatingToken={false}
+            onTokenDraftChange={vi.fn()}
+            onSaveToken={vi.fn()}
+            onDeleteChannel={vi.fn()}
+            onToggleEnabled={onToggleEnabled}
+            onSiteBlockModel={vi.fn()}
+          />
+        </SortableContext>
+      </DndContext>,
+    );
+
+    const statusButton = root.root.find((node) => (
+      node.type === 'button'
+      && node.props['aria-label'] === '点击启用此通道'
+    ));
+
+    statusButton.props.onClick({ stopPropagation: vi.fn() });
+    expect(onToggleEnabled).toHaveBeenCalledWith(true);
+  });
 });

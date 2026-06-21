@@ -15,6 +15,8 @@ import {
 } from './routeRoutingStrategy.js';
 import { type DownstreamRoutingPolicy, EMPTY_DOWNSTREAM_ROUTING_POLICY } from './downstreamPolicyTypes.js';
 import { isUsableAccountToken } from './accountTokenService.js';
+import { isSuccessfulManualTokenModelTest } from './tokenModelAvailabilityStatus.js';
+import { isImageGenerationModel } from './modelType.js';
 import { getOauthInfoFromAccount } from './oauth/oauthAccount.js';
 import { parseCodexQuotaResetHint } from './oauth/quota.js';
 import {
@@ -33,6 +35,8 @@ import {
   normalizeTokenRouteMode,
   type RouteDecision,
   type RouteDecisionCandidate,
+  type RouteDecisionScoreBreakdown,
+  type RouteDecisionScoreBreakdownRow,
   type RouteMode,
 } from '../../shared/tokenRouteContract.js';
 
@@ -43,6 +47,7 @@ interface RouteMatch {
     account: typeof schema.accounts.$inferSelect;
     site: typeof schema.sites.$inferSelect;
     token: typeof schema.accountTokens.$inferSelect | null;
+    tokenModelAvailability: typeof schema.tokenModelAvailability.$inferSelect | null;
     routeUnit: OAuthRouteUnitSummary | null;
     routeUnitMembers: Array<{
       member: typeof schema.oauthRouteUnitMembers.$inferSelect;
@@ -97,7 +102,10 @@ const SHORT_WINDOW_LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
 const MAX_FAILURE_BACKOFF_SEC = 30 * 24 * 60 * 60;
 const MIN_EFFECTIVE_UNIT_COST = 1e-6;
 const ROUND_ROBIN_FAILURE_THRESHOLD = 3;
+const STABLE_FIRST_FAILURE_THRESHOLD = 5;
+const STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD = 50;
 const ROUND_ROBIN_COOLDOWN_LEVELS_SEC = [0, 10 * 60, 60 * 60, 24 * 60 * 60] as const;
+const STAGED_FAILURE_COOLDOWN_STRATEGIES = new Set<RouteRoutingStrategy>(['round_robin', 'stable_first']);
 const STABLE_FIRST_SITE_SCORE_RATIO = 0.92;
 const SITE_RUNTIME_HEALTH_DECAY_HALF_LIFE_MS = 10 * 60 * 1000;
 const SITE_RUNTIME_MIN_MULTIPLIER = 0.08;
@@ -208,9 +216,254 @@ type SiteRuntimeHealthDetails = {
 type WeightedSelectionMode = 'weighted' | 'stable_first';
 type WeightedSelectionResult = {
   selected: RouteChannelCandidate | null;
-  details: Array<{ candidate: RouteChannelCandidate; probability: number; reason: string }>;
+  details: Array<{
+    candidate: RouteChannelCandidate;
+    probability: number;
+    reason: string;
+    scoreBreakdown: RouteDecisionScoreBreakdown;
+  }>;
   stableSiteCount: number;
 };
+
+function formatDecisionNumber(value: number, digits = 4): string {
+  if (!Number.isFinite(value)) return '0';
+  if (Math.abs(value) >= 1000) return value.toFixed(0);
+  if (Math.abs(value) >= 100) return value.toFixed(1);
+  if (Math.abs(value) >= 10) return value.toFixed(2);
+  return value.toFixed(digits).replace(/\.?0+$/, '') || '0';
+}
+
+function formatDecisionPercent(value: number, digits = 1): string {
+  if (!Number.isFinite(value)) return '0%';
+  return `${(value * 100).toFixed(digits)}%`;
+}
+
+function buildWeightedScoreBreakdown(params: {
+  mode: WeightedSelectionMode;
+  probability: number;
+  contribution: number;
+  totalContribution: number;
+  weight: number;
+  unitCost: number;
+  costSourceText: string;
+  inputCostText: string;
+  valueScore: number;
+  normalizedValueScore: number;
+  baseContribution: number;
+  baseWeightFactor: number;
+  valueScoreFactor: number;
+  costWeight: number;
+  balanceWeight: number;
+  usageWeight: number;
+  balance: number;
+  recentUsage: number;
+  siteChannels: number;
+  combinedSiteWeight: number;
+  runtimeMultiplier: number;
+  runtimeLoadText: string;
+  runtimeLoadMultiplier: number;
+  historicalMultiplier: number;
+  historicalSuccessRateText: string;
+  historicalLatencyText: string;
+  historicalSampleCount: number;
+  fallbackPenalty: number;
+}): RouteDecisionScoreBreakdown {
+  const siteSplit = 1 / Math.max(1, params.siteChannels);
+  const rows: RouteDecisionScoreBreakdownRow[] = [
+    {
+      metric: '基础权重',
+      value: `W=${params.weight}`,
+      formula: `(W + 10) x (${formatDecisionNumber(params.baseWeightFactor, 3)} + 价值得分 x ${formatDecisionNumber(params.valueScoreFactor, 3)})`,
+      weight: `基础 ${formatDecisionPercent(params.baseWeightFactor, 0)} / 价值 ${formatDecisionPercent(params.valueScoreFactor, 0)}`,
+      contribution: formatDecisionNumber(params.baseContribution),
+      tone: 'positive',
+    },
+    {
+      metric: '价值得分',
+      value: formatDecisionNumber(params.valueScore),
+      formula: `${formatDecisionNumber(params.costWeight, 3)} x 1/成本 + ${formatDecisionNumber(params.balanceWeight, 3)} x 余额 + ${formatDecisionNumber(params.usageWeight, 3)} x 1/调用量`,
+      weight: `成本 ${formatDecisionPercent(params.costWeight, 0)} / 余额 ${formatDecisionPercent(params.balanceWeight, 0)} / 使用 ${formatDecisionPercent(params.usageWeight, 0)}`,
+      contribution: `归一化 ${formatDecisionNumber(params.normalizedValueScore, 4)}`,
+    },
+    {
+      metric: '成本',
+      value: `${params.costSourceText}:${formatDecisionNumber(params.unitCost, 6)}`,
+      formula: `1 / ${formatDecisionNumber(params.unitCost, 6)}`,
+      weight: `${formatDecisionNumber(params.costWeight, 3)}x`,
+      contribution: formatDecisionNumber(1 / Math.max(params.unitCost, MIN_EFFECTIVE_UNIT_COST)),
+      tone: params.costSourceText === '默认' ? 'warning' : 'positive',
+    },
+    {
+      metric: '站点倍率',
+      value: formatDecisionNumber(params.combinedSiteWeight, 3),
+      formula: '站点权重 x 下游倍率',
+      weight: `${formatDecisionNumber(params.combinedSiteWeight, 3)}x`,
+      contribution: formatDecisionNumber(params.combinedSiteWeight, 3),
+    },
+    {
+      metric: '运行健康',
+      value: formatDecisionNumber(params.runtimeMultiplier, 3),
+      formula: '站点健康 x 模型健康',
+      weight: `${formatDecisionNumber(params.runtimeMultiplier, 3)}x`,
+      contribution: formatDecisionNumber(params.runtimeMultiplier, 3),
+      tone: params.runtimeMultiplier >= 1 ? 'positive' : 'warning',
+    },
+    {
+      metric: '会话负载',
+      value: params.runtimeLoadText,
+      formula: '运行中负载越高，乘数越低',
+      weight: `${formatDecisionNumber(params.runtimeLoadMultiplier, 3)}x`,
+      contribution: formatDecisionNumber(params.runtimeLoadMultiplier, 3),
+    },
+    {
+      metric: '历史健康',
+      value: `${params.historicalSuccessRateText} / ${params.historicalLatencyText}`,
+      formula: '成功率和平均延迟生成健康乘数',
+      weight: `${formatDecisionNumber(params.historicalMultiplier, 3)}x`,
+      contribution: `样本 ${params.historicalSampleCount}`,
+      tone: params.historicalMultiplier >= 1 ? 'positive' : 'warning',
+    },
+    {
+      metric: '同站点分摊',
+      value: `${params.siteChannels} 个通道`,
+      formula: `贡献 / ${params.siteChannels}`,
+      weight: `${formatDecisionNumber(siteSplit, 3)}x`,
+      contribution: formatDecisionNumber(siteSplit, 3),
+    },
+  ];
+
+  if (params.fallbackPenalty !== 1) {
+    rows.push({
+      metric: '默认成本惩罚',
+      value: formatDecisionNumber(params.fallbackPenalty, 3),
+      formula: '缺少真实成本时按默认成本反向惩罚',
+      weight: `${formatDecisionNumber(params.fallbackPenalty, 3)}x`,
+      contribution: formatDecisionNumber(params.fallbackPenalty, 3),
+      tone: 'warning',
+    });
+  }
+
+  rows.push({
+    metric: '最终占比',
+    value: formatDecisionPercent(params.probability),
+    formula: '本通道贡献 / 同层总贡献',
+    weight: '结果',
+    contribution: `${formatDecisionNumber(params.contribution)} / ${formatDecisionNumber(params.totalContribution)}`,
+    tone: params.probability > 0 ? 'positive' : 'muted',
+  });
+
+  return {
+    strategy: params.mode,
+    formula: '贡献 = 基础权重 x 站点倍率 x 运行健康 x 会话负载 x 历史健康 x 同站点分摊 x 默认成本惩罚；概率 = 本通道贡献 / 总贡献',
+    contribution: params.contribution,
+    totalContribution: params.totalContribution,
+    probability: params.probability,
+    rows,
+  };
+}
+
+function buildStableFirstScoreBreakdown(params: {
+  probability: number;
+  contribution: number;
+  totalContribution: number;
+  unitCost: number;
+  costSourceText: string;
+  inputCostText: string;
+  recentSuccessRate: number;
+  recentSampleCount: number;
+  recentConfidence: number;
+  historicalSuccessRateText: string;
+  stableFirstSuccessRate: number;
+  runtimeMultiplier: number;
+  runtimeLoadText: string;
+  runtimeLoadMultiplier: number;
+  siteChannels: number;
+  consecutiveFailText: string;
+  stickyProgressText: string;
+}): RouteDecisionScoreBreakdown {
+  const siteSplit = 1 / Math.max(1, params.siteChannels);
+  const costScore = 1 / Math.max(params.unitCost, MIN_EFFECTIVE_UNIT_COST);
+  const successMultiplier = Math.max(0.05, params.stableFirstSuccessRate);
+  const rows: RouteDecisionScoreBreakdownRow[] = [
+    {
+      metric: '低价成本',
+      value: `${params.costSourceText}:${formatDecisionNumber(params.unitCost, 6)}`,
+      formula: `1 / ${formatDecisionNumber(params.unitCost, 6)}`,
+      weight: '成本优先',
+      contribution: formatDecisionNumber(costScore),
+      tone: params.costSourceText === '默认' ? 'warning' : 'positive',
+    },
+    {
+      metric: '输入/M',
+      value: params.inputCostText,
+      formula: '优先使用每 M 输入实际成本，没有则用综合成本',
+      weight: '排序主键',
+      contribution: params.inputCostText,
+    },
+    {
+      metric: '综合成功率',
+      value: formatDecisionPercent(params.stableFirstSuccessRate),
+      formula: '近期成功率按样本置信度融合历史成功率',
+      weight: `${formatDecisionNumber(successMultiplier, 3)}x`,
+      contribution: `近期 ${formatDecisionPercent(params.recentSuccessRate)} / 历史 ${params.historicalSuccessRateText}`,
+      tone: successMultiplier >= 0.9 ? 'positive' : 'warning',
+    },
+    {
+      metric: '近期样本',
+      value: `${formatDecisionNumber(params.recentSampleCount, 2)} 个`,
+      formula: '样本越多，近期成功率置信度越高',
+      weight: `置信 ${formatDecisionNumber(params.recentConfidence, 3)}`,
+      contribution: formatDecisionNumber(params.recentConfidence, 3),
+    },
+    {
+      metric: '运行健康',
+      value: formatDecisionNumber(params.runtimeMultiplier, 3),
+      formula: '站点健康 x 模型健康',
+      weight: `${formatDecisionNumber(params.runtimeMultiplier, 3)}x`,
+      contribution: formatDecisionNumber(params.runtimeMultiplier, 3),
+      tone: params.runtimeMultiplier >= 1 ? 'positive' : 'warning',
+    },
+    {
+      metric: '会话负载',
+      value: params.runtimeLoadText,
+      formula: '运行中负载越高，乘数越低',
+      weight: `${formatDecisionNumber(params.runtimeLoadMultiplier, 3)}x`,
+      contribution: formatDecisionNumber(params.runtimeLoadMultiplier, 3),
+    },
+    {
+      metric: '失败/粘性',
+      value: `失败 ${params.consecutiveFailText}`,
+      formula: '连续失败 5 次后切换；选中后稳定 50 次再重评低价',
+      weight: '稳定保护',
+      contribution: `粘性 ${params.stickyProgressText}`,
+      tone: params.consecutiveFailText.startsWith('0/') ? 'positive' : 'warning',
+    },
+    {
+      metric: '同站点分摊',
+      value: `${params.siteChannels} 个通道`,
+      formula: `贡献 / ${params.siteChannels}`,
+      weight: `${formatDecisionNumber(siteSplit, 3)}x`,
+      contribution: formatDecisionNumber(siteSplit, 3),
+    },
+    {
+      metric: '最终占比',
+      value: formatDecisionPercent(params.probability),
+      formula: '本通道贡献 / 同层总贡献',
+      weight: '结果',
+      contribution: `${formatDecisionNumber(params.contribution)} / ${formatDecisionNumber(params.totalContribution)}`,
+      tone: params.probability > 0 ? 'positive' : 'muted',
+    },
+  ];
+
+  return {
+    strategy: 'stable_first',
+    formula: '稳定优先贡献 = 1/成本 x max(5%, 综合成功率) x 运行健康 x 会话负载 / 同站点通道数；先按低价排序，失败 5 次切换，稳定 50 次后重新按低价评估',
+    contribution: params.contribution,
+    totalContribution: params.totalContribution,
+    probability: params.probability,
+    rows,
+  };
+}
 
 type RecentOutcomeSnapshot = {
   successCount: number;
@@ -241,10 +494,17 @@ type StableFirstObservationProgressState = {
   lastObservationAtMs: number | null;
 };
 
+type StableFirstStickyChannelState = {
+  channelId: number;
+  successCount: number;
+  updatedAtMs: number;
+};
+
 const siteRuntimeHealthStates = new Map<number, SiteRuntimeHealthState>();
 const siteModelRuntimeHealthStates = new Map<number, Map<string, SiteRuntimeHealthState>>();
 const stableFirstLastSelectedSiteByKey = new Map<string, number>();
 const MAX_STABLE_FIRST_ROTATION_KEYS = 1024;
+const stableFirstStickyChannelByKey = new Map<string, StableFirstStickyChannelState>();
 const stableFirstObservationProgressByKey = new Map<string, StableFirstObservationProgressState>();
 const stableFirstObservationSiteCooldownByKey = new Map<string, number>();
 const MAX_STABLE_FIRST_OBSERVATION_PROGRESS_KEYS = 1024;
@@ -270,6 +530,51 @@ function rememberStableFirstSiteSelectionForKey(rotationKey: string, siteId: num
     const oldestKey = stableFirstLastSelectedSiteByKey.keys().next().value;
     if (!oldestKey) break;
     stableFirstLastSelectedSiteByKey.delete(oldestKey);
+  }
+}
+
+function rememberStableFirstStickyChannelForKey(rotationKey: string, channelId: number, nowMs = Date.now()): void {
+  if (!rotationKey || !Number.isFinite(channelId) || channelId <= 0) return;
+  const existing = stableFirstStickyChannelByKey.get(rotationKey);
+  if (existing?.channelId === channelId) {
+    existing.updatedAtMs = nowMs;
+    if (stableFirstStickyChannelByKey.has(rotationKey)) {
+      stableFirstStickyChannelByKey.delete(rotationKey);
+    }
+    stableFirstStickyChannelByKey.set(rotationKey, existing);
+  } else {
+    stableFirstStickyChannelByKey.set(rotationKey, {
+      channelId,
+      successCount: 0,
+      updatedAtMs: nowMs,
+    });
+  }
+
+  while (stableFirstStickyChannelByKey.size > MAX_STABLE_FIRST_ROTATION_KEYS) {
+    const oldestKey = stableFirstStickyChannelByKey.keys().next().value;
+    if (!oldestKey) break;
+    stableFirstStickyChannelByKey.delete(oldestKey);
+  }
+}
+
+function recordStableFirstStickySuccess(channelId: number, nowMs = Date.now()): void {
+  if (!Number.isFinite(channelId) || channelId <= 0) return;
+  for (const [key, state] of stableFirstStickyChannelByKey.entries()) {
+    if (state.channelId !== channelId) continue;
+    stableFirstStickyChannelByKey.set(key, {
+      ...state,
+      successCount: state.successCount + 1,
+      updatedAtMs: nowMs,
+    });
+  }
+}
+
+function forgetStableFirstStickyChannel(channelId: number): void {
+  if (!Number.isFinite(channelId) || channelId <= 0) return;
+  for (const [key, state] of stableFirstStickyChannelByKey.entries()) {
+    if (state.channelId === channelId) {
+      stableFirstStickyChannelByKey.delete(key);
+    }
   }
 }
 
@@ -346,6 +651,14 @@ function resolveEffectiveFailureCooldownMs(failCount?: number | null): number {
 function resolveRoundRobinCooldownSec(level: number): number {
   const normalizedLevel = Math.max(0, Math.min(ROUND_ROBIN_COOLDOWN_LEVELS_SEC.length - 1, Math.trunc(level)));
   return ROUND_ROBIN_COOLDOWN_LEVELS_SEC[normalizedLevel] ?? 0;
+}
+
+function usesStagedFailureCooldown(strategy: RouteRoutingStrategy): boolean {
+  return STAGED_FAILURE_COOLDOWN_STRATEGIES.has(strategy);
+}
+
+function resolveStagedFailureThreshold(strategy: RouteRoutingStrategy): number {
+  return strategy === 'stable_first' ? STABLE_FIRST_FAILURE_THRESHOLD : ROUND_ROBIN_FAILURE_THRESHOLD;
 }
 
 function resolveSiteRuntimeBreakerMs(level: number): number {
@@ -1173,6 +1486,19 @@ async function loadRouteMatch(route: RouteRow, nowMs = Date.now()): Promise<Rout
       .where(inArray(schema.routeChannels.routeId, enabledSourceRouteIds))
       .all()
     : [];
+  const explicitTokenIds: number[] = Array.from(new Set(channels
+    .map((row) => Number(row.route_channels.tokenId))
+    .filter((tokenId): tokenId is number => Number.isFinite(tokenId) && tokenId > 0)));
+  const tokenModelAvailabilityRows = explicitTokenIds.length > 0
+    ? await db.select().from(schema.tokenModelAvailability)
+      .where(inArray(schema.tokenModelAvailability.tokenId, explicitTokenIds))
+      .all()
+    : [];
+  const tokenModelAvailabilityByKey = new Map<string, typeof schema.tokenModelAvailability.$inferSelect>();
+  for (const row of tokenModelAvailabilityRows) {
+    const key = buildTokenModelAvailabilityKey(row.tokenId, row.modelName);
+    if (key) tokenModelAvailabilityByKey.set(key, row);
+  }
 
   const oauthRouteUnitIds: number[] = Array.from(new Set<number>(
     channels
@@ -1184,28 +1510,35 @@ async function loadRouteMatch(route: RouteRow, nowMs = Date.now()): Promise<Rout
     listOauthRouteUnitMembersByUnitIds(oauthRouteUnitIds),
   ]);
 
-  const mapped = channels.map((row) => ({
-    channel: {
+  const mapped = channels.map((row) => {
+    const channel = {
       ...row.route_channels,
       sourceModel: normalizeChannelSourceModel(row.route_channels.sourceModel)
         || fallbackSourceModelByRouteId.get(row.route_channels.routeId)
         || null,
-    },
-    account: row.accounts,
-    site: row.sites,
-    token: row.account_tokens,
-    routeUnit: row.route_channels.oauthRouteUnitId
-      ? (routeUnitSummaries.get(row.route_channels.oauthRouteUnitId) || null)
-      : null,
-    routeUnitMembers: row.route_channels.oauthRouteUnitId
-      ? (routeUnitMembersByUnitId.get(row.route_channels.oauthRouteUnitId) || []).map((member) => ({
-        member: member.member,
-        account: member.account,
-        site: member.site,
-        token: null,
-      }))
-      : [],
-  }));
+    };
+    return {
+      channel,
+      account: row.accounts,
+      site: row.sites,
+      token: row.account_tokens,
+      tokenModelAvailability: tokenModelAvailabilityByKey.get(buildTokenModelAvailabilityKey(
+        channel.tokenId,
+        channel.sourceModel,
+      ) || '') || null,
+      routeUnit: row.route_channels.oauthRouteUnitId
+        ? (routeUnitSummaries.get(row.route_channels.oauthRouteUnitId) || null)
+        : null,
+      routeUnitMembers: row.route_channels.oauthRouteUnitId
+        ? (routeUnitMembersByUnitId.get(row.route_channels.oauthRouteUnitId) || []).map((member) => ({
+          member: member.member,
+          account: member.account,
+          site: member.site,
+          token: null,
+        }))
+        : [],
+    };
+  });
 
   const match = { route, channels: mapped };
   routeMatchCache.set(route.id, {
@@ -1229,6 +1562,11 @@ function clearStableFirstCachesForRoute(routeId: number): void {
   for (const key of stableFirstLastSelectedSiteByKey.keys()) {
     if (key.startsWith(routePrefix)) {
       stableFirstLastSelectedSiteByKey.delete(key);
+    }
+  }
+  for (const key of stableFirstStickyChannelByKey.keys()) {
+    if (key.startsWith(routePrefix)) {
+      stableFirstStickyChannelByKey.delete(key);
     }
   }
   for (const key of stableFirstObservationProgressByKey.keys()) {
@@ -1256,6 +1594,7 @@ export function invalidateTokenRouterCache(): void {
   };
   routeMatchCache.clear();
   stableFirstLastSelectedSiteByKey.clear();
+  stableFirstStickyChannelByKey.clear();
   stableFirstObservationProgressByKey.clear();
   stableFirstObservationSiteCooldownByKey.clear();
 }
@@ -1325,6 +1664,7 @@ type CandidateEligibilityOptions = {
 type CostSignal = {
   unitCost: number;
   source: 'observed' | 'configured' | 'catalog' | 'fallback';
+  inputCostPerMillion: number | null;
 };
 
 export function isRegexModelPattern(pattern: string): boolean {
@@ -1454,6 +1794,16 @@ function isModelAllowedByDownstreamPolicy(requestedModel: string, policy: Downst
   return false;
 }
 
+function buildTokenModelAvailabilityKey(
+  tokenId: number | null | undefined,
+  modelName: string | null | undefined,
+): string | null {
+  const id = Number(tokenId);
+  const modelAlias = normalizeModelAlias(modelName || '');
+  if (!Number.isFinite(id) || id <= 0 || !modelAlias) return null;
+  return `${id}:${modelAlias}`;
+}
+
 function parseModelMappingRecord(modelMapping?: string | Record<string, unknown> | null): Record<string, unknown> | null {
   if (!modelMapping) return null;
   if (typeof modelMapping === 'object' && !Array.isArray(modelMapping)) {
@@ -1571,15 +1921,26 @@ function formatChannelRuntimeLoad(snapshot: ProxyChannelLoadSnapshot): string {
   return `${multiplier.toFixed(2)}（活跃=${snapshot.activeLeaseCount}/${snapshot.concurrencyLimit}，等待=${snapshot.waitingCount}）`;
 }
 
+function resolveInputCostPerMillionFromChannel(candidate: RouteChannelCandidate): number | null {
+  const totalInputTokens = Math.max(0, candidate.channel.totalInputTokens ?? 0);
+  const totalCost = Math.max(0, candidate.channel.totalCost ?? 0);
+  const rechargeRatio = Math.max(0, candidate.site.rechargeRatio ?? 1) || 1;
+  if (totalInputTokens <= 0 || totalCost <= 0) return null;
+  return Math.max((totalCost / rechargeRatio) * 1_000_000 / totalInputTokens, MIN_EFFECTIVE_UNIT_COST);
+}
+
 function resolveEffectiveUnitCost(candidate: RouteChannelCandidate, modelName: string): CostSignal {
   const successCount = Math.max(0, candidate.channel.successCount ?? 0);
   const totalCost = Math.max(0, candidate.channel.totalCost ?? 0);
   const configured = candidate.account.unitCost ?? null;
+  const rechargeRatio = Math.max(0, candidate.site.rechargeRatio ?? 1) || 1;
+  const inputCostPerMillion = resolveInputCostPerMillionFromChannel(candidate);
 
   if (successCount > 0 && totalCost > 0) {
     return {
-      unitCost: Math.max(totalCost / successCount, MIN_EFFECTIVE_UNIT_COST),
+      unitCost: Math.max((totalCost / rechargeRatio) / successCount, MIN_EFFECTIVE_UNIT_COST),
       source: 'observed',
+      inputCostPerMillion,
     };
   }
 
@@ -1587,6 +1948,7 @@ function resolveEffectiveUnitCost(candidate: RouteChannelCandidate, modelName: s
     return {
       unitCost: Math.max(configured, MIN_EFFECTIVE_UNIT_COST),
       source: 'configured',
+      inputCostPerMillion,
     };
   }
 
@@ -1599,12 +1961,14 @@ function resolveEffectiveUnitCost(candidate: RouteChannelCandidate, modelName: s
     return {
       unitCost: Math.max(catalogCost, MIN_EFFECTIVE_UNIT_COST),
       source: 'catalog',
+      inputCostPerMillion,
     };
   }
 
   return {
     unitCost: Math.max(config.routingFallbackUnitCost || 1, MIN_EFFECTIVE_UNIT_COST),
     source: 'fallback',
+    inputCostPerMillion,
   };
 }
 
@@ -2136,93 +2500,26 @@ export class TokenRouter {
         }
       }
 
-      const filteredCandidates = filterRecentlyFailedCandidates(breakerFiltered.candidates, nowMs);
-      const avoided = breakerFiltered.candidates.filter((row) => !filteredCandidates.some((item) => item.channel.id === row.channel.id));
-      if (avoided.length > 0) {
-        for (const row of avoided) {
-          const target = candidateMap.get(row.channel.id);
-          if (!target) continue;
-          target.avoidedByRecentFailure = true;
-          target.reason = `最近失败，优先避让（${resolveFailureBackoffSec(row.channel.failCount)} 秒窗口）`;
-        }
-      }
-
       const rotationKey = this.buildStableFirstRotationKey(match.route.id, requestedModel);
-      const poolPlan = buildStableFirstPoolPlan(
-        filteredCandidates,
-        useChannelSourceModelForCost ? runtimeModelResolver : mappedModel,
-        nowMs,
-      );
-      const observationDueNow = poolPlan.observationCandidates.length > 0
-        && shouldUseStableFirstObservationCandidate(rotationKey, poolPlan.observationCandidates, nowMs);
-      const useObservationNow = poolPlan.observationCandidates.length > 0
-        && (poolPlan.primaryCandidates.length <= 0 || observationDueNow);
-      const observationProgressState = stableFirstObservationProgressByKey.get(rotationKey) ?? {
-        requestCount: 0,
-        lastObservationAtMs: null,
-      };
-      const remainingPrimaryRequestsBeforeObservation = poolPlan.primaryCandidates.length > 0
-        ? Math.max(0, STABLE_FIRST_OBSERVATION_REQUEST_INTERVAL - (observationProgressState.requestCount + 1))
-        : 0;
-      const observationBlockedByCooldown = poolPlan.primaryCandidates.length > 0
-        && poolPlan.observationCandidates.length > 0
-        && remainingPrimaryRequestsBeforeObservation === 0
-        && !observationDueNow;
-      const primaryWeighted = this.calculateWeightedSelection(
-        poolPlan.primaryCandidates,
+      const weighted = this.calculateWeightedSelection(
+        breakerFiltered.candidates,
         useChannelSourceModelForCost ? runtimeModelResolver : mappedModel,
         downstreamPolicy,
         nowMs,
         'stable_first',
         rotationKey,
       );
-      const observationWeighted = poolPlan.observationCandidates.length > 0
-        ? this.calculateWeightedSelection(
-          poolPlan.observationCandidates,
-          useChannelSourceModelForCost ? runtimeModelResolver : mappedModel,
-          downstreamPolicy,
-          nowMs,
-          'stable_first',
-          `${rotationKey}:observe`,
-        )
-        : {
-          selected: null,
-          details: [],
-          stableSiteCount: 0,
-        };
 
-      for (const detail of primaryWeighted.details) {
+      for (const detail of weighted.details) {
         const target = candidateMap.get(detail.candidate.channel.id);
-        if (!target) continue;
-        target.probability = Number((detail.probability * (useObservationNow ? 0 : 100)).toFixed(2));
-        if (target.eligible && !target.avoidedByRecentFailure) {
-          target.reason = useObservationNow
-            ? `主池：本次让位给观察池灰度请求；${detail.reason}`
-            : `主池：${detail.reason}`;
-        }
-      }
-      for (const detail of observationWeighted.details) {
-        const target = candidateMap.get(detail.candidate.channel.id);
-        if (!target) continue;
-        target.probability = Number((detail.probability * (useObservationNow ? 100 : 0)).toFixed(2));
-        if (target.eligible && !target.avoidedByRecentFailure) {
-          const siteState = poolPlan.siteStateById.get(detail.candidate.site.id);
-          const observationWindowPrefix = useObservationNow
-            ? (poolPlan.primaryCandidates.length > 0
-              ? '本次命中灰度真实请求'
-              : '当前主池为空，改由观察池承接')
-            : (observationBlockedByCooldown
-              ? '当前已到灰度窗口，但观察站点仍在冷却'
-              : `当前还需 ${remainingPrimaryRequestsBeforeObservation} 次主池请求`);
-          target.reason = poolPlan.observationSiteIds.has(detail.candidate.site.id)
-            ? `${siteState?.observationReason || '观察池'}；${observationWindowPrefix}；${detail.reason}`
-            : `观察池：${observationWindowPrefix}；${detail.reason}`;
-        }
+	        if (!target) continue;
+	        target.probability = Number((detail.probability * 100).toFixed(2));
+	        target.scoreBreakdown = detail.scoreBreakdown;
+	        if (target.eligible && !target.avoidedByRecentFailure) {
+	          target.reason = detail.reason;
+	        }
       }
 
-      const weighted = useObservationNow
-        ? observationWeighted
-        : (primaryWeighted.selected ? primaryWeighted : observationWeighted);
       if (!weighted.selected) {
         summary.push('本次未选出通道');
         return {
@@ -2237,32 +2534,13 @@ export class TokenRouter {
       }
 
       const summaryParts = [`稳定优先：可用 ${available.length}`];
-      if (poolPlan.primarySiteIds.size > 0) {
-        summaryParts.push(`主池站点 ${poolPlan.primarySiteIds.size}`);
-      }
-      if (poolPlan.observationSiteIds.size > 0) {
-        summaryParts.push(`观察池站点 ${poolPlan.observationSiteIds.size}`);
-      }
-      summaryParts.push('按近期成功率分层后按配置顺序轮询站点');
-      if (poolPlan.observationSiteIds.size > 0) {
-        if (useObservationNow) {
-          summaryParts.push('本次命中观察池灰度流量');
-        } else if (observationBlockedByCooldown) {
-          summaryParts.push('观察池已到灰度窗口，但候选站点仍在观察冷却');
-        } else if (poolPlan.primaryCandidates.length <= 0) {
-          summaryParts.push('当前主池为空，由观察池承接流量');
-        } else {
-          summaryParts.push(`观察池仅消耗少量真实请求灰度流量（当前还需 ${remainingPrimaryRequestsBeforeObservation} 次主池请求）`);
-        }
-      }
+      summaryParts.push(`低价优先，连续失败 ${STABLE_FIRST_FAILURE_THRESHOLD} 次后切换`);
+      summaryParts.push(`切换后稳定成功 ${STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD} 次再重新评估低价`);
       if (breakerFiltered.avoided.length > 0) {
         const breakerSummaryLabel = breakerFiltered.avoided.some((item) => item.reason.includes('模型熔断'))
           ? '运行时熔断避让'
           : '站点熔断避让';
         summaryParts.push(`${breakerSummaryLabel} ${breakerFiltered.avoided.length}`);
-      }
-      if (avoided.length > 0) {
-        summaryParts.push(`最近失败避让 ${avoided.length}`);
       }
       summary.push(summaryParts.join('，'));
 
@@ -2339,11 +2617,12 @@ export class TokenRouter {
       );
       for (const detail of weighted.details) {
         const target = candidateMap.get(detail.candidate.channel.id);
-        if (!target) continue;
-        target.probability = Number((detail.probability * 100).toFixed(2));
-        if (target.eligible && !target.avoidedByRecentFailure) {
-          target.reason = detail.reason;
-        }
+	        if (!target) continue;
+	        target.probability = Number((detail.probability * 100).toFixed(2));
+	        target.scoreBreakdown = detail.scoreBreakdown;
+	        if (target.eligible && !target.avoidedByRecentFailure) {
+	          target.reason = detail.reason;
+	        }
       }
 
       if (!weighted.selected) continue;
@@ -2453,6 +2732,7 @@ export class TokenRouter {
     cost: number,
     modelName?: string | null,
     actualAccountId?: number,
+    inputTokens = 0,
   ) {
     await ensureSiteRuntimeHealthStateLoaded();
     const row = await db.select()
@@ -2467,6 +2747,8 @@ export class TokenRouter {
     const nextSuccessCount = (ch.successCount ?? 0) + 1;
     const nextTotalLatencyMs = (ch.totalLatencyMs ?? 0) + latencyMs;
     const nextTotalCost = (ch.totalCost ?? 0) + cost;
+    const normalizedInputTokens = Math.max(0, Math.trunc(Number(inputTokens) || 0));
+    const nextTotalInputTokens = (ch.totalInputTokens ?? 0) + normalizedInputTokens;
     if (typeof ch.oauthRouteUnitId === 'number' && ch.oauthRouteUnitId > 0) {
       const targetAccountId = Number.isFinite(actualAccountId) && (actualAccountId ?? 0) > 0
         ? Math.trunc(actualAccountId!)
@@ -2510,6 +2792,7 @@ export class TokenRouter {
       successCount: nextSuccessCount,
       totalLatencyMs: nextTotalLatencyMs,
       totalCost: nextTotalCost,
+      totalInputTokens: nextTotalInputTokens,
       lastUsedAt: nowIso,
       cooldownUntil: null,
       lastFailAt: null,
@@ -2521,12 +2804,14 @@ export class TokenRouter {
       channel.successCount = nextSuccessCount;
       channel.totalLatencyMs = nextTotalLatencyMs;
       channel.totalCost = nextTotalCost;
+      channel.totalInputTokens = nextTotalInputTokens;
       channel.lastUsedAt = nowIso;
       channel.cooldownUntil = null;
       channel.lastFailAt = null;
       channel.consecutiveFailCount = 0;
       channel.cooldownLevel = 0;
     });
+    recordStableFirstStickySuccess(channelId);
   }
 
   async recordProbeSuccess(
@@ -2790,14 +3075,17 @@ export class TokenRouter {
       cooldownUntil = shortWindowLimitCooldownUntil;
       consecutiveFailCount = 0;
       cooldownLevel = 0;
-    } else if (routeStrategy === 'round_robin') {
-      if (consecutiveFailCount >= ROUND_ROBIN_FAILURE_THRESHOLD) {
+    } else if (usesStagedFailureCooldown(routeStrategy)) {
+      if (consecutiveFailCount >= resolveStagedFailureThreshold(routeStrategy)) {
         cooldownLevel = Math.min(cooldownLevel + 1, ROUND_ROBIN_COOLDOWN_LEVELS_SEC.length - 1);
         const cooldownSec = resolveRoundRobinCooldownSec(cooldownLevel);
         cooldownUntil = cooldownSec > 0
           ? new Date(nowMs + clampFailureCooldownMs(cooldownSec * 1000)).toISOString()
           : null;
         consecutiveFailCount = 0;
+        if (routeStrategy === 'stable_first') {
+          forgetStableFirstStickyChannel(channelId);
+        }
       }
     } else {
       cooldownUntil = new Date(nowMs + resolveEffectiveFailureCooldownMs(failCount)).toISOString();
@@ -2890,32 +3178,14 @@ export class TokenRouter {
 
     if (routeStrategy === 'stable_first') {
       const breakerFiltered = filterSiteRuntimeBrokenCandidatesByModel(available, runtimeModelResolver, nowMs);
-      const candidates = filterRecentlyFailedCandidates(breakerFiltered.candidates, nowMs);
+      const candidates = breakerFiltered.candidates;
       const rotationKey = this.buildStableFirstRotationKey(match.route.id, requestedModel);
-      const poolPlan = buildStableFirstPoolPlan(
-        candidates,
-        requestedByDisplayName ? runtimeModelResolver : mappedModel,
-        nowMs,
-      );
-      const shouldUseObservation = (
-        poolPlan.observationCandidates.length > 0
-        && (
-          poolPlan.primaryCandidates.length <= 0
-          || (
-            recordSelection
-            && shouldUseStableFirstObservationCandidate(rotationKey, poolPlan.observationCandidates, nowMs)
-          )
-        )
-      );
-      const selectionPool = shouldUseObservation
-        ? poolPlan.observationCandidates
-        : (poolPlan.primaryCandidates.length > 0 ? poolPlan.primaryCandidates : poolPlan.observationCandidates);
       const selected = this.stableFirstSelect(
-        selectionPool,
+        candidates,
         requestedByDisplayName ? runtimeModelResolver : mappedModel,
         downstreamPolicy,
         nowMs,
-        shouldUseObservation ? `${rotationKey}:observe` : rotationKey,
+        rotationKey,
       );
       if (!selected) return null;
       return await this.finalizeSelectedCandidateForDispatch(
@@ -2928,8 +3198,8 @@ export class TokenRouter {
         nowIso,
         nowMs,
         rotationKey,
-        `${rotationKey}:observe`,
-        shouldUseObservation,
+        undefined,
+        false,
         excludeChannelIds,
       );
     }
@@ -3334,6 +3604,16 @@ export class TokenRouter {
     }
 
     if (!candidate.channel.enabled) reasonParts.push('通道禁用');
+    if (candidate.channel.tokenId && !isUsableAccountToken(candidate.token)) {
+      reasonParts.push('账号令牌禁用或不可用');
+    }
+    if (
+      candidate.channel.tokenId
+      && !isImageGenerationModel(candidate.channel.sourceModel)
+      && !isSuccessfulManualTokenModelTest(candidate.tokenModelAvailability)
+    ) {
+      reasonParts.push('模型测试不可用');
+    }
 
     if (isOauthRouteUnitCandidate(candidate)) {
       if (excludeChannelIds.includes(candidate.channel.id)) {
@@ -3489,6 +3769,11 @@ export class TokenRouter {
           selectedSiteId: dispatchCandidate.site.id,
           nowMs,
         });
+      } else if (stableFirstRotationKey) {
+        rememberStableFirstSiteSelectionForKey(stableFirstRotationKey, dispatchCandidate.site.id);
+      }
+      if (stableFirstRotationKey) {
+        rememberStableFirstStickyChannelForKey(stableFirstRotationKey, selected.channel.id, nowMs);
       }
       await this.recordChannelSelection(selected.channel.id);
     }
@@ -3544,11 +3829,11 @@ export class TokenRouter {
     stableFirstRotationKey?: string,
   ): WeightedSelectionResult {
     if (candidates.length === 0) {
-      return {
-        selected: null as RouteChannelCandidate | null,
-        details: [] as Array<{ candidate: RouteChannelCandidate; probability: number; reason: string }>,
-        stableSiteCount: 0,
-      };
+	      return {
+	        selected: null as RouteChannelCandidate | null,
+	        details: [],
+	        stableSiteCount: 0,
+	      };
     }
 
     const { baseWeightFactor, valueScoreFactor, costWeight, balanceWeight, usageWeight } = config.routingWeights;
@@ -3602,7 +3887,12 @@ export class TokenRouter {
           runtimeHealthDetails[i],
           siteHistoricalHealthMetrics.get(candidate.site.id)?.successRate,
         );
-        let contribution = Math.max(1e-4, recentSuccessRate ** 2);
+        const unitCost = Math.max(
+          effectiveCosts[i]?.inputCostPerMillion || effectiveCosts[i]?.unitCost || 1,
+          MIN_EFFECTIVE_UNIT_COST,
+        );
+        let contribution = 1 / unitCost;
+        contribution *= Math.max(0.05, recentSuccessRate);
         contribution *= runtimeMultiplier;
         contribution *= runtimeLoadMultiplier;
         return contribution / siteChannels;
@@ -3639,6 +3929,14 @@ export class TokenRouter {
     const totalContribution = contributions.reduce((a, b) => a + b, 0);
     const rankedIndices = candidates.map((_, index) => index)
       .sort((leftIndex, rightIndex) => {
+          if (selectionMode === 'stable_first') {
+          const leftCost = effectiveCosts[leftIndex]?.inputCostPerMillion || effectiveCosts[leftIndex]?.unitCost || 1;
+          const rightCost = effectiveCosts[rightIndex]?.inputCostPerMillion || effectiveCosts[rightIndex]?.unitCost || 1;
+          const costDiff = leftCost - rightCost;
+          if (Math.abs(costDiff) > 1e-9) {
+            return costDiff > 0 ? 1 : -1;
+          }
+        }
         const contributionDiff = contributions[rightIndex] - contributions[leftIndex];
         if (Math.abs(contributionDiff) > 1e-9) {
           return contributionDiff > 0 ? 1 : -1;
@@ -3653,10 +3951,14 @@ export class TokenRouter {
       ? this.getStableFirstSiteLeaderIndices(candidates, contributions, rankedIndices)
       : [];
     const stableSiteIds = new Set(stableSiteLeaderIndices.map((index) => candidates[index]?.site.id).filter((siteId) => typeof siteId === 'number'));
-    const details = candidates.map((candidate, i) => {
-      const probability = totalContribution > 0 ? contributions[i] / totalContribution : 0;
-      const weight = candidate.channel.weight ?? 10;
-      const cost = effectiveCosts[i];
+	    const details = candidates.map((candidate, i) => {
+	      const probability = totalContribution > 0 ? contributions[i] / totalContribution : 0;
+	      const weight = candidate.channel.weight ?? 10;
+	      const cost = effectiveCosts[i];
+	      const unitCost = cost?.unitCost || 1;
+	      const inputCostText = cost?.inputCostPerMillion == null
+	        ? '—'
+	        : cost.inputCostPerMillion.toFixed(6);
       const costSourceText = cost?.source === 'observed'
         ? '实测'
         : (cost?.source === 'configured' ? '配置' : (cost?.source === 'catalog' ? '目录' : '默认'));
@@ -3680,34 +3982,93 @@ export class TokenRouter {
       const historicalLatencyText = siteHistoricalHealth?.avgLatencyMs == null
         ? '—'
         : `${siteHistoricalHealth.avgLatencyMs}ms`;
-      const channelRuntimeLoad = channelLoadSnapshots[i];
-      const runtimeHealthText = siteRuntimeDetail.modelKey
-        ? `${siteRuntimeDetail.combinedMultiplier.toFixed(2)}（站点=${siteRuntimeDetail.globalMultiplier.toFixed(2)}，模型=${siteRuntimeDetail.modelMultiplier.toFixed(2)}）`
-        : `${siteRuntimeDetail.globalMultiplier.toFixed(2)}`;
+	      const channelRuntimeLoad = channelLoadSnapshots[i];
+	      const runtimeLoadMultiplier = resolveChannelRuntimeLoadMultiplier(channelRuntimeLoad);
+	      const runtimeHealthText = siteRuntimeDetail.modelKey
+	        ? `${siteRuntimeDetail.combinedMultiplier.toFixed(2)}（站点=${siteRuntimeDetail.globalMultiplier.toFixed(2)}，模型=${siteRuntimeDetail.modelMultiplier.toFixed(2)}）`
+	        : `${siteRuntimeDetail.globalMultiplier.toFixed(2)}`;
       const runtimeLoadText = formatChannelRuntimeLoad(channelRuntimeLoad);
       const recentSuccessRateText = `${(siteRuntimeDetail.recentSuccessRate * 100).toFixed(1)}%`;
       const stableFirstSuccessRate = resolveStableFirstSuccessRate(siteRuntimeDetail, siteHistoricalHealth?.successRate);
       const stableFirstSuccessRateText = `${(stableFirstSuccessRate * 100).toFixed(1)}%`;
-      const stableSiteOrder = this.getStableFirstSiteOrder(candidates, candidate.site.id);
-      const reasonPrefix = selectionMode === 'stable_first'
-        ? (
+      const stickyState = stableFirstRotationKey ? stableFirstStickyChannelByKey.get(stableFirstRotationKey) : undefined;
+      const stickyProgressText = stickyState?.channelId === candidate.channel.id
+        ? `${Math.min(stickyState.successCount, STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD)}/${STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD}`
+        : `0/${STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD}`;
+	      const consecutiveFailText = `${Math.max(0, candidate.channel.consecutiveFailCount ?? 0)}/${STABLE_FIRST_FAILURE_THRESHOLD}`;
+	      const fallbackPenalty = cost?.source === 'fallback'
+	        ? 1 / Math.max(1, cost?.unitCost || 1)
+	        : 1;
+	      const scoreBreakdown = selectionMode === 'stable_first'
+	        ? buildStableFirstScoreBreakdown({
+	          probability,
+	          contribution: contributions[i],
+	          totalContribution,
+	          unitCost: Math.max(
+	            cost?.inputCostPerMillion || unitCost,
+	            MIN_EFFECTIVE_UNIT_COST,
+	          ),
+	          costSourceText,
+	          inputCostText,
+	          recentSuccessRate: siteRuntimeDetail.recentSuccessRate,
+	          recentSampleCount: siteRuntimeDetail.recentSampleCount,
+	          recentConfidence: siteRuntimeDetail.recentConfidence,
+	          historicalSuccessRateText,
+	          stableFirstSuccessRate,
+	          runtimeMultiplier: siteRuntimeDetail.combinedMultiplier,
+	          runtimeLoadText,
+	          runtimeLoadMultiplier,
+	          siteChannels,
+	          consecutiveFailText,
+	          stickyProgressText,
+	        })
+	        : buildWeightedScoreBreakdown({
+	          mode: selectionMode,
+	          probability,
+	          contribution: contributions[i],
+	          totalContribution,
+	          weight,
+	          unitCost,
+	          costSourceText,
+	          inputCostText,
+	          valueScore: valueScores[i],
+	          normalizedValueScore: normalizedVS[i],
+	          baseContribution: baseContributions[i],
+	          baseWeightFactor,
+	          valueScoreFactor,
+	          costWeight,
+	          balanceWeight,
+	          usageWeight,
+	          balance: candidate.account.balance || 0,
+	          recentUsage: Math.max(((candidate.channel.successCount ?? 0) + (candidate.channel.failCount ?? 0)), 1),
+	          siteChannels,
+	          combinedSiteWeight,
+	          runtimeMultiplier: siteRuntimeDetail.combinedMultiplier,
+	          runtimeLoadText,
+	          runtimeLoadMultiplier,
+	          historicalMultiplier: siteHistoricalMultiplier,
+	          historicalSuccessRateText,
+	          historicalLatencyText,
+	          historicalSampleCount: siteHistoricalHealth?.totalCalls ?? 0,
+	          fallbackPenalty,
+	        });
+	      const reasonPrefix = selectionMode === 'stable_first'
+	        ? (
           candidates.length === 1
             ? '稳定优先（唯一可用候选'
-            : `稳定优先（综合评分第 ${rankByIndex.get(i) ?? 1} / ${candidates.length}`
+            : `稳定优先（低价排序第 ${rankByIndex.get(i) ?? 1} / ${candidates.length}`
         )
         : (
           candidates.length === 1
             ? '按权重随机（唯一可用候选'
             : '按权重随机'
         );
-      const stablePoolText = selectionMode === 'stable_first'
-        ? `，轮询顺位=P${stableSiteOrder}`
-        : '';
       return {
-        candidate,
-        probability,
-        reason: selectionMode === 'stable_first'
-          ? `${reasonPrefix}，近期成功率=${recentSuccessRateText}（样本=${siteRuntimeDetail.recentSampleCount.toFixed(2)}，置信=${siteRuntimeDetail.recentConfidence.toFixed(2)}），回退成功率=${historicalSuccessRateText}，综合近期成功率=${stableFirstSuccessRateText}，运行时健康=${runtimeHealthText}，会话负载=${runtimeLoadText}，同站点通道=${siteChannels}${stablePoolText}，评分占比≈${(probability * 100).toFixed(1)}%）`
+	        candidate,
+	        probability,
+	        scoreBreakdown,
+	        reason: selectionMode === 'stable_first'
+          ? `${reasonPrefix}，成本=${costSourceText}:${(cost?.unitCost || 1).toFixed(6)}，输入/M=${inputCostText}，连续失败=${consecutiveFailText}，粘性成功=${stickyProgressText}，近期成功率=${recentSuccessRateText}（样本=${siteRuntimeDetail.recentSampleCount.toFixed(2)}，置信=${siteRuntimeDetail.recentConfidence.toFixed(2)}），回退成功率=${historicalSuccessRateText}，综合近期成功率=${stableFirstSuccessRateText}，运行时健康=${runtimeHealthText}，会话负载=${runtimeLoadText}，同站点通道=${siteChannels}，评分占比≈${(probability * 100).toFixed(1)}%）`
           : (
             candidates.length === 1
               ? `${reasonPrefix}，W=${weight}，成本=${costSourceText}:${(cost?.unitCost || 1).toFixed(6)}，站点权重=${siteGlobalWeight.toFixed(2)}x下游倍率=${normalizedDownstreamSiteMultiplier.toFixed(2)}=${combinedSiteWeight.toFixed(2)}，运行时健康=${runtimeHealthText}，会话负载=${runtimeLoadText}，历史健康=${siteHistoricalMultiplier.toFixed(2)}（成功率=${historicalSuccessRateText}，均延迟=${historicalLatencyText}，样本=${siteHistoricalHealth?.totalCalls ?? 0}），同站点通道=${siteChannels}，概率≈${(probability * 100).toFixed(1)}%）`
@@ -3775,24 +4136,17 @@ export class TokenRouter {
     rankedIndices: number[],
     stableFirstRotationKey?: string,
   ): RouteChannelCandidate | null {
-    const stableSiteLeaderIndices = this.getStableFirstSiteLeaderIndices(candidates, contributions, rankedIndices);
-    if (stableSiteLeaderIndices.length <= 0) return candidates[rankedIndices[0] ?? 0] ?? null;
+    if (stableFirstRotationKey) {
+      const stickyState = stableFirstStickyChannelByKey.get(stableFirstRotationKey);
+      if (stickyState && stickyState.successCount < STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD) {
+        const stickyCandidate = candidates.find((candidate) => candidate.channel.id === stickyState.channelId);
+        if (stickyCandidate) {
+          return stickyCandidate;
+        }
+      }
+    }
 
-    const orderedSiteLeaderIndices = this.getStableFirstOrderedSiteLeaderIndices(candidates, stableSiteLeaderIndices);
-    const lastSelectedSiteId = stableFirstRotationKey
-      ? stableFirstLastSelectedSiteByKey.get(stableFirstRotationKey)
-      : undefined;
-    const lastSelectedIndex = typeof lastSelectedSiteId === 'number'
-      ? orderedSiteLeaderIndices.findIndex((index) => candidates[index]?.site.id === lastSelectedSiteId)
-      : -1;
-    const selectedSiteLeader = orderedSiteLeaderIndices[lastSelectedIndex >= 0
-      ? ((lastSelectedIndex + 1) % orderedSiteLeaderIndices.length)
-      : 0];
-    if (selectedSiteLeader == null) return candidates[rankedIndices[0] ?? 0] ?? null;
-
-    const selectedSiteId = candidates[selectedSiteLeader]?.site.id;
-    const topSiteCandidateIndex = rankedIndices.find((index) => candidates[index]?.site.id === selectedSiteId);
-    return topSiteCandidateIndex == null ? (candidates[selectedSiteLeader] ?? null) : (candidates[topSiteCandidateIndex] ?? null);
+    return candidates[rankedIndices[0] ?? 0] ?? null;
   }
 }
 

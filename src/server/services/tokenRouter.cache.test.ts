@@ -849,6 +849,69 @@ describe('TokenRouter runtime cache', () => {
     expect(current?.cooldownUntil).toBeNull();
   });
 
+  it('applies staged cooldowns for stable first after every five consecutive failures', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'stable-first-cooldown-site',
+      url: 'https://stable-first-cooldown-site.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'stable-first-cooldown-user',
+      accessToken: 'stable-first-cooldown-access-token',
+      apiToken: 'stable-first-cooldown-api-token',
+      status: 'active',
+    }).returning().get();
+
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'stable-first-cooldown-token',
+      token: 'sk-stable-first-cooldown-token',
+      enabled: true,
+      isDefault: true,
+    }).returning().get();
+
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5-stable-first-cooldown',
+      routingStrategy: 'stable_first',
+      enabled: true,
+    }).returning().get();
+
+    const channel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: account.id,
+      tokenId: token.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+
+    const router = new TokenRouter();
+
+    for (let index = 0; index < 4; index += 1) {
+      await router.recordFailure(channel.id);
+    }
+    let current = await db.select().from(schema.routeChannels)
+      .where(eq(schema.routeChannels.id, channel.id))
+      .get();
+    expect(current?.cooldownUntil).toBeNull();
+    expect(current?.consecutiveFailCount).toBe(4);
+    expect(current?.cooldownLevel).toBe(0);
+
+    const startedAt = Date.now();
+    await router.recordFailure(channel.id);
+    current = await db.select().from(schema.routeChannels)
+      .where(eq(schema.routeChannels.id, channel.id))
+      .get();
+    const cooldownMs = Date.parse(String(current?.cooldownUntil || '')) - startedAt;
+    expect(current?.consecutiveFailCount).toBe(0);
+    expect(current?.cooldownLevel).toBe(1);
+    expect(cooldownMs).toBeGreaterThanOrEqual(9 * 60 * 1000);
+    expect(cooldownMs).toBeLessThanOrEqual(11 * 60 * 1000);
+  });
+
   it('caps weighted cooldowns before Date overflow for heavily failed channels', async () => {
     const site = await db.insert(schema.sites).values({
       name: 'weighted-cooldown-cap-site',

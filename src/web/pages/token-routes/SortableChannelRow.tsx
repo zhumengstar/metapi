@@ -1,6 +1,9 @@
-import { useState, type CSSProperties } from 'react';
+import { useEffect, useState, type CSSProperties, type MouseEvent } from 'react';
+import { createPortal } from 'react-dom';
 import ModernSelect from '../../components/ModernSelect.js';
-import type { SortableChannelRowProps } from './types.js';
+import { formatDateTimeLocal } from '../helpers/checkinLogTime.js';
+import { isImageGenerationModel } from '../../utils/modelType.js';
+import type { RouteChannelModelTestResult, SortableChannelRowProps } from './types.js';
 import {
   buildFixedTokenOptionDescription,
   buildFixedTokenOptionLabel,
@@ -8,6 +11,7 @@ import {
   resolveTokenBindingConnectionMode,
 } from './tokenBindingPresentation.js';
 import { getChannelDecisionState, getPriorityTagStyle, getProbabilityColor } from './utils.js';
+import type { RouteDecisionScoreBreakdownRow } from '../../../shared/tokenRouteContract.js';
 
 function getRouteUnitStrategyLabel(strategy: string | null | undefined): string {
   return strategy === 'stick_until_unavailable' ? '单个用到不可用再切' : '轮询';
@@ -17,6 +21,89 @@ function formatRouteUnitMemberLabel(member: { accountId: number; username: strin
   const accountLabel = member.username?.trim() || `account-${member.accountId}`;
   const siteLabel = member.siteName?.trim();
   return siteLabel ? `${accountLabel} @ ${siteLabel}` : accountLabel;
+}
+
+function formatCompactCost(value: number | null | undefined): string {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount <= 0) return '0';
+  if (amount >= 1000) return amount.toFixed(0);
+  if (amount >= 1) return amount.toFixed(2);
+  if (amount >= 0.01) return amount.toFixed(4);
+  return amount.toFixed(6);
+}
+
+function formatInputCostPerMillion(value: number | null | undefined): string {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount <= 0) return '--';
+  return formatCompactCost(amount);
+}
+
+type ModelTestTooltipRow = {
+  label: string;
+  value: string | number | null | undefined;
+  tone?: 'success' | 'warning' | 'error' | 'muted';
+};
+
+type ModelTestTooltipState = {
+  left: number;
+  top: number;
+  rows: ModelTestTooltipRow[];
+};
+
+const MODEL_TEST_TOOLTIP_WIDTH = 300;
+const MODEL_TEST_TOOLTIP_OFFSET = 12;
+
+function buildModelTestRows(
+  modelName: string,
+  result: RouteChannelModelTestResult | null | undefined,
+): ModelTestTooltipRow[] {
+  if (!result) {
+    return [
+      { label: '模型', value: modelName || '-', tone: 'muted' },
+      { label: '结果', value: '未测试', tone: 'muted' },
+    ];
+  }
+  const checkedAt = result.checkedAt ? formatDateTimeLocal(result.checkedAt) : '';
+  return [
+    { label: '模型', value: result.model || modelName || '-' },
+    { label: '结果', value: result.available ? '可用' : '不可用', tone: result.available ? 'success' : 'error' },
+    { label: result.available ? '说明' : '上游报错', value: result.message || '', tone: result.available ? undefined : 'error' },
+    { label: '模型答复', value: result.responseText || '' },
+    { label: 'HTTP', value: result.httpStatus == null ? '' : result.httpStatus },
+    { label: '耗时', value: Number.isFinite(Number(result.latencyMs)) ? `${result.latencyMs}ms` : '' },
+    { label: '检测时间', value: checkedAt },
+  ];
+}
+
+function getTooltipRowColor(tone: ModelTestTooltipRow['tone']): string {
+  if (tone === 'success') return 'var(--color-success)';
+  if (tone === 'warning') return 'var(--color-warning)';
+  if (tone === 'error') return 'var(--color-danger)';
+  if (tone === 'muted') return 'var(--color-text-muted)';
+  return 'var(--color-text-primary)';
+}
+
+function getDecisionBreakdownToneColor(tone: RouteDecisionScoreBreakdownRow['tone']): string {
+  if (tone === 'positive') return 'var(--color-success)';
+  if (tone === 'warning') return 'var(--color-warning)';
+  if (tone === 'negative') return 'var(--color-danger)';
+  if (tone === 'muted') return 'var(--color-text-muted)';
+  return 'var(--color-text-primary)';
+}
+
+function buildFallbackDecisionBreakdown(reason: string): RouteDecisionScoreBreakdownRow[] {
+  const trimmed = String(reason || '').trim();
+  if (!trimmed) return [];
+  return [
+    {
+      metric: '说明',
+      value: trimmed,
+      formula: '后端未返回结构化计算明细',
+      weight: '--',
+      contribution: '--',
+      tone: 'muted',
+    },
+  ];
 }
 
 export function SortableChannelRow({
@@ -37,10 +124,15 @@ export function SortableChannelRow({
   tokenOptions,
   activeTokenId,
   isUpdatingToken,
+  modelName,
+  testingModel = false,
+  modelTestResult = null,
   onTokenDraftChange,
   onSaveToken,
   onDeleteChannel,
   onToggleEnabled,
+  onToggleImageUpscale,
+  onTestModel,
   onSiteBlockModel,
 }: SortableChannelRowProps) {
   const resolvedPriority = displayPriority ?? channel.priority ?? 0;
@@ -88,6 +180,19 @@ export function SortableChannelRow({
   };
 
   const decisionState = getChannelDecisionState(decisionCandidate, channel, isExactRoute, loadingDecision);
+  const decisionReasonText = decisionCandidate?.reason || decisionState.reasonText || '';
+  const decisionReasonTooltip = suppressTooltips
+    ? undefined
+    : (decisionReasonText || undefined);
+  const decisionBreakdown = decisionCandidate?.scoreBreakdown ?? null;
+  const decisionBreakdownRows = decisionBreakdown?.rows?.length
+    ? decisionBreakdown.rows
+    : buildFallbackDecisionBreakdown(decisionReasonText);
+  const actualTotalCost = channel.actualTotalCost ?? channel.totalCost ?? 0;
+  const inputCostPerMillion = channel.inputCostPerMillion ?? null;
+  const costStatsTooltip = suppressTooltips
+    ? undefined
+    : `余额实际消耗：${formatCompactCost(actualTotalCost)}；输入 token：${channel.totalInputTokens || 0}；每 M 输入成本：${formatInputCostPerMillion(inputCostPerMillion)}`;
   const tokenBinding = describeTokenBinding(
     tokenOptions,
     activeTokenId,
@@ -104,6 +209,288 @@ export function SortableChannelRow({
     ? routeUnit.members.map((member) => formatRouteUnitMemberLabel(member)).join('、')
     : null;
   const routeUnitMemberSummaryText = routeUnitMemberSummary ? `成员：${routeUnitMemberSummary}` : null;
+  const channelEnabled = channel.enabled !== false;
+  const canToggleChannelStatus = !managementLocked && !isUpdatingToken;
+  const channelStatusText = channelEnabled ? '已启用' : '已禁用';
+  const channelStatusActionText = channelEnabled ? '点击禁用此通道' : '点击启用此通道';
+  const channelStatusButtonStyle: CSSProperties = {
+    fontSize: 8.5,
+    border: 0,
+    appearance: 'none',
+    lineHeight: 1.2,
+    padding: '2px 6px',
+    cursor: canToggleChannelStatus ? 'pointer' : 'not-allowed',
+    opacity: canToggleChannelStatus ? 1 : 0.72,
+  };
+  const renderChannelStatusToggle = () => (
+    <button
+      type="button"
+      className={channelEnabled ? 'badge badge-success' : 'badge badge-muted'}
+      style={channelStatusButtonStyle}
+      disabled={!canToggleChannelStatus}
+      onClick={(event) => {
+        event.stopPropagation();
+        if (!canToggleChannelStatus) return;
+        onToggleEnabled(!channelEnabled);
+      }}
+      data-tooltip={suppressTooltips ? undefined : (canToggleChannelStatus ? channelStatusActionText : '该通道当前不可编辑')}
+      aria-label={channelStatusActionText}
+    >
+      {channelStatusText}
+    </button>
+  );
+  const resolvedModelName = String(modelName || channel.sourceModel || '').trim();
+  const imageRouteModel = isImageGenerationModel(resolvedModelName);
+  const imageUpscaleEnabled = channel.imageUpscaleEnabled === true;
+  const canToggleImageUpscale = imageRouteModel && Boolean(onToggleImageUpscale) && !managementLocked && !isUpdatingToken;
+  const canTestModel = Boolean(onTestModel && resolvedModelName && Number(channel.accountId || 0) > 0);
+  const testModelBadgeClass = testingModel
+    ? 'badge badge-info'
+    : modelTestResult
+      ? (modelTestResult.available ? 'badge badge-success' : 'badge badge-info')
+      : 'badge badge-muted';
+  const testModelText = testingModel ? '测试中' : '测模型';
+  const [modelTestTooltip, setModelTestTooltip] = useState<ModelTestTooltipState | null>(null);
+  const showModelTestTooltip = (event: MouseEvent<HTMLElement>) => {
+    if (suppressTooltips) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+    const left = Math.min(
+      Math.max(MODEL_TEST_TOOLTIP_OFFSET, rect.right - MODEL_TEST_TOOLTIP_WIDTH),
+      Math.max(MODEL_TEST_TOOLTIP_OFFSET, viewportWidth - MODEL_TEST_TOOLTIP_WIDTH - MODEL_TEST_TOOLTIP_OFFSET),
+    );
+    setModelTestTooltip({
+      left,
+      top: rect.bottom + MODEL_TEST_TOOLTIP_OFFSET,
+      rows: buildModelTestRows(resolvedModelName, modelTestResult),
+    });
+  };
+  const hideModelTestTooltip = () => setModelTestTooltip(null);
+  const renderModelTestButton = () => (
+    <button
+      type="button"
+      className={`${testModelBadgeClass} token-availability-badge`}
+      style={{
+        fontSize: 8.5,
+        border: 0,
+        appearance: 'none',
+        lineHeight: 1.2,
+        padding: '2px 6px',
+        cursor: canTestModel && !testingModel ? 'pointer' : 'not-allowed',
+        opacity: canTestModel ? 1 : 0.68,
+      }}
+      disabled={!canTestModel || testingModel}
+      onClick={(event) => {
+        event.stopPropagation();
+        if (!canTestModel || testingModel) return;
+        onTestModel?.();
+      }}
+      onMouseEnter={showModelTestTooltip}
+      onMouseLeave={hideModelTestTooltip}
+      onFocus={(event) => showModelTestTooltip(event as unknown as MouseEvent<HTMLElement>)}
+      onBlur={hideModelTestTooltip}
+      data-tooltip={suppressTooltips ? undefined : (canTestModel ? undefined : '缺少可测试的账号或模型')}
+      aria-label={resolvedModelName ? `手动测试模型 ${resolvedModelName}` : '手动测试模型'}
+    >
+      {testingModel ? <span className="spinner spinner-sm" /> : null}
+      {testModelText}
+    </button>
+  );
+  const renderImageUpscaleToggle = () => {
+    if (!imageRouteModel || !onToggleImageUpscale) return null;
+    const actionText = imageUpscaleEnabled ? '关闭图片超分' : '开启图片超分';
+    return (
+      <button
+        type="button"
+        className={imageUpscaleEnabled ? 'badge badge-info' : 'badge badge-muted'}
+        style={{
+          fontSize: 8.5,
+          border: 0,
+          appearance: 'none',
+          lineHeight: 1.2,
+          padding: '2px 6px',
+          cursor: canToggleImageUpscale ? 'pointer' : 'not-allowed',
+          opacity: canToggleImageUpscale ? 1 : 0.68,
+        }}
+        disabled={!canToggleImageUpscale}
+        onClick={(event) => {
+          event.stopPropagation();
+          if (!canToggleImageUpscale) return;
+          onToggleImageUpscale(!imageUpscaleEnabled);
+        }}
+        data-tooltip={suppressTooltips ? undefined : `${actionText}。仅图片模型生效，只有请求尺寸需要放大时才处理。`}
+        aria-label={actionText}
+      >
+        {imageUpscaleEnabled ? '超分开' : '超分关'}
+      </button>
+    );
+  };
+  const renderChannelStatusActions = () => (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+      {renderChannelStatusToggle()}
+      {renderModelTestButton()}
+      {renderImageUpscaleToggle()}
+    </span>
+  );
+
+  useEffect(() => {
+    if (!modelTestTooltip) return undefined;
+    const hide = () => setModelTestTooltip(null);
+    window.addEventListener('scroll', hide, true);
+    window.addEventListener('resize', hide);
+    return () => {
+      window.removeEventListener('scroll', hide, true);
+      window.removeEventListener('resize', hide);
+    };
+  }, [modelTestTooltip]);
+
+  const renderModelTestTooltip = () => {
+    if (!modelTestTooltip || typeof document === 'undefined') return null;
+    return createPortal(
+      <div
+        className="token-availability-tooltip token-availability-tooltip-portal"
+        style={{
+          left: modelTestTooltip.left,
+          top: modelTestTooltip.top,
+          width: MODEL_TEST_TOOLTIP_WIDTH,
+        }}
+      >
+        {modelTestTooltip.rows
+          .filter((row) => row.value !== undefined && row.value !== null && String(row.value).trim() !== '')
+	          .map((row, index) => (
+	            <span key={`${row.label}-${index}`} className="token-availability-tooltip-row">
+	              <span className="token-availability-tooltip-label">{row.label}</span>
+	              <span
+	                className={`token-availability-tooltip-value ${row.tone ? `is-${row.tone}` : ''}`.trim()}
+	                style={{ color: getTooltipRowColor(row.tone) }}
+	              >
+	                {row.value}
+	              </span>
+	            </span>
+	          ))}
+      </div>,
+      document.body,
+    );
+  };
+
+  const renderDecisionFormula = (compactFormula: boolean) => {
+    if (!decisionReasonText && decisionBreakdownRows.length === 0) return null;
+    const visibleRows = decisionBreakdownRows.slice(0, compactFormula ? 4 : 6);
+    const hiddenCount = Math.max(0, decisionBreakdownRows.length - visibleRows.length);
+    const strategyLabel = decisionBreakdown?.strategy === 'stable_first'
+      ? '稳定优先'
+      : (decisionBreakdown?.strategy === 'round_robin' ? '轮询' : '权重计算');
+    return (
+      <div
+        data-tooltip={decisionReasonTooltip}
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'minmax(0, 1fr)',
+          gap: 5,
+          marginLeft: compactFormula ? undefined : 'auto',
+          width: compactFormula ? '100%' : 'min(100%, 760px)',
+          minWidth: compactFormula ? 0 : 420,
+          padding: '6px 7px',
+          borderRadius: 10,
+          border: '1px solid color-mix(in srgb, var(--color-border-light) 88%, transparent)',
+          background: 'color-mix(in srgb, var(--color-bg-card) 88%, var(--color-info-soft) 12%)',
+          color: decisionState.reasonColor,
+          lineHeight: 1.35,
+          overflow: 'hidden',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 10.5, fontWeight: 800, color: 'var(--color-text-primary)', whiteSpace: 'nowrap' }}>
+            计算公式
+          </span>
+          <span className="badge badge-info" style={{ fontSize: 9.5, padding: '1px 5px' }}>
+            {strategyLabel}
+          </span>
+          {decisionBreakdown ? (
+            <span style={{ fontSize: 10, color: 'var(--color-text-muted)', minWidth: 0 }}>
+              概率 = {(decisionBreakdown.probability * 100).toFixed(1)}%，贡献 {decisionBreakdown.contribution.toFixed(4)} / {decisionBreakdown.totalContribution.toFixed(4)}
+            </span>
+          ) : null}
+        </div>
+        {decisionBreakdown?.formula ? (
+          <div
+            style={{
+              fontSize: 10,
+              color: 'var(--color-text-muted)',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {decisionBreakdown.formula}
+          </div>
+        ) : null}
+        <div
+          style={{
+            overflowX: 'auto',
+            borderRadius: 8,
+            border: '1px solid color-mix(in srgb, var(--color-border-light) 74%, transparent)',
+            background: 'color-mix(in srgb, var(--color-bg-card) 92%, white 8%)',
+          }}
+        >
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: compactFormula
+                ? 'minmax(70px, 0.8fr) minmax(92px, 1fr) minmax(110px, 1.1fr) minmax(72px, 0.8fr) minmax(78px, 0.8fr)'
+                : 'minmax(78px, 0.8fr) minmax(110px, 1fr) minmax(180px, 1.6fr) minmax(92px, 0.8fr) minmax(110px, 0.9fr)',
+              minWidth: compactFormula ? 560 : 680,
+              alignItems: 'stretch',
+              fontSize: 10,
+            }}
+          >
+            {['指标', '当前值', '计算方式', '权重/乘数', '贡献'].map((label) => (
+              <span
+                key={label}
+                style={{
+                  padding: '4px 6px',
+                  fontWeight: 800,
+                  color: 'var(--color-text-muted)',
+                  borderBottom: '1px solid color-mix(in srgb, var(--color-border-light) 74%, transparent)',
+                  background: 'color-mix(in srgb, var(--color-bg-muted) 68%, transparent)',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {label}
+              </span>
+            ))}
+            {visibleRows.map((row, index) => {
+              const rowKey = `${row.metric}-${row.value}-${index}`;
+              const rowColor = getDecisionBreakdownToneColor(row.tone);
+              const cellBase: CSSProperties = {
+                padding: '4px 6px',
+                minWidth: 0,
+                borderTop: index === 0 ? 0 : '1px solid color-mix(in srgb, var(--color-border-light) 62%, transparent)',
+                color: 'var(--color-text-secondary)',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              };
+              return (
+                <div key={rowKey} style={{ display: 'contents' }}>
+                  <span style={{ ...cellBase, color: rowColor, fontWeight: 700 }}>{row.metric}</span>
+                  <span style={cellBase}>{row.value}</span>
+                  <span style={cellBase}>{row.formula}</span>
+                  <span style={{ ...cellBase, color: rowColor, fontVariantNumeric: 'tabular-nums' }}>{row.weight}</span>
+                  <span style={{ ...cellBase, fontVariantNumeric: 'tabular-nums' }}>{row.contribution}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+        {hiddenCount > 0 ? (
+          <span style={{ fontSize: 10, color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>
+            还有 {hiddenCount} 项，悬浮可查看完整原因
+          </span>
+        ) : null}
+      </div>
+    );
+  };
 
   const [mobileDetailsOpen, setMobileDetailsOpen] = useState(false);
 
@@ -158,7 +545,14 @@ export function SortableChannelRow({
                 {channel.site?.name || 'unknown'}
               </span>
 
-              <span style={{ fontSize: 11, color: 'var(--color-text-muted)', marginLeft: 'auto' }}>
+              <span
+                style={{ fontSize: 11, color: 'var(--color-text-muted)', marginLeft: 'auto' }}
+                data-tooltip={costStatsTooltip}
+              >
+                消耗 <span style={{ color: 'var(--color-text-primary)', fontWeight: 600 }}>{formatCompactCost(actualTotalCost)}</span>
+                <span style={{ color: 'var(--color-text-muted)', margin: '0 5px' }}>·</span>
+                输入/M <span style={{ color: 'var(--color-text-primary)', fontWeight: 600 }}>{formatInputCostPerMillion(inputCostPerMillion)}</span>
+                <span style={{ color: 'var(--color-text-muted)', margin: '0 5px' }}>·</span>
                 成功/失败 <span style={{ color: 'var(--color-success)', fontWeight: 600 }}>{channel.successCount || 0}</span>
                 <span style={{ color: 'var(--color-text-muted)', margin: '0 2px' }}>/</span>
                 <span style={{ color: 'var(--color-danger)', fontWeight: 600 }}>{channel.failCount || 0}</span>
@@ -211,6 +605,8 @@ export function SortableChannelRow({
                 </span>
               ) : null}
 
+              {renderChannelStatusActions()}
+
               {routeUnit ? (
                 <>
                   <span className="badge badge-muted" style={{ fontSize: 10 }}>
@@ -244,7 +640,7 @@ export function SortableChannelRow({
               <span style={{ fontSize: 11, color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>选中概率</span>
               <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, minWidth: 96 }}>
                 <div
-                  data-tooltip={suppressTooltips ? undefined : (decisionState.probability <= 0 ? decisionState.reasonText : undefined)}
+                  data-tooltip={decisionReasonTooltip}
                   style={{
                     width: 60,
                     height: 4,
@@ -264,7 +660,7 @@ export function SortableChannelRow({
                   />
                 </div>
                 <span
-                  data-tooltip={suppressTooltips ? undefined : (decisionState.probability <= 0 ? decisionState.reasonText : undefined)}
+                  data-tooltip={decisionReasonTooltip}
                   style={{
                     fontSize: 11,
                     color: decisionState.probability > 0 ? 'var(--color-text-secondary)' : decisionState.reasonColor,
@@ -274,6 +670,9 @@ export function SortableChannelRow({
                 >
                   {decisionState.probability.toFixed(1)}%
                 </span>
+              </div>
+              <div style={{ minWidth: 0, flexBasis: '100%' }}>
+                {renderDecisionFormula(true)}
               </div>
 
               {!managementLocked && (
@@ -325,14 +724,7 @@ export function SortableChannelRow({
                     {isUpdatingToken ? <span className="spinner spinner-sm" /> : '保存'}
                   </button>
 
-                  <button
-                    onClick={() => onToggleEnabled(channel.enabled === false)}
-                    className={`btn btn-link ${channel.enabled === false ? 'btn-link-info' : 'btn-link-warning'}`}
-                  >
-                    {channel.enabled === false ? '启用' : '禁用'}
-                  </button>
-
-                  {onSiteBlockModel && channel.site?.id ? (
+	                  {onSiteBlockModel && channel.site?.id ? (
                     <button
                       onClick={onSiteBlockModel}
                       className="btn btn-link btn-link-warning"
@@ -352,6 +744,7 @@ export function SortableChannelRow({
             )}
           </div>
         </div>
+        {renderModelTestTooltip()}
       </div>
     );
   }
@@ -446,9 +839,7 @@ export function SortableChannelRow({
           </span>
         ) : null}
 
-        {channel.enabled === false ? (
-          <span className="badge badge-muted" style={{ fontSize: 10 }}>已禁用</span>
-        ) : null}
+        {renderChannelStatusActions()}
 
         {routeUnit ? (
           <>
@@ -482,7 +873,7 @@ export function SortableChannelRow({
           <span style={{ fontSize: 11, color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>选中概率</span>
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, minWidth: 96 }}>
             <div
-              data-tooltip={suppressTooltips ? undefined : (decisionState.probability <= 0 ? decisionState.reasonText : undefined)}
+              data-tooltip={decisionReasonTooltip}
               style={{
                 width: 60,
                 height: 4,
@@ -502,7 +893,7 @@ export function SortableChannelRow({
               />
             </div>
             <span
-              data-tooltip={suppressTooltips ? undefined : (decisionState.probability <= 0 ? decisionState.reasonText : undefined)}
+              data-tooltip={decisionReasonTooltip}
               style={{
                 fontSize: 11,
                 color: decisionState.probability > 0 ? 'var(--color-text-secondary)' : decisionState.reasonColor,
@@ -513,7 +904,26 @@ export function SortableChannelRow({
               {decisionState.probability.toFixed(1)}%
             </span>
           </div>
+          {renderDecisionFormula(false)}
 
+          <span
+            style={{ fontSize: 11, color: 'var(--color-text-muted)' }}
+            data-tooltip={costStatsTooltip}
+          >
+            消耗
+          </span>
+          <span style={{ fontSize: 11, color: 'var(--color-text-primary)', fontWeight: 600 }}>
+            {formatCompactCost(actualTotalCost)}
+          </span>
+          <span
+            style={{ fontSize: 11, color: 'var(--color-text-muted)' }}
+            data-tooltip={costStatsTooltip}
+          >
+            输入/M
+          </span>
+          <span style={{ fontSize: 11, color: 'var(--color-text-primary)', fontWeight: 600 }}>
+            {formatInputCostPerMillion(inputCostPerMillion)}
+          </span>
           <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>成功/失败</span>
           <span style={{ fontSize: 11 }}>
             <span style={{ color: 'var(--color-success)', fontWeight: 600 }}>{channel.successCount || 0}</span>
@@ -571,14 +981,7 @@ export function SortableChannelRow({
               {isUpdatingToken ? <span className="spinner spinner-sm" /> : '保存'}
             </button>
 
-            <button
-              onClick={() => onToggleEnabled(channel.enabled === false)}
-              className={`btn btn-link ${channel.enabled === false ? 'btn-link-info' : 'btn-link-warning'}`}
-              data-tooltip={suppressTooltips ? undefined : (channel.enabled === false ? '启用此通道' : '禁用此通道')}
-            >
-              {channel.enabled === false ? '启用' : '禁用'}
-            </button>
-          </div>
+	          </div>
 
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 3, flexWrap: 'wrap', minHeight: 32 }}>
             {onSiteBlockModel && channel.site?.id ? (
@@ -600,6 +1003,7 @@ export function SortableChannelRow({
           </div>
         </div>
       ) : null}
+      {renderModelTestTooltip()}
     </div>
   );
 }

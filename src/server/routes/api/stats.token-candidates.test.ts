@@ -15,6 +15,15 @@ vi.mock('../../services/modelPricingService.js', async () => {
 
 type DbModule = typeof import('../../db/index.js');
 
+function manualTokenModelSuccess() {
+  return {
+    available: true,
+    message: '请求成功',
+    httpStatus: 200,
+    responseText: 'OK',
+  };
+}
+
 describe('/api/models/token-candidates', () => {
   let app: FastifyInstance;
   let db: DbModule['db'];
@@ -93,7 +102,7 @@ describe('/api/models/token-candidates', () => {
     await db.insert(schema.tokenModelAvailability).values({
       tokenId: token.id,
       modelName: 'claude-haiku-4-5-20251001',
-      available: true,
+      ...manualTokenModelSuccess(),
     }).run();
 
     const response = await app.inject({
@@ -236,7 +245,7 @@ describe('/api/models/token-candidates', () => {
     await db.insert(schema.tokenModelAvailability).values({
       tokenId: defaultToken.id,
       modelName: 'claude-opus-4-6',
-      available: true,
+      ...manualTokenModelSuccess(),
     }).run();
 
     fetchModelPricingCatalogMock.mockResolvedValue({
@@ -318,7 +327,7 @@ describe('/api/models/token-candidates', () => {
     await db.insert(schema.tokenModelAvailability).values({
       tokenId: token.id,
       modelName: 'claude-sonnet-4-5-20250929',
-      available: true,
+      ...manualTokenModelSuccess(),
     }).run();
 
     fetchModelPricingCatalogMock.mockResolvedValue({
@@ -399,7 +408,7 @@ describe('/api/models/token-candidates', () => {
     await db.insert(schema.tokenModelAvailability).values({
       tokenId: token.id,
       modelName: 'gpt-5.2-codex',
-      available: true,
+      ...manualTokenModelSuccess(),
     }).run();
 
     fetchModelPricingCatalogMock.mockResolvedValue({
@@ -464,7 +473,7 @@ describe('/api/models/token-candidates', () => {
     await db.insert(schema.tokenModelAvailability).values({
       tokenId: token.id,
       modelName: 'claude-opus-4-5-20251101',
-      available: true,
+      ...manualTokenModelSuccess(),
     }).run();
 
     fetchModelPricingCatalogMock.mockResolvedValue({
@@ -549,7 +558,7 @@ describe('/api/models/token-candidates', () => {
     await db.insert(schema.tokenModelAvailability).values({
       tokenId: token.id,
       modelName: 'claude-opus-4-6',
-      available: true,
+      ...manualTokenModelSuccess(),
     }).run();
 
     fetchModelPricingCatalogMock.mockResolvedValue({

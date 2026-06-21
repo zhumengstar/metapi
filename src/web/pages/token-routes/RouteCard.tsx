@@ -23,10 +23,11 @@ import ModernSelect from '../../components/ModernSelect.js';
 import { tr } from '../../i18n.js';
 import { formatDateTimeMinuteLocal } from '../helpers/checkinLogTime.js';
 import type {
-  RouteSummaryRow,
-  RouteChannel,
-  RouteChannelRouteUnit,
-  RouteDecision,
+	  RouteSummaryRow,
+	  RouteChannel,
+	  RouteChannelRouteUnit,
+	  RouteChannelModelTestResult,
+	  RouteDecision,
   RouteDecisionCandidate,
   MissingTokenRouteSiteActionItem,
   MissingTokenGroupRouteSiteActionItem,
@@ -82,11 +83,15 @@ type RouteCardProps = {
   candidateView: RouteCandidateView;
   channelTokenDraft: Record<number, number>;
   updatingChannel: Record<number, boolean>;
+  testingChannelModel?: Record<number, boolean>;
+  channelModelTestResults?: Record<number, RouteChannelModelTestResult | undefined>;
   savingPriority: boolean;
   onTokenDraftChange: (channelId: number, tokenId: number) => void;
   onSaveToken: (routeId: number, channelId: number, accountId: number) => void;
   onDeleteChannel: (channelId: number, routeId: number) => void;
   onToggleChannelEnabled: (channelId: number, routeId: number, enabled: boolean) => void;
+  onToggleChannelImageUpscale?: (channelId: number, routeId: number, enabled: boolean) => void;
+  onTestChannelModel?: (routeId: number, channelId: number) => void;
   onChannelDragEnd: (routeId: number, event: DragEndEvent) => void;
   // Missing token hints
   missingTokenSiteItems: MissingTokenRouteSiteActionItem[];
@@ -103,6 +108,14 @@ type RouteCardProps = {
 
 function getRouteUnitStrategyLabel(strategy: string | null | undefined): string {
   return strategy === 'stick_until_unavailable' ? '单个用到不可用再切' : '轮询';
+}
+
+function formatRouteUsageCount(value: number | null | undefined): string {
+  const amount = Number(value || 0);
+  if (!Number.isFinite(amount) || amount <= 0) return '0';
+  if (amount >= 1_000_000) return `${(amount / 1_000_000).toFixed(amount >= 10_000_000 ? 1 : 2)}M`;
+  if (amount >= 1_000) return `${(amount / 1_000).toFixed(amount >= 10_000 ? 1 : 2)}K`;
+  return String(Math.round(amount));
 }
 
 function collectRouteUnits(channels: RouteChannel[] | undefined): RouteChannelRouteUnit[] {
@@ -363,6 +376,8 @@ type SortableChannelShellProps = {
   candidateView: RouteCandidateView;
   channelTokenDraft: Record<number, number>;
   updatingChannel: Record<number, boolean>;
+  testingChannelModel?: Record<number, boolean>;
+  channelModelTestResults?: Record<number, RouteChannelModelTestResult | undefined>;
   activeDragChannelId: number | null;
   decisionMap: Map<number, RouteDecisionCandidate>;
   exactRoute: boolean;
@@ -373,6 +388,8 @@ type SortableChannelShellProps = {
   onSaveToken: (routeId: number, channelId: number, accountId: number) => void;
   onDeleteChannel: (channelId: number, routeId: number) => void;
   onToggleChannelEnabled: (channelId: number, routeId: number, enabled: boolean) => void;
+  onToggleChannelImageUpscale?: (channelId: number, routeId: number, enabled: boolean) => void;
+  onTestChannelModel?: (routeId: number, channelId: number) => void;
   onSiteBlockModel: (channelId: number, routeId: number) => void;
   railLabel: string;
   mobileRailLabel: string;
@@ -393,6 +410,8 @@ function SortableChannelShell({
   candidateView,
   channelTokenDraft,
   updatingChannel,
+  testingChannelModel,
+  channelModelTestResults,
   activeDragChannelId,
   decisionMap,
   exactRoute,
@@ -403,6 +422,8 @@ function SortableChannelShell({
   onSaveToken,
   onDeleteChannel,
   onToggleChannelEnabled,
+  onToggleChannelImageUpscale,
+  onTestChannelModel,
   onSiteBlockModel,
   railLabel,
   mobileRailLabel,
@@ -523,10 +544,15 @@ function SortableChannelShell({
         tokenOptions={tokenOptions}
         activeTokenId={activeTokenId}
         isUpdatingToken={!!updatingChannel[channel.id]}
+        modelName={channel.sourceModel || undefined}
+        testingModel={!!testingChannelModel?.[channel.id]}
+        modelTestResult={channelModelTestResults?.[channel.id] || channel.modelTestResult || null}
         onTokenDraftChange={onTokenDraftChange}
         onSaveToken={() => onSaveToken(routeId, channel.id, channel.accountId)}
         onDeleteChannel={() => onDeleteChannel(channel.id, routeId)}
         onToggleEnabled={(enabled) => onToggleChannelEnabled(channel.id, routeId, enabled)}
+        onToggleImageUpscale={onToggleChannelImageUpscale ? (enabled) => onToggleChannelImageUpscale(channel.id, routeId, enabled) : undefined}
+        onTestModel={onTestChannelModel ? () => onTestChannelModel(routeId, channel.id) : undefined}
         onSiteBlockModel={channelManagementDisabled ? undefined : () => onSiteBlockModel(channel.id, routeId)}
       />
     </div>
@@ -553,14 +579,18 @@ function RouteCardInner({
   routeDecision,
   loadingDecision,
   candidateView,
-  channelTokenDraft,
-  updatingChannel,
-  savingPriority,
+	  channelTokenDraft,
+	  updatingChannel,
+	  testingChannelModel,
+	  channelModelTestResults,
+	  savingPriority,
   onTokenDraftChange,
   onSaveToken,
-  onDeleteChannel,
-  onToggleChannelEnabled,
-  onChannelDragEnd,
+	  onDeleteChannel,
+	  onToggleChannelEnabled,
+	  onToggleChannelImageUpscale,
+	  onTestChannelModel,
+	  onChannelDragEnd,
   missingTokenSiteItems,
   missingTokenGroupItems,
   onCreateTokenForMissing,
@@ -771,6 +801,13 @@ function RouteCardInner({
               {route.channelCount} {tr('通道')}
             </span>
           )}
+          <span
+            className="badge badge-muted"
+            style={{ fontSize: 10, flexShrink: 0 }}
+            data-tooltip={`成功请求数量：${Number(route.successCount || 0).toLocaleString()}`}
+          >
+            使用量 {formatRouteUsageCount(route.successCount)}
+          </span>
           {hasCachedDecisionSnapshot ? (
             <span
               className="badge badge-success"
@@ -866,6 +903,13 @@ function RouteCardInner({
                 {route.channelCount} {tr('通道')}
               </span>
             )}
+            <span
+              className="badge badge-muted"
+              style={{ fontSize: 10 }}
+              data-tooltip={`成功请求数量：${Number(route.successCount || 0).toLocaleString()}`}
+            >
+              使用量 {formatRouteUsageCount(route.successCount)}
+            </span>
             {hasCachedDecisionSnapshot ? (
               <span
                 className="badge badge-success"
@@ -946,6 +990,13 @@ function RouteCardInner({
               )}
               <span className="badge badge-info" style={{ fontSize: 10 }}>
                 {route.channelCount} {tr('通道')}
+              </span>
+              <span
+                className="badge badge-muted"
+                style={{ fontSize: 10 }}
+                data-tooltip={`成功请求数量：${Number(route.successCount || 0).toLocaleString()}`}
+              >
+                使用量 {formatRouteUsageCount(route.successCount)}
               </span>
               {hasCachedDecisionSnapshot ? (
                 <span
@@ -1201,6 +1252,8 @@ function RouteCardInner({
                             candidateView={candidateView}
                             channelTokenDraft={channelTokenDraft}
                             updatingChannel={updatingChannel}
+                            testingChannelModel={testingChannelModel}
+                            channelModelTestResults={channelModelTestResults}
                             activeDragChannelId={activeDragChannelId}
                             decisionMap={decisionMap}
                             exactRoute={exactRoute}
@@ -1211,6 +1264,8 @@ function RouteCardInner({
                             onSaveToken={onSaveToken}
                             onDeleteChannel={onDeleteChannel}
                             onToggleChannelEnabled={onToggleChannelEnabled}
+                            onToggleChannelImageUpscale={onToggleChannelImageUpscale}
+                            onTestChannelModel={onTestChannelModel}
                             onSiteBlockModel={onSiteBlockModel}
                             railLabel={railSection ? `P${bucketIndex} · ${railSection.channelCount}` : railLabel}
                             mobileRailLabel={mobileRailLabel}
@@ -1292,8 +1347,9 @@ function areRouteCardPropsEqual(prev: RouteCardProps, next: RouteCardProps): boo
     || prev.onTokenDraftChange !== next.onTokenDraftChange
     || prev.onSaveToken !== next.onSaveToken
     || prev.onDeleteChannel !== next.onDeleteChannel
-    || prev.onToggleChannelEnabled !== next.onToggleChannelEnabled
-    || prev.onChannelDragEnd !== next.onChannelDragEnd
+	    || prev.onToggleChannelEnabled !== next.onToggleChannelEnabled
+	    || prev.onTestChannelModel !== next.onTestChannelModel
+	    || prev.onChannelDragEnd !== next.onChannelDragEnd
     || prev.onCreateTokenForMissing !== next.onCreateTokenForMissing
     || prev.onAddChannel !== next.onAddChannel
     || prev.onSiteBlockModel !== next.onSiteBlockModel
@@ -1302,9 +1358,11 @@ function areRouteCardPropsEqual(prev: RouteCardProps, next: RouteCardProps): boo
     || prev.updatingRoutingStrategy !== next.updatingRoutingStrategy
     || prev.savingPriority !== next.savingPriority
     || prev.loadingChannels !== next.loadingChannels
-    || prev.loadingDecision !== next.loadingDecision
-    || prev.routeDecision !== next.routeDecision
-    || prev.candidateView !== next.candidateView
+	    || prev.loadingDecision !== next.loadingDecision
+	    || prev.routeDecision !== next.routeDecision
+	    || prev.testingChannelModel !== next.testingChannelModel
+	    || prev.channelModelTestResults !== next.channelModelTestResults
+	    || prev.candidateView !== next.candidateView
     || prev.missingTokenSiteItems !== next.missingTokenSiteItems
     || prev.missingTokenGroupItems !== next.missingTokenGroupItems
     || prev.channels !== next.channels

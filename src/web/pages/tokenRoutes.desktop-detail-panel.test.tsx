@@ -11,6 +11,7 @@ const { apiMock, getBrandMock } = vi.hoisted(() => ({
     getModelTokenCandidates: vi.fn(),
     getRouteDecision: vi.fn(),
     getRouteDecisionsBatch: vi.fn(),
+    getRouteDecisionsByRouteBatch: vi.fn(),
     getRouteWideDecisionsBatch: vi.fn(),
     updateRoute: vi.fn(),
     rebuildRoutes: vi.fn(),
@@ -141,6 +142,7 @@ describe('TokenRoutes desktop detail panel', () => {
     apiMock.getModelTokenCandidates.mockResolvedValue({ models: {} });
     apiMock.getRouteDecision.mockResolvedValue({ decision: null });
     apiMock.getRouteDecisionsBatch.mockResolvedValue({ decisions: {} });
+    apiMock.getRouteDecisionsByRouteBatch.mockResolvedValue({ decisions: {} });
     apiMock.getRouteWideDecisionsBatch.mockResolvedValue({ decisions: {} });
     apiMock.updateRoute.mockResolvedValue({});
     apiMock.rebuildRoutes.mockResolvedValue({ rebuild: { createdRoutes: 0, createdChannels: 0 } });

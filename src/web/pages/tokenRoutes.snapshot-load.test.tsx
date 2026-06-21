@@ -10,6 +10,7 @@ const { apiMock, getBrandMock } = vi.hoisted(() => ({
     getRouteChannels: vi.fn(),
     getModelTokenCandidates: vi.fn(),
     getRouteDecisionsBatch: vi.fn(),
+    getRouteDecisionsByRouteBatch: vi.fn(),
     getRouteWideDecisionsBatch: vi.fn(),
   },
   getBrandMock: vi.fn(),
@@ -50,6 +51,7 @@ describe('TokenRoutes cached snapshot load', () => {
     getBrandMock.mockReturnValue(null);
     apiMock.getModelTokenCandidates.mockResolvedValue({ models: {} });
     apiMock.getRouteDecisionsBatch.mockResolvedValue({ decisions: {} });
+    apiMock.getRouteDecisionsByRouteBatch.mockResolvedValue({ decisions: {} });
     apiMock.getRouteWideDecisionsBatch.mockResolvedValue({ decisions: {} });
     apiMock.getRoutesSummary.mockResolvedValue([
       {

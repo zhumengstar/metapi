@@ -9,7 +9,6 @@ import { MobileCard, MobileField } from '../components/MobileCard.js';
 import ResponsiveFilterPanel from '../components/ResponsiveFilterPanel.js';
 import { useIsMobile } from '../components/useIsMobile.js';
 import { tr } from '../i18n.js';
-import { ROUTE_DECISION_REFRESH_TASK_TYPE } from '../../shared/tokenRouteContract.js';
 import {
   buildRouteModelCandidatesIndex,
   type RouteCandidateView,
@@ -36,9 +35,11 @@ import type {
   GroupFilter,
   RouteSummaryRow,
   RouteRoutingStrategy,
-  RouteMode,
-  RouteDecision,
-  RouteIconOption,
+	  RouteMode,
+	  RouteDecision,
+	  RouteChannel,
+	  RouteChannelModelTestResult,
+	  RouteIconOption,
   MissingTokenRouteSiteActionItem,
   MissingTokenGroupRouteSiteActionItem,
   GroupRouteItem,
@@ -76,6 +77,28 @@ const ROUTE_ICON_OPTIONS: RouteIconOption[] = [
   { value: '', label: '自动品牌图标', description: '按模型匹配规则自动识别品牌', iconText: '✦' },
 ];
 
+const ROUTING_STRATEGY_OPTIONS: Array<{
+  value: RouteRoutingStrategy;
+  label: string;
+  description: string;
+}> = [
+  {
+    value: 'weighted',
+    label: '权重随机',
+    description: '按 P 值优先级、权重、成本和健康度随机选择',
+  },
+  {
+    value: 'round_robin',
+    label: '轮询',
+    description: '按通道顺序依次调用，连续失败后冷却',
+  },
+  {
+    value: 'stable_first',
+    label: '稳定优先',
+    description: '优先避开最近失败或不健康站点',
+  },
+];
+
 type RouteEditorForm = {
   routeMode: RouteMode;
   displayName: string;
@@ -95,6 +118,16 @@ const EMPTY_ROUTE_FORM: RouteEditorForm = {
 };
 const DESKTOP_DETAIL_ENTER_MS = 260;
 const DESKTOP_DETAIL_COLLAPSE_MS = 200;
+const ROUTE_DECISION_AUTO_REFRESH_MS = 5_000;
+
+function areRouteDecisionsEqual(a: RouteDecision | null | undefined, b: RouteDecision | null | undefined) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  if (a.selectedChannelId !== b.selectedChannelId) return false;
+  if (a.selectedLabel !== b.selectedLabel) return false;
+  if ((a.candidates?.length || 0) !== (b.candidates?.length || 0)) return false;
+  return JSON.stringify(a.candidates || []) === JSON.stringify(b.candidates || []);
+}
 
 function prefersReducedMotion(): boolean {
   return typeof globalThis.matchMedia === 'function'
@@ -195,7 +228,7 @@ export default function TokenRoutes() {
   const [filterCollapsed, setFilterCollapsed] = useState(true);
   const [showFilters, setShowFilters] = useState(false);
   const [showZeroChannelRoutes, setShowZeroChannelRoutes] = useState(false);
-  const [sortBy, setSortBy] = useState<RouteSortBy>('channelCount');
+  const [sortBy, setSortBy] = useState<RouteSortBy>('usage');
   const [sortDir, setSortDir] = useState<RouteSortDir>('desc');
 
   const [showManual, setShowManual] = useState(false);
@@ -203,19 +236,21 @@ export default function TokenRoutes() {
   const [editingRouteId, setEditingRouteId] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
   const [rebuilding, setRebuilding] = useState(false);
+  const [resettingAutoRoutes, setResettingAutoRoutes] = useState(false);
   const [batchUpdatingRoutes, setBatchUpdatingRoutes] = useState(false);
+  const [batchRoutingStrategy, setBatchRoutingStrategy] = useState<RouteRoutingStrategy>('weighted');
   const [batchSelectMode, setBatchSelectMode] = useState(false);
   const [selectedRouteIds, setSelectedRouteIds] = useState<Set<number>>(new Set());
 
   const [channelTokenDraft, setChannelTokenDraft] = useState<Record<number, number>>({});
   const [updatingChannel, setUpdatingChannel] = useState<Record<number, boolean>>({});
+  const [testingChannelModel, setTestingChannelModel] = useState<Record<number, boolean>>({});
+  const [channelModelTestResults, setChannelModelTestResults] = useState<Record<number, RouteChannelModelTestResult | undefined>>({});
   const [savingPriorityByRoute, setSavingPriorityByRoute] = useState<Record<number, boolean>>({});
   const [updatingRoutingStrategyByRoute, setUpdatingRoutingStrategyByRoute] = useState<Record<number, boolean>>({});
   const [clearingCooldownByRoute, setClearingCooldownByRoute] = useState<Record<number, boolean>>({});
 
   const [decisionByRoute, setDecisionByRoute] = useState<Record<number, RouteDecision | null>>({});
-  const [loadingDecision, setLoadingDecision] = useState(false);
-  const [decisionAutoSkipped, setDecisionAutoSkipped] = useState(false);
   const [visibleRouteCount, setVisibleRouteCount] = useState(ROUTE_RENDER_CHUNK);
   const [expandedSourceGroupMap, setExpandedSourceGroupMap] = useState<Record<string, boolean>>({});
   const [expandedRouteIds, setExpandedRouteIds] = useState<number[]>([]);
@@ -238,7 +273,7 @@ export default function TokenRoutes() {
   const candidatesPromiseRef = useRef<Promise<void> | null>(null);
   const candidatesVersionRef = useRef(0);
   const candidatesSeqRef = useRef(0);
-  const decisionRefreshWatchSeqRef = useRef(0);
+  const decisionAutoRefreshInFlightRef = useRef(false);
   const mountedRef = useRef(true);
 
   const loadCandidates = (force?: boolean) => {
@@ -283,9 +318,6 @@ export default function TokenRoutes() {
       decisionPlaceholder[route.id] = route.decisionSnapshot || null;
     }
     setDecisionByRoute(decisionPlaceholder);
-    setDecisionAutoSkipped(
-      summaries.some((route) => isRouteExactModel(route) && !route.decisionSnapshot),
-    );
 
     // Silently refresh candidates in the background if already loaded
     if (candidatesLoadedRef.current) {
@@ -296,94 +328,10 @@ export default function TokenRoutes() {
   const loadRef = useRef(load);
   loadRef.current = load;
 
-  const toastRef = useRef(toast);
-  toastRef.current = toast;
-
-  const monitorRouteDecisionRefreshTask = useCallback((taskId: string) => {
-    const normalizedTaskId = String(taskId || '').trim();
-    if (!normalizedTaskId) return;
-
-    const taskFetcher = (api as { getTask?: (id: string) => Promise<unknown> }).getTask;
-    if (typeof taskFetcher !== 'function') {
-      setLoadingDecision(false);
-      return;
-    }
-
-    const watchSeq = ++decisionRefreshWatchSeqRef.current;
-    setLoadingDecision(true);
-    setDecisionAutoSkipped(false);
-
-    void (async () => {
-      while (mountedRef.current && decisionRefreshWatchSeqRef.current === watchSeq) {
-        try {
-          const taskResponse = await taskFetcher(normalizedTaskId) as {
-            task?: { status?: string; message?: string; error?: string | null };
-          };
-          const task = taskResponse?.task;
-          if (!task) {
-            throw new Error('路由选中概率任务不存在');
-          }
-
-          const status = String(task.status || '').trim();
-          if (status === 'pending' || status === 'running') {
-            await new Promise((resolve) => setTimeout(resolve, 1200));
-            continue;
-          }
-
-          if (!mountedRef.current || decisionRefreshWatchSeqRef.current !== watchSeq) return;
-          await loadRef.current();
-          if (!mountedRef.current || decisionRefreshWatchSeqRef.current !== watchSeq) return;
-
-          setLoadingDecision(false);
-          if (status === 'succeeded') {
-            toastRef.current.success('路由选择概率已刷新');
-          } else {
-            toastRef.current.error(String(task.message || task.error || '刷新路由选择概率失败'));
-          }
-          return;
-        } catch (error: any) {
-          if (!mountedRef.current || decisionRefreshWatchSeqRef.current !== watchSeq) return;
-          setLoadingDecision(false);
-          toastRef.current.error(error?.message || '刷新路由选择概率失败');
-          return;
-        }
-      }
-    })();
-  }, []);
-
-  const resumeRouteDecisionRefreshTask = useCallback(async () => {
-    const tasksFetcher = (api as { getTasks?: (limit?: number) => Promise<unknown> }).getTasks;
-    if (typeof tasksFetcher !== 'function') {
-      setLoadingDecision(false);
-      return;
-    }
-
-    try {
-      const tasksResponse = await tasksFetcher(50) as {
-        tasks?: Array<{ id?: string; type?: string; status?: string }>;
-      };
-      const runningTask = Array.isArray(tasksResponse?.tasks)
-        ? tasksResponse.tasks.find((task) => (
-          String(task?.type || '').trim() === ROUTE_DECISION_REFRESH_TASK_TYPE
-          && (task?.status === 'pending' || task?.status === 'running')
-        ))
-        : null;
-      const taskId = String(runningTask?.id || '').trim();
-      if (!taskId) {
-        setLoadingDecision(false);
-        return;
-      }
-      monitorRouteDecisionRefreshTask(taskId);
-    } catch {
-      setLoadingDecision(false);
-    }
-  }, [monitorRouteDecisionRefreshTask]);
-
   useEffect(() => {
     mountedRef.current = true;
     (async () => {
       try {
-        await resumeRouteDecisionRefreshTask();
         await load();
       } catch {
         toast.error('加载路由配置失败');
@@ -394,9 +342,8 @@ export default function TokenRoutes() {
     })();
     return () => {
       mountedRef.current = false;
-      decisionRefreshWatchSeqRef.current += 1;
     };
-  }, [resumeRouteDecisionRefreshTask, toast]);
+  }, [toast]);
 
   const handleRebuild = async () => {
     try {
@@ -420,21 +367,24 @@ export default function TokenRoutes() {
     }
   };
 
-  const handleRefreshRouteDecisions = async () => {
+  const handleResetAutoRoutes = async () => {
     try {
-      const response = await api.refreshRouteDecisionSnapshots() as {
-        message?: string;
-        jobId?: string;
+      setResettingAutoRoutes(true);
+      const res = await api.resetAutoRoutes() as {
+        resetChannels?: number;
+        rebuild?: { createdRoutes?: number; createdChannels?: number; removedChannels?: number };
       };
-      const taskId = String(response?.jobId || '').trim();
-      if (!taskId) {
-        throw new Error('刷新任务未返回 taskId');
-      }
-
-      toast.info(response?.message || '已开始后台刷新路由选中概率，可稍后返回查看');
-      monitorRouteDecisionRefreshTask(taskId);
-    } catch (error: any) {
-      toast.error(error?.message || '刷新路由选择概率失败');
+      const resetChannels = res?.resetChannels ?? 0;
+      const createdRoutes = res?.rebuild?.createdRoutes ?? 0;
+      const createdChannels = res?.rebuild?.createdChannels ?? 0;
+      const removedChannels = res?.rebuild?.removedChannels ?? 0;
+      toast.success(`自动重置完成（重置 ${resetChannels} 个通道，新增 ${createdRoutes} 条路由 / ${createdChannels} 个通道，移除 ${removedChannels} 个通道）`);
+      invalidateChannels();
+      await load();
+    } catch (e: any) {
+      toast.error(e.message || '自动重置失败');
+    } finally {
+      setResettingAutoRoutes(false);
     }
   };
 
@@ -802,6 +752,10 @@ export default function TokenRoutes() {
         const countCmp = a.channelCount - b.channelCount;
         if (countCmp !== 0) return sortDir === 'asc' ? countCmp : -countCmp;
       }
+      if (sortBy === 'usage') {
+        const usageCmp = Number(a.successCount || 0) - Number(b.successCount || 0);
+        if (usageCmp !== 0) return sortDir === 'asc' ? usageCmp : -usageCmp;
+      }
 
       const nameCmp = a.modelPattern.localeCompare(b.modelPattern, undefined, { sensitivity: 'base' });
       return sortDir === 'asc' ? nameCmp : -nameCmp;
@@ -924,6 +878,47 @@ export default function TokenRoutes() {
     }
   };
 
+  const handleBatchUpdateRouteStrategy = async () => {
+    const ids = Array.from(selectedRouteIds).filter((id) => selectableRouteIds.has(id));
+    if (ids.length === 0) {
+      toast.info('请先选择要操作的路由');
+      return;
+    }
+
+    const strategyLabel = getRouteRoutingStrategyLabel(batchRoutingStrategy);
+    const confirmed = window.confirm(`确认将 ${ids.length} 条路由批量设置为「${strategyLabel}」？`);
+    if (!confirmed) return;
+
+    const previousStrategies = new Map(
+      routeSummaries
+        .filter((route) => ids.includes(route.id))
+        .map((route) => [route.id, route.routingStrategy] as const),
+    );
+    setRouteSummaries((prev) => prev.map((route) => (
+      ids.includes(route.id)
+        ? { ...route, routingStrategy: batchRoutingStrategy }
+        : route
+    )));
+
+    setBatchUpdatingRoutes(true);
+    try {
+      await api.batchUpdateRoutes({ ids, routingStrategy: batchRoutingStrategy });
+      toast.success(`已批量设置 ${ids.length} 条路由为${strategyLabel}`);
+      setSelectedRouteIds(new Set());
+      setBatchSelectMode(false);
+      await load();
+    } catch (e: any) {
+      setRouteSummaries((prev) => prev.map((route) => (
+        previousStrategies.has(route.id)
+          ? { ...route, routingStrategy: previousStrategies.get(route.id) ?? null }
+          : route
+      )));
+      toast.error(e.message || '批量设置路由策略失败');
+    } finally {
+      setBatchUpdatingRoutes(false);
+    }
+  };
+
   useEffect(() => {
     setVisibleRouteCount(getInitialVisibleCount(filteredRoutes.length, ROUTE_RENDER_CHUNK));
   }, [filteredRoutes.length]);
@@ -951,6 +946,88 @@ export default function TokenRoutes() {
     () => filteredRoutes.slice(0, visibleRouteCount),
     [filteredRoutes, visibleRouteCount],
   );
+
+  const refreshVisibleRouteDecisions = useCallback(async () => {
+    if (decisionAutoRefreshInFlightRef.current) return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+
+    const exactItems = visibleRoutes
+      .filter((route) => isRouteExactModel(route))
+      .map((route) => ({ routeId: route.id, model: route.modelPattern }));
+    const wideRouteIds = visibleRoutes
+      .filter((route) => !isRouteExactModel(route) && route.kind !== 'zero_channel' && route.readOnly !== true && route.isVirtual !== true)
+      .map((route) => route.id);
+
+    if (exactItems.length === 0 && wideRouteIds.length === 0) return;
+
+    decisionAutoRefreshInFlightRef.current = true;
+    try {
+      const next: Record<number, RouteDecision | null> = {};
+      if (exactItems.length > 0) {
+        const res = await api.getRouteDecisionsByRouteBatch(exactItems);
+        const decisions = res?.decisions || {};
+        for (const item of exactItems) {
+          if (Object.prototype.hasOwnProperty.call(decisions, String(item.routeId))) {
+            const decisionsByModel = decisions[String(item.routeId)] || {};
+            next[item.routeId] = (decisionsByModel[item.model] || null) as RouteDecision | null;
+          }
+        }
+      }
+      if (wideRouteIds.length > 0) {
+        const res = await api.getRouteWideDecisionsBatch(wideRouteIds);
+        const decisions = res?.decisions || {};
+        for (const routeId of wideRouteIds) {
+          if (Object.prototype.hasOwnProperty.call(decisions, String(routeId))) {
+            next[routeId] = (decisions[String(routeId)] || null) as RouteDecision | null;
+          }
+        }
+      }
+      if (Object.keys(next).length > 0 && mountedRef.current) {
+        const refreshedAt = new Date().toISOString();
+        setDecisionByRoute((prev) => ({ ...prev, ...next }));
+        setRouteSummaries((prev) => {
+          let changed = false;
+          const updated = prev.map((route) => {
+            if (!Object.prototype.hasOwnProperty.call(next, route.id)) return route;
+            if (areRouteDecisionsEqual(route.decisionSnapshot, next[route.id])) return route;
+            changed = true;
+            return {
+              ...route,
+              decisionSnapshot: next[route.id],
+              decisionRefreshedAt: refreshedAt,
+            };
+          });
+          return changed ? updated : prev;
+        });
+      }
+    } catch {
+      // Keep the cached probability when a silent refresh fails.
+    } finally {
+      decisionAutoRefreshInFlightRef.current = false;
+    }
+  }, [visibleRoutes]);
+
+  useEffect(() => {
+    if (visibleRoutes.length === 0) return;
+    void refreshVisibleRouteDecisions();
+    const timer = globalThis.setInterval(() => {
+      void refreshVisibleRouteDecisions();
+    }, ROUTE_DECISION_AUTO_REFRESH_MS);
+    const handleVisibilityChange = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        void refreshVisibleRouteDecisions();
+      }
+    };
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+    }
+    return () => {
+      globalThis.clearInterval(timer);
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+      }
+    };
+  }, [refreshVisibleRouteDecisions, visibleRoutes.length]);
 
   // Lazy per-route candidate index — only computes for routes actually accessed
   const candidateIndexCacheRef = useRef<{ key: string; cache: Map<number, RouteCandidateView> }>({ key: '', cache: new Map() });
@@ -1101,6 +1178,101 @@ export default function TokenRoutes() {
       setUpdatingChannel((prev) => ({ ...prev, [channelId]: false }));
     }
   };
+
+  const handleToggleChannelImageUpscale = async (channelId: number, routeId: number, enabled: boolean) => {
+    if (updatingChannel[channelId]) return;
+    const previousChannels = channelsByRouteId[routeId] || [];
+    setUpdatingChannel((prev) => ({ ...prev, [channelId]: true }));
+    setChannels(routeId, previousChannels.map((channel) => (
+      channel.id === channelId ? { ...channel, imageUpscaleEnabled: enabled } : channel
+    )));
+    try {
+      await api.updateChannel(channelId, { imageUpscaleEnabled: enabled });
+      toast.success(enabled ? '图片超分已开启' : '图片超分已关闭');
+    } catch (e: any) {
+      setChannels(routeId, previousChannels);
+      toast.error(e.message || '更新图片超分失败');
+    } finally {
+      setUpdatingChannel((prev) => ({ ...prev, [channelId]: false }));
+    }
+  };
+
+  const resolveRouteChannelModelName = useCallback((routeId: number, channel: RouteChannel): string => {
+    const directModel = String(channel.sourceModel || '').trim();
+    if (directModel) return directModel;
+    const route = routeSummaries.find((item) => item.id === routeId);
+    if (route && isExactModelPattern(route.modelPattern)) {
+      return route.modelPattern.trim();
+    }
+    return '';
+  }, [routeSummaries]);
+
+  const handleTestChannelModel = useCallback(async (routeId: number, channelId: number) => {
+    const channel = (channelsByRouteId[routeId] || []).find((item) => item.id === channelId);
+    if (!channel) {
+      toast.error('未找到通道');
+      return;
+    }
+
+    const model = resolveRouteChannelModelName(routeId, channel);
+    if (!model) {
+      toast.error('该通道没有可测试的模型');
+      return;
+    }
+    if (testingChannelModel[channelId]) return;
+
+    setTestingChannelModel((prev) => ({ ...prev, [channelId]: true }));
+    try {
+      const res = await api.testRouteChannelModelAvailability(channelId, { model });
+      const rawResult = res?.result || null;
+      const tokenId = rawResult?.tokenId == null ? null : Number(rawResult.tokenId);
+      const nextResult: RouteChannelModelTestResult = rawResult
+        ? {
+          tokenId,
+          model: String(rawResult.model || model),
+          available: rawResult.available === true,
+          message: rawResult.message || null,
+          responseText: rawResult.responseText || null,
+          httpStatus: rawResult.httpStatus ?? null,
+          latencyMs: rawResult.latencyMs ?? null,
+          checkedAt: rawResult.checkedAt || new Date().toISOString(),
+        }
+        : {
+          tokenId: null,
+          model,
+          available: false,
+          message: '测试接口没有返回结果',
+          responseText: null,
+          httpStatus: null,
+          latencyMs: null,
+          checkedAt: new Date().toISOString(),
+        };
+      setChannelModelTestResults((prev) => ({ ...prev, [channelId]: nextResult }));
+      if (nextResult.available) {
+        toast.success('模型测试成功');
+      } else {
+        toast.info(nextResult.message || '模型测试不可用');
+      }
+    } catch (error: any) {
+      const message = error?.message || '模型测试失败';
+      setChannelModelTestResults((prev) => ({
+        ...prev,
+        [channelId]: {
+          tokenId: null,
+          model,
+          available: false,
+          message,
+          responseText: null,
+          httpStatus: null,
+          latencyMs: null,
+          checkedAt: new Date().toISOString(),
+        },
+      }));
+      toast.error(message);
+    } finally {
+      setTestingChannelModel((prev) => ({ ...prev, [channelId]: false }));
+    }
+  }, [channelsByRouteId, resolveRouteChannelModelName, testingChannelModel, toast]);
 
   const handleChannelTokenSave = async (routeId: number, channelId: number, accountId: number) => {
     const tokenId = channelTokenDraft[channelId];
@@ -1325,18 +1497,34 @@ export default function TokenRoutes() {
       setClosingDesktopDetailRouteIds((prev) => prev.filter((id) => id !== routeId));
       loadCandidates();
       setExpandedRouteIds((prev) => [...prev, routeId]);
-      // Load channels on demand
+      // Refresh channels on expand so runtime counters such as success/failure are current.
       const route = routeById.get(routeId) || null;
       const isReadOnlyRoute = route?.kind === 'zero_channel' || route?.readOnly === true || route?.isVirtual === true;
-      if (!channelsByRouteId[routeId] && !isReadOnlyRoute) {
+      if (!isReadOnlyRoute) {
         try {
-          await loadChannels(routeId);
+          await loadChannels(routeId, true);
         } catch {
           toast.error('加载通道失败');
         }
       }
     }
   };
+
+  useEffect(() => {
+    const routeIds = expandedRouteIds.filter((routeId) => {
+      const route = routeById.get(routeId) || null;
+      return !(route?.kind === 'zero_channel' || route?.readOnly === true || route?.isVirtual === true);
+    });
+    if (routeIds.length === 0) return undefined;
+
+    const timerId = globalThis.setInterval(() => {
+      for (const routeId of routeIds) {
+        void loadChannels(routeId, true).catch(() => undefined);
+      }
+    }, 10_000);
+
+    return () => globalThis.clearInterval(timerId);
+  }, [expandedRouteIds, loadChannels, routeById]);
 
   useEffect(() => () => {
     Object.values(desktopDetailCloseTimersRef.current).forEach((timerId) => {
@@ -1475,6 +1663,18 @@ export default function TokenRoutes() {
     (channelId: number, routeId: number, enabled: boolean) => handleToggleChannelEnabledRef.current(channelId, routeId, enabled),
     [],
   );
+  const handleToggleChannelImageUpscaleRef = useRef(handleToggleChannelImageUpscale);
+  handleToggleChannelImageUpscaleRef.current = handleToggleChannelImageUpscale;
+  const stableToggleChannelImageUpscale = useCallback(
+    (channelId: number, routeId: number, enabled: boolean) => handleToggleChannelImageUpscaleRef.current(channelId, routeId, enabled),
+    [],
+  );
+  const handleTestChannelModelRef = useRef(handleTestChannelModel);
+  handleTestChannelModelRef.current = handleTestChannelModel;
+  const stableTestChannelModel = useCallback(
+    (routeId: number, channelId: number) => handleTestChannelModelRef.current(routeId, channelId),
+    [],
+  );
   const handleChannelDragEndRef = useRef(handleChannelDragEnd);
   handleChannelDragEndRef.current = handleChannelDragEnd;
   const stableChannelDragEnd = useCallback(
@@ -1545,6 +1745,7 @@ export default function TokenRoutes() {
               options={[
                 { value: 'modelPattern', label: tr('模型名称') },
                 { value: 'channelCount', label: tr('通道数量') },
+                { value: 'usage', label: tr('使用量') },
               ]}
               placeholder={tr('排序字段')}
             />
@@ -1562,21 +1763,8 @@ export default function TokenRoutes() {
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, borderLeft: '1px solid var(--color-border)', paddingLeft: 8 }}>
           <button
-            onClick={handleRefreshRouteDecisions}
-            disabled={loadingDecision}
-            className="btn btn-ghost"
-            style={{ border: '1px solid var(--color-border)', padding: '7px 12px' }}
-          >
-            {loadingDecision ? (
-              <><span className="spinner spinner-sm" /> {tr('刷新中...')}</>
-            ) : (
-              tr('刷新选中概率')
-            )}
-          </button>
-
-          <button
             onClick={handleRebuild}
-            disabled={rebuilding}
+            disabled={rebuilding || resettingAutoRoutes}
             className="btn btn-ghost"
             style={{ border: '1px solid var(--color-border)', padding: '7px 12px' }}
           >
@@ -1584,6 +1772,19 @@ export default function TokenRoutes() {
               <><span className="spinner spinner-sm" /> {tr('重建中...')}</>
             ) : (
               tr('自动重建')
+            )}
+          </button>
+
+          <button
+            onClick={handleResetAutoRoutes}
+            disabled={rebuilding || resettingAutoRoutes}
+            className="btn btn-ghost"
+            style={{ border: '1px solid var(--color-border)', padding: '7px 12px' }}
+          >
+            {resettingAutoRoutes ? (
+              <><span className="spinner spinner-sm" /> {tr('重置中...')}</>
+            ) : (
+              tr('自动重置')
             )}
           </button>
 
@@ -1719,7 +1920,30 @@ export default function TokenRoutes() {
           </span>
           <button className="btn btn-ghost" style={{ padding: '4px 12px', fontSize: 12 }} onClick={selectAllRoutes}>{tr('全选')}</button>
           <button className="btn btn-ghost" style={{ padding: '4px 12px', fontSize: 12 }} onClick={deselectAllRoutes}>{tr('取消全选')}</button>
-          <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+          <div className="route-batch-actions">
+            <div className="route-batch-strategy-select">
+              <ModernSelect
+                size="sm"
+                value={batchRoutingStrategy}
+                disabled={batchUpdatingRoutes}
+                onChange={(nextValue) => setBatchRoutingStrategy(nextValue as RouteRoutingStrategy)}
+                options={ROUTING_STRATEGY_OPTIONS.map((option) => ({
+                  value: option.value,
+                  label: tr(option.label),
+                  description: tr(option.description),
+                }))}
+                placeholder={tr('选择路由策略')}
+                emptyLabel={tr('暂无可选策略')}
+              />
+            </div>
+            <button
+              className="btn btn-ghost"
+              style={{ padding: '6px 16px', fontSize: 13, border: '1px solid var(--color-border)' }}
+              disabled={selectedRouteIds.size === 0 || batchUpdatingRoutes}
+              onClick={handleBatchUpdateRouteStrategy}
+            >
+              {batchUpdatingRoutes ? <><span className="spinner spinner-sm" /> {tr('处理中...')}</> : tr('批量设置策略')}
+            </button>
             <button
               className="btn btn-warning"
               style={{ padding: '6px 16px', fontSize: 13 }}
@@ -1847,16 +2071,20 @@ export default function TokenRoutes() {
                     channels={channelsByRouteId[route.id]}
                     loadingChannels={!!loadingChannelsByRouteId[route.id]}
                     routeDecision={decisionByRoute[route.id] || null}
-                    loadingDecision={loadingDecision}
+                    loadingDecision={false}
                     candidateView={getRouteCandidateView(route.id)}
-                    channelTokenDraft={channelTokenDraft}
-                    updatingChannel={updatingChannel}
-                    savingPriority={!!savingPriorityByRoute[route.id]}
+	                    channelTokenDraft={channelTokenDraft}
+	                    updatingChannel={updatingChannel}
+	                    testingChannelModel={testingChannelModel}
+	                    channelModelTestResults={channelModelTestResults}
+	                    savingPriority={!!savingPriorityByRoute[route.id]}
                     onTokenDraftChange={stableTokenDraftChange}
                     onSaveToken={stableChannelTokenSave}
-                    onDeleteChannel={stableDeleteChannel}
-                    onToggleChannelEnabled={stableToggleChannelEnabled}
-                    onChannelDragEnd={stableChannelDragEnd}
+	                    onDeleteChannel={stableDeleteChannel}
+	                    onToggleChannelEnabled={stableToggleChannelEnabled}
+	                    onToggleChannelImageUpscale={stableToggleChannelImageUpscale}
+	                    onTestChannelModel={stableTestChannelModel}
+	                    onChannelDragEnd={stableChannelDragEnd}
                     missingTokenSiteItems={getMissingTokenSiteItems(route.id)}
                     missingTokenGroupItems={getMissingTokenGroupItems(route.id)}
                     onCreateTokenForMissing={stableCreateTokenForMissing}
@@ -1887,16 +2115,20 @@ export default function TokenRoutes() {
               channels={channelsByRouteId[route.id]}
               loadingChannels={!!loadingChannelsByRouteId[route.id]}
               routeDecision={decisionByRoute[route.id] || null}
-              loadingDecision={loadingDecision}
+              loadingDecision={false}
               candidateView={EMPTY_ROUTE_CANDIDATE_VIEW}
-              channelTokenDraft={channelTokenDraft}
-              updatingChannel={updatingChannel}
-              savingPriority={!!savingPriorityByRoute[route.id]}
+	              channelTokenDraft={channelTokenDraft}
+	              updatingChannel={updatingChannel}
+	              testingChannelModel={testingChannelModel}
+	              channelModelTestResults={channelModelTestResults}
+	              savingPriority={!!savingPriorityByRoute[route.id]}
               onTokenDraftChange={stableTokenDraftChange}
               onSaveToken={stableChannelTokenSave}
-              onDeleteChannel={stableDeleteChannel}
-              onToggleChannelEnabled={stableToggleChannelEnabled}
-              onChannelDragEnd={stableChannelDragEnd}
+	              onDeleteChannel={stableDeleteChannel}
+	              onToggleChannelEnabled={stableToggleChannelEnabled}
+	              onToggleChannelImageUpscale={stableToggleChannelImageUpscale}
+	              onTestChannelModel={stableTestChannelModel}
+	              onChannelDragEnd={stableChannelDragEnd}
               missingTokenSiteItems={EMPTY_MISSING_ITEMS}
               missingTokenGroupItems={EMPTY_MISSING_GROUP_ITEMS}
               onCreateTokenForMissing={stableCreateTokenForMissing}
@@ -1926,16 +2158,20 @@ export default function TokenRoutes() {
                   channels={channelsByRouteId[route.id]}
                   loadingChannels={!!loadingChannelsByRouteId[route.id]}
                   routeDecision={decisionByRoute[route.id] || null}
-                  loadingDecision={loadingDecision}
+                  loadingDecision={false}
                   candidateView={getRouteCandidateView(route.id)}
-                  channelTokenDraft={channelTokenDraft}
-                  updatingChannel={updatingChannel}
-                  savingPriority={!!savingPriorityByRoute[route.id]}
+	                  channelTokenDraft={channelTokenDraft}
+	                  updatingChannel={updatingChannel}
+	                  testingChannelModel={testingChannelModel}
+	                  channelModelTestResults={channelModelTestResults}
+	                  savingPriority={!!savingPriorityByRoute[route.id]}
                   onTokenDraftChange={stableTokenDraftChange}
                   onSaveToken={stableChannelTokenSave}
-                  onDeleteChannel={stableDeleteChannel}
-                  onToggleChannelEnabled={stableToggleChannelEnabled}
-                  onChannelDragEnd={stableChannelDragEnd}
+	                  onDeleteChannel={stableDeleteChannel}
+	                  onToggleChannelEnabled={stableToggleChannelEnabled}
+	                  onToggleChannelImageUpscale={stableToggleChannelImageUpscale}
+	                  onTestChannelModel={stableTestChannelModel}
+	                  onChannelDragEnd={stableChannelDragEnd}
                   missingTokenSiteItems={getMissingTokenSiteItems(route.id)}
                   missingTokenGroupItems={getMissingTokenGroupItems(route.id)}
                   onCreateTokenForMissing={stableCreateTokenForMissing}
