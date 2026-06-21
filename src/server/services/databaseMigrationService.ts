@@ -39,6 +39,7 @@ type BackupSnapshot = {
     tokenModelAvailability: Array<Record<string, unknown>>;
     tokenRoutes: Array<Record<string, unknown>>;
     routeChannels: Array<Record<string, unknown>>;
+    routeChannelStatSnapshots: Array<Record<string, unknown>>;
     routeGroupSources: Array<Record<string, unknown>>;
     proxyLogs: Array<Record<string, unknown>>;
     proxyVideoTasks: Array<Record<string, unknown>>;
@@ -66,6 +67,7 @@ export interface DatabaseMigrationSummary {
     accountTokens: number;
     tokenRoutes: number;
     routeChannels: number;
+    routeChannelStatSnapshots: number;
     routeGroupSources: number;
     checkinLogs: number;
     modelAvailability: number;
@@ -263,6 +265,7 @@ async function toBackupSnapshot(): Promise<BackupSnapshot> {
       tokenModelAvailability: await db.select().from(schema.tokenModelAvailability).all() as Array<Record<string, unknown>>,
       tokenRoutes: await db.select().from(schema.tokenRoutes).all() as Array<Record<string, unknown>>,
       routeChannels: await db.select().from(schema.routeChannels).all() as Array<Record<string, unknown>>,
+      routeChannelStatSnapshots: await db.select().from(schema.routeChannelStatSnapshots).all() as Array<Record<string, unknown>>,
       routeGroupSources: await db.select().from(schema.routeGroupSources).all() as Array<Record<string, unknown>>,
       proxyLogs: await db.select().from(schema.proxyLogs).all() as Array<Record<string, unknown>>,
       proxyVideoTasks: await db.select().from(schema.proxyVideoTasks).all() as Array<Record<string, unknown>>,
@@ -291,6 +294,7 @@ async function ensureTargetState(client: SqlClient, overwrite: boolean): Promise
 async function clearTargetData(client: SqlClient): Promise<void> {
   const tables = [
     'route_channels',
+    'route_channel_stat_snapshots',
     'route_group_sources',
     'token_model_availability',
     'model_availability',
@@ -323,7 +327,7 @@ function buildStatements(
   for (const row of snapshot.accounts.sites) {
     statements.push({
       table: 'sites',
-      columns: ['id', 'name', 'url', 'external_checkin_url', 'platform', 'proxy_url', 'use_system_proxy', 'custom_headers', 'status', 'is_pinned', 'sort_order', 'global_weight', 'api_key', 'created_at', 'updated_at'],
+      columns: ['id', 'name', 'url', 'external_checkin_url', 'platform', 'proxy_url', 'use_system_proxy', 'custom_headers', 'status', 'is_pinned', 'sort_order', 'global_weight', 'recharge_ratio', 'api_key', 'created_at', 'updated_at'],
       values: [
         asNumber(row.id, 0),
         asNullableString(row.name),
@@ -337,6 +341,7 @@ function buildStatements(
         asBoolean(row.isPinned, false),
         asNumber(row.sortOrder, 0),
         asNumber(row.globalWeight, 1),
+        asNumber((row as Record<string, unknown>).rechargeRatio, 1),
         asNullableString(row.apiKey),
         asNullableString(row.createdAt),
         asNullableString(row.updatedAt),
@@ -575,6 +580,35 @@ function buildStatements(
     });
   }
 
+  for (const row of (snapshot.accounts.routeChannelStatSnapshots || [])) {
+    statements.push({
+      table: 'route_channel_stat_snapshots',
+      columns: ['id', 'identity_key', 'model_pattern', 'account_id', 'token_id', 'oauth_route_unit_id', 'source_model', 'success_count', 'fail_count', 'total_latency_ms', 'total_cost', 'total_input_tokens', 'last_used_at', 'last_selected_at', 'last_fail_at', 'consecutive_fail_count', 'cooldown_level', 'cooldown_until', 'created_at', 'updated_at'],
+      values: [
+        asNumber(row.id, 0),
+        asNullableString(row.identityKey),
+        asNullableString(row.modelPattern),
+        asNumber(row.accountId, 0),
+        asNumber(row.tokenId, null),
+        asNumber(row.oauthRouteUnitId, null),
+        asNullableString(row.sourceModel),
+        asNumber(row.successCount, 0),
+        asNumber(row.failCount, 0),
+        asNumber(row.totalLatencyMs, 0),
+        asNumber(row.totalCost, 0),
+        asNumber(row.totalInputTokens, 0),
+        asNullableString(row.lastUsedAt),
+        asNullableString(row.lastSelectedAt),
+        asNullableString(row.lastFailAt),
+        asNumber(row.consecutiveFailCount, 0),
+        asNumber(row.cooldownLevel, 0),
+        asNullableString(row.cooldownUntil),
+        asNullableString(row.createdAt),
+        asNullableString(row.updatedAt),
+      ],
+    });
+  }
+
   for (const row of (snapshot.accounts.routeGroupSources || [])) {
     statements.push({
       table: 'route_group_sources',
@@ -756,6 +790,7 @@ async function syncPostgresSequences(client: SqlClient): Promise<void> {
     'token_model_availability',
     'token_routes',
     'route_channels',
+    'route_channel_stat_snapshots',
     'route_group_sources',
     'proxy_logs',
     'proxy_video_tasks',
@@ -822,6 +857,7 @@ export async function migrateCurrentDatabase(input: DatabaseMigrationInput): Pro
       accountTokens: snapshot.accounts.accountTokens.length,
       tokenRoutes: snapshot.accounts.tokenRoutes.length,
       routeChannels: snapshot.accounts.routeChannels.length,
+      routeChannelStatSnapshots: (snapshot.accounts.routeChannelStatSnapshots || []).length,
       checkinLogs: snapshot.accounts.checkinLogs.length,
       modelAvailability: snapshot.accounts.modelAvailability.length,
       tokenModelAvailability: snapshot.accounts.tokenModelAvailability.length,

@@ -2,6 +2,7 @@ import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db, schema } from '../../db/index.js';
 import { insertAndGetById } from '../../db/insertHelpers.js';
 import * as routeRefreshWorkflow from '../routeRefreshWorkflow.js';
+import { deleteRouteChannelsByOauthRouteUnitIdPreservingStats } from '../routeChannelStatsService.js';
 import { invalidateTokenRouterCache } from '../tokenRouter.js';
 
 export type OAuthRouteUnitStrategy = 'round_robin' | 'stick_until_unavailable';
@@ -137,10 +138,8 @@ export async function listOauthRouteUnitMembersByUnitIds(unitIds: number[]): Pro
 }
 
 async function rollbackCreatedOauthRouteUnit(routeUnitId: number): Promise<void> {
+  await deleteRouteChannelsByOauthRouteUnitIdPreservingStats(routeUnitId);
   await db.transaction(async (tx) => {
-    await tx.delete(schema.routeChannels)
-      .where(eq(schema.routeChannels.oauthRouteUnitId, routeUnitId))
-      .run();
     await tx.delete(schema.oauthRouteUnitMembers)
       .where(eq(schema.oauthRouteUnitMembers.unitId, routeUnitId))
       .run();
@@ -403,9 +402,7 @@ export async function deleteOauthRouteUnit(routeUnitId: number) {
     .where(eq(schema.routeChannels.oauthRouteUnitId, routeUnitId))
     .all();
 
-  await db.delete(schema.routeChannels)
-    .where(eq(schema.routeChannels.oauthRouteUnitId, routeUnitId))
-    .run();
+  await deleteRouteChannelsByOauthRouteUnitIdPreservingStats(routeUnitId);
   await db.delete(schema.oauthRouteUnitMembers)
     .where(eq(schema.oauthRouteUnitMembers.unitId, routeUnitId))
     .run();

@@ -75,6 +75,7 @@ describe('refreshModelsForAccount credential discovery', () => {
     await db.delete(schema.tokenRoutes).run();
     await db.delete(schema.tokenModelAvailability).run();
     await db.delete(schema.modelAvailability).run();
+    await db.delete(schema.accountTokenGroupPreferences).run();
     await db.delete(schema.accountTokens).run();
     await db.delete(schema.accounts).run();
     await db.delete(schema.siteApiEndpoints).run();
@@ -135,6 +136,74 @@ describe('refreshModelsForAccount credential discovery', () => {
 
     const tokenRows = await db.select().from(schema.tokenModelAvailability).all();
     expect(tokenRows).toHaveLength(0);
+  });
+
+  it('does not re-enable a manually disabled token when model refresh recovers from auto-disable', async () => {
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockResolvedValue(['gpt-5.5']);
+
+    const site = await db.insert(schema.sites).values({
+      name: 'site-manual-disabled',
+      url: 'https://manual-disabled.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'manual-disabled-user',
+      accessToken: 'session-token',
+      apiToken: null,
+      status: 'active',
+    }).returning().get();
+
+    await db.insert(schema.tokenGroupPricing).values({
+      siteId: site.id,
+      accountId: account.id,
+      sourceKey: `account:${account.id}`,
+      group: 'pro',
+      groupName: 'pro',
+      ratio: 0.9,
+      source: 'upstream',
+      pricingAvailable: true,
+    }).run();
+
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'pro-token',
+      token: 'sk-pro-token',
+      tokenGroup: 'pro',
+      source: 'sync',
+      valueStatus: 'ready' as any,
+      enabled: false,
+      isDefault: false,
+      autoDisabledAt: '2026-06-21T00:00:00.000Z',
+      autoDisabledReason: '模型拉取为空',
+      autoDisabledPreviousEnabled: true,
+    }).returning().get();
+
+    await db.insert(schema.accountTokenGroupPreferences).values({
+      accountId: account.id,
+      tokenGroup: 'pro',
+      groupRatio: 0.9,
+      groupRatioKey: '0.9',
+      enabled: false,
+    }).run();
+
+    const result = await refreshModelsForAccount(account.id);
+
+    expect(result.status).toBe('success');
+
+    const refreshedToken = await db.select()
+      .from(schema.accountTokens)
+      .where(eq(schema.accountTokens.id, token.id))
+      .get();
+    expect(refreshedToken).toMatchObject({
+      enabled: false,
+      autoDisabledAt: null,
+      autoDisabledReason: null,
+      autoDisabledPreviousEnabled: null,
+    });
   });
 
   it('uses the configured ai endpoint for direct model discovery credentials', async () => {
@@ -555,6 +624,10 @@ describe('refreshModelsForAccount credential discovery', () => {
       tokenId: token.id,
       modelName: 'gpt-4.1',
       available: true,
+      routeEnabled: true,
+      message: '请求成功',
+      httpStatus: 200,
+      responseText: '我是测试模型',
       latencyMs: 90,
       checkedAt: '2026-03-21T11:30:00.000Z',
     }).run();
@@ -587,6 +660,122 @@ describe('refreshModelsForAccount credential discovery', () => {
       tokenId: token.id,
       modelName: 'gpt-4.1',
       available: true,
+      routeEnabled: true,
+      message: '请求成功',
+      httpStatus: 200,
+      responseText: '我是测试模型',
+    });
+  });
+
+  it('preserves token test details and route enabled state during successful token model refresh', async () => {
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockResolvedValue(['gpt-5.5']);
+
+    const site = await db.insert(schema.sites).values({
+      name: 'site-token-test-preserve',
+      url: 'https://site-token-test-preserve.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'preserve-user',
+      accessToken: '',
+      apiToken: null,
+      status: 'active',
+      extraConfig: JSON.stringify({ credentialMode: 'session' }),
+    }).returning().get();
+
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'default',
+      token: 'sk-preserve-token',
+      source: 'manual',
+      enabled: true,
+      isDefault: true,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+
+    await db.insert(schema.tokenModelAvailability).values({
+      tokenId: token.id,
+      modelName: 'gpt-5.5',
+      available: true,
+      routeEnabled: true,
+      message: '请求成功',
+      httpStatus: 200,
+      responseText: '我是测试模型',
+      latencyMs: 90,
+      checkedAt: '2026-03-21T11:30:00.000Z',
+    }).run();
+
+    const result = await refreshModelsForAccount(account.id);
+
+    expect(result).toMatchObject({
+      accountId: account.id,
+      refreshed: true,
+      status: 'success',
+    });
+    const tokenRow = await db.select().from(schema.tokenModelAvailability)
+      .where(eq(schema.tokenModelAvailability.tokenId, token.id))
+      .get();
+    expect(tokenRow).toMatchObject({
+      modelName: 'gpt-5.5',
+      available: true,
+      routeEnabled: true,
+      message: '请求成功',
+      httpStatus: 200,
+      responseText: '我是测试模型',
+    });
+  });
+
+  it('does not mark token models available during model discovery', async () => {
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockResolvedValue(['gpt-5.5']);
+
+    const site = await db.insert(schema.sites).values({
+      name: 'site-token-model-list-only',
+      url: 'https://site-token-model-list-only.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'list-only-user',
+      accessToken: '',
+      apiToken: null,
+      status: 'active',
+      extraConfig: JSON.stringify({ credentialMode: 'session' }),
+    }).returning().get();
+
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'default',
+      token: 'sk-list-only-token',
+      source: 'manual',
+      enabled: true,
+      isDefault: true,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+
+    const result = await refreshModelsForAccount(account.id);
+
+    expect(result).toMatchObject({
+      accountId: account.id,
+      refreshed: true,
+      status: 'success',
+    });
+    const tokenRow = await db.select().from(schema.tokenModelAvailability)
+      .where(eq(schema.tokenModelAvailability.tokenId, token.id))
+      .get();
+    expect(tokenRow).toMatchObject({
+      modelName: 'gpt-5.5',
+      available: null,
+      routeEnabled: false,
+      message: null,
+      httpStatus: null,
+      responseText: null,
     });
   });
 
@@ -1859,7 +2048,7 @@ describe('refreshModelsForAccount credential discovery', () => {
         Authorization: 'Bearer antigravity-access-token',
         Accept: 'application/json',
         'Content-Type': 'application/json',
-        'User-Agent': 'antigravity/1.19.6 darwin/arm64',
+        'User-Agent': expect.stringMatching(/^antigravity\/\d+\.\d+\.\d+ darwin\/arm64$/),
       }),
     });
     const discoveryHeaders = undiciFetchMock.mock.calls[0]?.[1]?.headers as Record<string, string>;

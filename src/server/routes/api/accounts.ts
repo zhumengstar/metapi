@@ -10,6 +10,7 @@ import {
 } from "../../services/accountMutationWorkflow.js";
 import {
   getCredentialModeFromExtraConfig,
+  getAutoReloginConfig,
   getProxyUrlFromExtraConfig,
   guessPlatformUserIdFromUsername,
   hasOauthProvider,
@@ -19,7 +20,10 @@ import {
   resolvePlatformUserId,
   type AccountCredentialMode,
 } from "../../services/accountExtraConfig.js";
-import { encryptAccountPassword } from "../../services/accountCredentialService.js";
+import {
+  decryptAccountPassword,
+  encryptAccountPassword,
+} from "../../services/accountCredentialService.js";
 import { applyAccountUpdateWorkflow } from "../../services/accountUpdateWorkflow.js";
 import { startBackgroundTask } from "../../services/backgroundTaskService.js";
 import { parseCheckinRewardAmount } from "../../services/checkinRewardParser.js";
@@ -317,6 +321,100 @@ function isVerificationTimeoutError(error: unknown): boolean {
   );
 }
 
+type ExpiredAccountReloginResult =
+  | { status: "not-available" }
+  | { status: "failed"; message: string }
+  | { status: "success"; row: AccountWithSiteRow };
+
+async function tryReloginExpiredAccount(
+  row: AccountWithSiteRow,
+): Promise<ExpiredAccountReloginResult> {
+  const relogin = getAutoReloginConfig(row.accounts.extraConfig);
+  if (!relogin) return { status: "not-available" };
+
+  const adapter = getAdapter(row.sites.platform);
+  if (!adapter) {
+    return { status: "failed", message: "站点平台不支持账号密码重新登录" };
+  }
+
+  const password = decryptAccountPassword(relogin.passwordCipher);
+  if (!password) {
+    return { status: "failed", message: "登录凭证密码解密失败，无法自动重新登录" };
+  }
+
+  try {
+    const loginResult = await withTimeout(
+      () => withAccountProxyOverride(
+        getProxyUrlFromExtraConfig(row.accounts.extraConfig),
+        () => adapter.login(row.sites.url, relogin.username, password),
+      ),
+      ACCOUNT_HEALTH_REFRESH_TIMEOUT_MS,
+      `账号密码重新登录超时（${Math.max(1, Math.round(ACCOUNT_HEALTH_REFRESH_TIMEOUT_MS / 1000))}s）`,
+    );
+
+    if (!loginResult.success || !loginResult.accessToken) {
+      const normalizedFailure = normalizeLoginFailure(loginResult.message);
+      return {
+        status: "failed",
+        message: `账号密码重新登录失败：${normalizedFailure.message}`,
+      };
+    }
+
+    const nextExtraConfigPatch: Record<string, unknown> = {
+      credentialMode: "session",
+      autoRelogin: {
+        username: relogin.username,
+        passwordCipher: relogin.passwordCipher,
+        updatedAt: new Date().toISOString(),
+      },
+    };
+    if (loginResult.refreshToken) {
+      nextExtraConfigPatch.sub2apiAuth = {
+        refreshToken: loginResult.refreshToken,
+        tokenExpiresAt: loginResult.tokenExpiresAt,
+      };
+    }
+    const nextExtraConfig = mergeAccountExtraConfig(
+      row.accounts.extraConfig,
+      nextExtraConfigPatch,
+    );
+    await db
+      .update(schema.accounts)
+      .set({
+        accessToken: loginResult.accessToken,
+        status: "active",
+        extraConfig: nextExtraConfig,
+        updatedAt: new Date().toISOString(),
+      })
+      .where(eq(schema.accounts.id, row.accounts.id))
+      .run();
+
+    const updatedAccount = await db
+      .select()
+      .from(schema.accounts)
+      .where(eq(schema.accounts.id, row.accounts.id))
+      .get();
+
+    return {
+      status: "success",
+      row: {
+        accounts: updatedAccount || {
+          ...row.accounts,
+          accessToken: loginResult.accessToken,
+          status: "active",
+          extraConfig: nextExtraConfig,
+        },
+        sites: row.sites,
+      },
+    };
+  } catch (error: any) {
+    return {
+      status: "failed",
+      message: `账号密码重新登录失败：${String(error?.message || "unknown error")}`,
+    };
+  }
+}
+
 function buildAccountVerifyTimeoutMessage(): string {
   return `Token verification timed out (${Math.max(1, Math.round(ACCOUNT_VERIFY_TIMEOUT_MS / 1000))}s)`;
 }
@@ -382,7 +480,8 @@ async function refreshRuntimeHealthForRow(
   const accountId = row.accounts.id;
   const username = row.accounts.username;
   const siteName = row.sites.name;
-  const capabilities = buildCapabilitiesForAccount(row.accounts);
+  let activeRow = row;
+  let capabilities = buildCapabilitiesForAccount(activeRow.accounts);
 
   if (
     (row.accounts.status || "active") === "disabled" ||
@@ -403,7 +502,68 @@ async function refreshRuntimeHealthForRow(
     };
   }
 
+  if ((activeRow.accounts.status || "active") === "expired") {
+    const relogin = await tryReloginExpiredAccount(activeRow);
+    if (relogin.status === "success") {
+      activeRow = relogin.row;
+      capabilities = buildCapabilitiesForAccount(activeRow.accounts);
+    } else if (relogin.status === "failed") {
+      const health = await setAccountRuntimeHealth(accountId, {
+        state: "unhealthy",
+        reason: relogin.message,
+        source: "auto-relogin",
+      });
+      return {
+        accountId,
+        username,
+        siteName,
+        status: "failed",
+        state: health?.state || "unhealthy",
+        message: health?.reason || relogin.message,
+      };
+    }
+  }
+
   if (capabilities.proxyOnly) {
+    if ((activeRow.accounts.status || "active") === "expired") {
+      const discoveredModelRow = await db
+        .select({ id: schema.modelAvailability.id })
+        .from(schema.modelAvailability)
+        .where(
+          and(
+            eq(schema.modelAvailability.accountId, accountId),
+            eq(schema.modelAvailability.available, true),
+          ),
+        )
+        .limit(1)
+        .get();
+      const hasDiscoveredModels = !!discoveredModelRow;
+      await db
+        .update(schema.accounts)
+        .set({
+          status: "active",
+          updatedAt: new Date().toISOString(),
+        })
+        .where(eq(schema.accounts.id, accountId))
+        .run();
+      const health = await setAccountRuntimeHealth(accountId, {
+        state: hasDiscoveredModels ? "healthy" : "unknown",
+        reason: hasDiscoveredModels
+          ? "已自动激活，模型探测成功"
+          : "已自动激活，等待模型探测",
+        source: "auto-reactivate",
+      });
+      return {
+        accountId,
+        username,
+        siteName,
+        status: "success",
+        state: health?.state || (hasDiscoveredModels ? "healthy" : "unknown"),
+        message: health?.reason || (hasDiscoveredModels
+          ? "已自动激活，模型探测成功"
+          : "已自动激活，等待模型探测"),
+      };
+    }
     return {
       accountId,
       username,
@@ -426,9 +586,9 @@ async function refreshRuntimeHealthForRow(
       .where(eq(schema.accounts.id, accountId))
       .get();
     const runtimeHealth = buildRuntimeHealthForAccount({
-      accountStatus: refreshedAccount?.status || row.accounts.status,
-      siteStatus: row.sites.status,
-      extraConfig: refreshedAccount?.extraConfig ?? row.accounts.extraConfig,
+      accountStatus: refreshedAccount?.status || activeRow.accounts.status,
+      siteStatus: activeRow.sites.status,
+      extraConfig: refreshedAccount?.extraConfig ?? activeRow.accounts.extraConfig,
       sessionCapable: capabilities.canRefreshBalance,
     });
 
@@ -459,15 +619,33 @@ async function refreshRuntimeHealthForRow(
 }
 
 async function executeRefreshAccountRuntimeHealth(accountId?: number) {
+  return executeRefreshAccountRuntimeHealthScoped({ accountId, scope: "all" });
+}
+
+async function executeRefreshAccountRuntimeHealthScoped(options?: {
+  accountId?: number;
+  scope?: "all" | "unhealthy";
+}) {
   const rows = await db
     .select()
     .from(schema.accounts)
     .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
     .all();
 
-  const targetRows = Number.isFinite(accountId as number)
-    ? rows.filter((row) => row.accounts.id === accountId)
-    : rows;
+  const requestedScope = options?.scope || "all";
+  const targetRows = rows.filter((row) => {
+    if (Number.isFinite(options?.accountId as number) && row.accounts.id !== options?.accountId) {
+      return false;
+    }
+    if (requestedScope !== "unhealthy") return true;
+    const health = buildRuntimeHealthForAccount({
+      accountStatus: row.accounts.status,
+      siteStatus: row.sites.status,
+      extraConfig: row.accounts.extraConfig,
+      sessionCapable: buildCapabilitiesForAccount(row.accounts).canRefreshBalance,
+    });
+    return ["unhealthy", "degraded", "unknown"].includes(health.state);
+  });
 
   const results: AccountHealthRefreshResult[] = [];
   for (const row of targetRows) {
@@ -1706,10 +1884,11 @@ export async function accountsRoutes(app: FastifyInstance) {
       }
 
       const accountId = parsedBody.data.accountId;
+      const scope = parsedBody.data.scope === "unhealthy" ? "unhealthy" : "all";
       const wait = parsedBody.data.wait === true;
 
       if (wait) {
-        const result = await executeRefreshAccountRuntimeHealth(accountId);
+        const result = await executeRefreshAccountRuntimeHealthScoped({ accountId, scope });
         if (accountId && result.summary.total === 0) {
           return reply
             .code(404)
@@ -1723,10 +1902,14 @@ export async function accountsRoutes(app: FastifyInstance) {
 
       const taskTitle = accountId
         ? `刷新账号运行健康状态 #${accountId}`
-        : "刷新全部账号运行健康状态";
+        : scope === "unhealthy"
+          ? "自动修复不正常账号运行健康状态"
+          : "刷新全部账号运行健康状态";
       const dedupeKey = accountId
         ? `refresh-account-runtime-health-${accountId}`
-        : "refresh-all-account-runtime-health";
+        : scope === "unhealthy"
+          ? "refresh-unhealthy-account-runtime-health"
+          : "refresh-all-account-runtime-health";
 
       const { task, reused } = startBackgroundTask(
         {
@@ -1746,7 +1929,7 @@ export async function accountsRoutes(app: FastifyInstance) {
           failureMessage: (currentTask) =>
             `${taskTitle}失败：${currentTask.error || "unknown error"}`,
         },
-        async () => executeRefreshAccountRuntimeHealth(accountId),
+        async () => executeRefreshAccountRuntimeHealthScoped({ accountId, scope }),
       );
 
       return reply.code(202).send({
@@ -1757,7 +1940,7 @@ export async function accountsRoutes(app: FastifyInstance) {
         status: task.status,
         message: reused
           ? "账号运行健康状态刷新进行中，请稍后查看账号列表"
-          : "已开始刷新账号运行健康状态，请稍后查看账号列表",
+          : "账号运行健康状态刷新进行中，请稍后查看账号列表",
       });
     },
   );

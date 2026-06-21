@@ -413,25 +413,11 @@ export function queueModelAvailabilityProbeTask(input: {
   );
 }
 
-export function startModelAvailabilityProbeScheduler(intervalMs = config.modelAvailabilityProbeIntervalMs) {
+export function startModelAvailabilityProbeScheduler(_intervalMs = config.modelAvailabilityProbeIntervalMs) {
   stopModelAvailabilityProbeScheduler();
-  if (!config.modelAvailabilityProbeEnabled) {
-    return {
-      enabled: false,
-      intervalMs: 0,
-    };
-  }
-
-  const safeIntervalMs = Math.max(60_000, Math.trunc(intervalMs || 0));
-  probeSchedulerTimer = setInterval(() => {
-    void queueModelAvailabilityProbeTask({
-      title: '后台模型可用性探测',
-    });
-  }, safeIntervalMs);
-  probeSchedulerTimer.unref?.();
   return {
-    enabled: true,
-    intervalMs: safeIntervalMs,
+    enabled: false,
+    intervalMs: 0,
   };
 }
 

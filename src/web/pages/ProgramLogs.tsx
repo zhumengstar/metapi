@@ -85,6 +85,54 @@ function eventStatusLabel(row: ProgramEvent) {
   return { label: '信息', cls: 'badge-info' };
 }
 
+function parseRuntimeFields(message: string | null | undefined) {
+  if (!message) {
+    return {
+      content: '-',
+      startedAt: '',
+      finishedAt: '',
+    };
+  }
+
+  let startedAt = '';
+  let finishedAt = '';
+  const contentLines: string[] = [];
+
+  for (const line of String(message).split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('开始时间：')) {
+      startedAt = trimmed.slice('开始时间：'.length).trim();
+      continue;
+    }
+    if (trimmed.startsWith('结束时间：')) {
+      finishedAt = trimmed.slice('结束时间：'.length).trim();
+      continue;
+    }
+    contentLines.push(line);
+  }
+
+  const content = contentLines.join('\n').trim();
+  return {
+    content: content || '-',
+    startedAt,
+    finishedAt,
+  };
+}
+
+function resolveEventRuntime(row: ProgramEvent) {
+  const runtime = parseRuntimeFields(row.message);
+  const status = eventStatusLabel(row);
+  const hasTerminalStatus = status.label === '成功' || status.label === '失败' || status.label === '异常' || status.label === '跳过';
+  const fallbackStartedAt = row.createdAt || '';
+  const fallbackFinishedAt = !runtime.startedAt && hasTerminalStatus ? (row.createdAt || '') : '';
+
+  return {
+    ...runtime,
+    startedAt: runtime.startedAt || fallbackStartedAt,
+    finishedAt: runtime.finishedAt || fallbackFinishedAt,
+  };
+}
+
 export default function ProgramLogs() {
   const [events, setEvents] = useState<ProgramEvent[]>([]);
   const [loading, setLoading] = useState(true);
@@ -295,6 +343,7 @@ export default function ProgramLogs() {
             {visibleRows.length > 0 ? visibleRows.map((row) => {
               const level = levelLabel(row.level || 'info');
               const eventStatus = eventStatusLabel(row);
+              const runtime = resolveEventRuntime(row);
               return (
                 <MobileCard
                   key={row.id}
@@ -319,11 +368,12 @@ export default function ProgramLogs() {
                     )
                   )}
                 >
-                  <MobileField label="时间" value={formatDateTimeLocal(row.createdAt)} />
+                  <MobileField label="开始时间" value={runtime.startedAt ? formatDateTimeLocal(runtime.startedAt) : '-'} />
+                  <MobileField label="结束时间" value={runtime.finishedAt ? formatDateTimeLocal(runtime.finishedAt) : '-'} />
                   <MobileField label="类型" value={<span className="badge badge-muted" style={{ fontSize: 11 }}>{row.type || '-'}</span>} />
                   <MobileField label="级别" value={<span className={`badge ${level.cls}`} style={{ fontSize: 11 }}>{level.label}</span>} />
                   <MobileField label="状态" value={<span className={`badge ${eventStatus.cls}`} style={{ fontSize: 11 }}>{eventStatus.label}</span>} />
-                  <MobileField label="内容" value={row.message || '-'} stacked />
+                  <MobileField label="内容" value={runtime.content} stacked />
                 </MobileCard>
               );
             }) : (
@@ -339,7 +389,8 @@ export default function ProgramLogs() {
         ) : visibleRows.length > 0 ? (
           <table className="data-table program-logs-table">
             <colgroup>
-              <col style={{ width: 170 }} />
+              <col style={{ width: 160 }} />
+              <col style={{ width: 160 }} />
               <col style={{ width: 90 }} />
               <col style={{ width: 90 }} />
               <col style={{ width: 260 }} />
@@ -349,7 +400,8 @@ export default function ProgramLogs() {
             </colgroup>
             <thead>
               <tr>
-                <th>时间</th>
+                <th>开始时间</th>
+                <th>结束时间</th>
                 <th>类型</th>
                 <th>级别</th>
                 <th>标题</th>
@@ -362,10 +414,14 @@ export default function ProgramLogs() {
               {visibleRows.map((row, idx) => {
                 const level = levelLabel(row.level || 'info');
                 const eventStatus = eventStatusLabel(row);
+                const runtime = resolveEventRuntime(row);
                 return (
                   <tr key={row.id} className={`animate-slide-up stagger-${Math.min(idx + 1, 5)}`}>
                     <td style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
-                      {formatDateTimeLocal(row.createdAt)}
+                      {runtime.startedAt ? formatDateTimeLocal(runtime.startedAt) : '-'}
+                    </td>
+                    <td style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
+                      {runtime.finishedAt ? formatDateTimeLocal(runtime.finishedAt) : '-'}
                     </td>
                     <td>
                       <span className="badge badge-muted" style={{ fontSize: 11 }}>
@@ -381,7 +437,7 @@ export default function ProgramLogs() {
                       {row.title || '-'}
                     </td>
                     <td className="program-logs-content-cell">
-                      {row.message || '-'}
+                      {runtime.content}
                     </td>
                     <td>
                       <span className={`badge ${eventStatus.cls}`} style={{ fontSize: 11 }}>

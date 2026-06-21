@@ -40,6 +40,8 @@ export interface BalanceInfo {
 interface LoginResult {
   success: boolean;
   accessToken?: string;
+  refreshToken?: string;
+  tokenExpiresAt?: number;
   username?: string;
   message?: string;
 }

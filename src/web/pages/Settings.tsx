@@ -855,11 +855,11 @@ export default function Settings() {
     setSavingModelAvailabilityProbe(true);
     try {
       const res = await api.updateRuntimeSettings({
-        modelAvailabilityProbeEnabled: enabled,
+        modelAvailabilityProbeEnabled: false,
       });
       const nextEnabled = typeof res?.modelAvailabilityProbeEnabled === 'boolean'
         ? res.modelAvailabilityProbeEnabled
-        : enabled;
+        : false;
       setRuntime((prev) => ({
         ...prev,
         modelAvailabilityProbeEnabled: nextEnabled,
@@ -867,7 +867,7 @@ export default function Settings() {
       setSavedModelAvailabilityProbeEnabled(nextEnabled);
       setModelAvailabilityProbeConfirmOpen(false);
       setModelAvailabilityProbeConfirmationInput('');
-      toast.success(nextEnabled ? '批量测活已开启' : '批量测活已关闭');
+      toast.success('后台自动测活已关闭，仅支持手动检测');
     } catch (err: any) {
       toast.error(err?.message || '保存失败');
     } finally {
@@ -876,12 +876,8 @@ export default function Settings() {
   };
 
   const saveModelAvailabilityProbeSettings = async () => {
-    if (runtime.modelAvailabilityProbeEnabled === savedModelAvailabilityProbeEnabled) {
-      toast.info('批量测活设置未变化');
-      return;
-    }
-    if (runtime.modelAvailabilityProbeEnabled) {
-      setModelAvailabilityProbeConfirmOpen(true);
+    if (!runtime.modelAvailabilityProbeEnabled && !savedModelAvailabilityProbeEnabled) {
+      toast.info('后台自动测活已关闭，仅支持手动检测');
       return;
     }
     await persistModelAvailabilityProbeSetting(false);
@@ -1876,9 +1872,9 @@ export default function Settings() {
         <div className="card animate-slide-up stagger-4" style={settingsModernDangerCardStyle} data-settings-card="model-availability-probe">
           <div style={settingsModernHeaderStyle}>
             <div style={settingsModernTitleBlockStyle}>
-              <div style={{ ...settingsModernTitleStyle, color: 'var(--color-danger)' }}>批量测活</div>
+              <div style={{ ...settingsModernTitleStyle, color: 'var(--color-danger)' }}>可用性检测</div>
               <div style={settingsModernDescriptionStyle}>
-                默认关闭。开启后，metapi 会在后台定时对活跃账号模型发送最小化探测请求，用来校正“/models 能看到但实际不可用”的假阳性。
+                后台自动测活已停用。令牌“可用”状态只由账号令牌管理或路由通道中的手动检测写入。
               </div>
             </div>
             <div style={settingsModernPillRowStyle}>
@@ -1886,7 +1882,7 @@ export default function Settings() {
                 {modelAvailabilityProbeStatusLabel}
               </span>
               <span style={getSettingsPillStyle('danger')}>
-                高风险操作
+                仅手动检测
               </span>
             </div>
           </div>
@@ -1897,22 +1893,22 @@ export default function Settings() {
               background: 'color-mix(in srgb, var(--color-danger-soft) 38%, var(--color-bg-card))',
             }}
           >
-            <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-danger)' }}>风险提示</div>
+            <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-danger)' }}>检测策略</div>
             <div style={{ fontSize: 12, lineHeight: 1.75, color: 'var(--color-text-secondary)' }}>
-              只有在你确认自己使用的中转站明确允许批量测活时才应该开启。若上游不允许，这类探测可能带来封号或风控风险。
+              模型列表仍会按计划刷新，但刷新模型不会自动请求上游测试可用性，也不会自动改写“可用”结果。
             </div>
           </div>
           <label style={settingsModernToggleStyle}>
             <div style={settingsModernToggleCopyStyle}>
-              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-secondary)' }}>允许 metapi 后台主动批量测活</span>
+              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-secondary)' }}>后台主动批量测活</span>
               <span style={{ fontSize: 12, lineHeight: 1.7, color: 'var(--color-text-muted)' }}>
-                首次从关闭切换到开启时，需要手动输入确认语句；关闭时可直接保存。
+                已固定关闭。请在账号令牌管理中使用手动检测更新可用状态。
               </span>
             </div>
             <input
               type="checkbox"
-              checked={runtime.modelAvailabilityProbeEnabled}
-              onChange={(e) => setRuntime((prev) => ({ ...prev, modelAvailabilityProbeEnabled: e.target.checked }))}
+              checked={false}
+              disabled
               style={{ width: 16, height: 16, marginTop: 2, flexShrink: 0 }}
             />
           </label>
@@ -1926,20 +1922,20 @@ export default function Settings() {
               </div>
               <div style={settingsModernFieldHintStyle}>
                 {savedModelAvailabilityProbeEnabled
-                  ? '后台会定时执行最小化探测请求，用于校正模型可用性。'
+                  ? '旧配置已被服务端强制关闭。'
                   : '后台不会主动发起模型可用性探测请求。'}
               </div>
             </div>
             <div style={settingsModernFieldCardStyle}>
-              <div style={settingsModernFieldLabelStyle}>启用门槛</div>
+              <div style={settingsModernFieldLabelStyle}>生效规则</div>
               <div style={{ ...settingsModernFieldHintStyle, marginTop: 0 }}>
-                首次开启必须手动输入确认语句，避免误把高风险探测当成普通开关。
+                只有手动检测接口会写入“可用/不可用”结果，自动拉取模型只更新模型列表和拉取时间。
               </div>
             </div>
           </ResponsiveFormGrid>
           <div style={settingsModernActionsStyle}>
             <button onClick={saveModelAvailabilityProbeSettings} disabled={savingModelAvailabilityProbe} className="btn btn-primary">
-              {savingModelAvailabilityProbe ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</> : '保存批量测活设置'}
+              {savingModelAvailabilityProbe ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</> : '保存关闭状态'}
             </button>
           </div>
         </div>

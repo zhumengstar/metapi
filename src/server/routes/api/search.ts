@@ -4,6 +4,7 @@ import { and, like, desc, eq, or } from 'drizzle-orm';
 import { getProxyLogBaseSelectFields } from '../../services/proxyLogStore.js';
 import { getCredentialModeFromExtraConfig, supportsDirectAccountRoutingConnection } from '../../services/accountExtraConfig.js';
 import { ACCOUNT_TOKEN_VALUE_STATUS_READY } from '../../services/accountTokenService.js';
+import { isSuccessfulManualTokenModelTest } from '../../services/tokenModelAvailabilityStatus.js';
 
 function hasSessionTokenValue(value: string | null | undefined): boolean {
   return typeof value === 'string' && value.trim().length > 0;
@@ -123,6 +124,10 @@ export async function searchRoutes(app: FastifyInstance) {
     // Search models (only keep routable items)
     const modelRows = await db.select({
       modelName: schema.tokenModelAvailability.modelName,
+      available: schema.tokenModelAvailability.available,
+      message: schema.tokenModelAvailability.message,
+      httpStatus: schema.tokenModelAvailability.httpStatus,
+      responseText: schema.tokenModelAvailability.responseText,
       tokenId: schema.accountTokens.id,
       accountId: schema.accounts.id,
       siteId: schema.sites.id,
@@ -134,7 +139,6 @@ export async function searchRoutes(app: FastifyInstance) {
       .where(
         and(
           like(schema.tokenModelAvailability.modelName, q),
-          eq(schema.tokenModelAvailability.available, true),
           eq(schema.accountTokens.enabled, true),
           eq(schema.accountTokens.valueStatus, ACCOUNT_TOKEN_VALUE_STATUS_READY),
           eq(schema.accounts.status, 'active'),
@@ -164,6 +168,7 @@ export async function searchRoutes(app: FastifyInstance) {
 
     const modelAgg = new Map<string, { tokenIds: Set<number>; accountIds: Set<number>; siteIds: Set<number> }>();
     for (const row of modelRows) {
+      if (!isSuccessfulManualTokenModelTest(row)) continue;
       const key = row.modelName;
       if (!modelAgg.has(key)) {
         modelAgg.set(key, { tokenIds: new Set(), accountIds: new Set(), siteIds: new Set() });

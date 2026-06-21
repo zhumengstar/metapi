@@ -29,6 +29,7 @@ import * as routeRefreshWorkflow from './services/routeRefreshWorkflow.js';
 import { startProxyFileRetentionService, stopProxyFileRetentionService } from './services/proxyFileRetentionService.js';
 import { setLegacyProxyLogRetentionFallbackEnabled, stopProxyLogRetentionService } from './services/proxyLogRetentionService.js';
 import { buildStartupSummaryLines } from './services/startupInfo.js';
+import { repairStaleBackgroundTaskEvents } from './services/backgroundTaskEventRepairService.js';
 import { repairStoredCreatedAtValues } from './services/storedTimestampRepairService.js';
 import { migrateSiteApiKeysToAccounts } from './services/siteApiKeyMigrationService.js';
 import { ensureDefaultSitesSeeded } from './services/defaultSiteSeedService.js';
@@ -61,6 +62,10 @@ import {
   startAccountTokenModelRefreshScheduler,
   stopAccountTokenModelRefreshScheduler,
 } from './services/accountTokenModelRefreshScheduler.js';
+import {
+  startAccountTokenHealthCheckScheduler,
+  stopAccountTokenHealthCheckScheduler,
+} from './services/accountTokenHealthCheckService.js';
 import { reloadBackupWebdavScheduler } from './services/backupService.js';
 import { ensureRuntimeDatabaseReady } from './runtimeDatabaseBootstrap.js';
 import { isPublicApiRoute, registerDesktopRoutes } from './desktop.js';
@@ -191,6 +196,7 @@ try {
   }
   await ensureProxyLogBillingDetailsColumn();
   await repairStoredCreatedAtValues();
+  await repairStaleBackgroundTaskEvents();
   await migrateSiteApiKeysToAccounts();
   await ensureDefaultSitesSeeded();
   await ensureOauthIdentityBackfill();
@@ -275,6 +281,7 @@ startUpdateCenterPolling();
 startUsageAggregationProjectorScheduler();
 startAdminSnapshotWarmScheduler();
 startAccountTokenModelRefreshScheduler();
+startAccountTokenHealthCheckScheduler();
 try {
   await startOAuthLoopbackCallbackServers();
 } catch (error) {
@@ -291,6 +298,7 @@ app.addHook('onClose', async () => {
   stopChannelRecoveryProbeScheduler();
   await stopUsageAggregationProjectorScheduler();
   await stopAdminSnapshotWarmScheduler();
+  stopAccountTokenHealthCheckScheduler();
   await stopAccountTokenModelRefreshScheduler();
   await stopSub2ApiManagedRefreshScheduler();
   await stopOAuthLoopbackCallbackServers();

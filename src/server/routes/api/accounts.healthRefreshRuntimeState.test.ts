@@ -3,11 +3,26 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { eq } from 'drizzle-orm';
 
 const refreshBalanceMock = vi.fn();
+const adapterLoginMock = vi.fn();
+const decryptAccountPasswordMock = vi.fn();
 
 vi.mock('../../services/balanceService.js', () => ({
   refreshBalance: (...args: unknown[]) => refreshBalanceMock(...args),
+}));
+
+vi.mock('../../services/platforms/index.js', () => ({
+  getAdapter: () => ({
+    login: (...args: unknown[]) => adapterLoginMock(...args),
+    getModels: vi.fn(),
+  }),
+}));
+
+vi.mock('../../services/accountCredentialService.js', () => ({
+  decryptAccountPassword: (...args: unknown[]) => decryptAccountPasswordMock(...args),
+  encryptAccountPassword: (password: string) => `cipher:${password}`,
 }));
 
 type DbModule = typeof import('../../db/index.js');
@@ -39,6 +54,9 @@ describe('accounts health refresh runtime state', () => {
 
   beforeEach(async () => {
     refreshBalanceMock.mockReset();
+    adapterLoginMock.mockReset();
+    decryptAccountPasswordMock.mockReset();
+    decryptAccountPasswordMock.mockReturnValue('plain-password');
     resetBackgroundTasks?.();
     await db.delete(schema.proxyLogs).run();
     await db.delete(schema.checkinLogs).run();
@@ -156,24 +174,103 @@ describe('accounts health refresh runtime state', () => {
     expect(response.statusCode).toBe(202);
     expect(response.json()).toMatchObject({
       success: true,
-      message: '已开始刷新账号运行健康状态，请稍后查看账号列表',
+      message: '账号运行健康状态刷新进行中，请稍后查看账号列表',
     });
 
     for (let i = 0; i < 10; i += 1) {
       const events = await db.select().from(schema.events).all();
       if (events.length > 0) {
         expect(events[0]).toMatchObject({
-          title: '刷新全部账号运行健康状态已开始',
-          message: '刷新全部账号运行健康状态 已开始执行',
+          title: '刷新全部账号运行健康状态进行中',
           level: 'info',
           type: 'status',
         });
+        expect(events[0]?.message).toContain('刷新全部账号运行健康状态 正在执行');
+        expect(events[0]?.message).toContain('开始时间：');
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
 
     throw new Error('expected a background task event to be recorded');
+  });
+
+  it('refreshes only unhealthy accounts when scope is unhealthy', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'Scoped Site',
+      url: 'https://scoped.example.com',
+      platform: 'done-hub',
+    }).returning().get();
+
+    const healthyAccount = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'healthy-user',
+      accessToken: 'healthy-token',
+      status: 'active',
+      extraConfig: JSON.stringify({
+        runtimeHealth: {
+          state: 'healthy',
+          reason: '余额刷新成功',
+          source: 'balance',
+          checkedAt: '2026-06-20T00:00:00.000Z',
+        },
+      }),
+    }).returning().get();
+
+    const unhealthyAccount = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'unhealthy-user',
+      accessToken: 'unhealthy-token',
+      status: 'active',
+      extraConfig: JSON.stringify({
+        runtimeHealth: {
+          state: 'unhealthy',
+          reason: '最近健康检查失败',
+          source: 'health-refresh',
+          checkedAt: '2026-06-20T00:00:00.000Z',
+        },
+      }),
+    }).returning().get();
+
+    refreshBalanceMock.mockImplementationOnce(async (accountId: number) => {
+      await db.update(schema.accounts)
+        .set({
+          extraConfig: JSON.stringify({
+            runtimeHealth: {
+              state: 'healthy',
+              reason: '余额刷新成功',
+              source: 'balance',
+              checkedAt: '2026-06-20T01:00:00.000Z',
+            },
+          }),
+        })
+        .where(eq(schema.accounts.id, accountId))
+        .run();
+      return { balance: 100, used: 0, quota: 100 };
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/accounts/health/refresh',
+      payload: { scope: 'unhealthy', wait: true },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as {
+      success: boolean;
+      summary: { total: number; success: number };
+      results: Array<{ accountId: number; state: string }>;
+    };
+
+    expect(body.success).toBe(true);
+    expect(body.summary).toMatchObject({
+      total: 1,
+      success: 1,
+    });
+    expect(body.results.map((item) => item.accountId)).toEqual([unhealthyAccount.id]);
+    expect(refreshBalanceMock).toHaveBeenCalledTimes(1);
+    expect(refreshBalanceMock).toHaveBeenCalledWith(unhealthyAccount.id);
+    expect(refreshBalanceMock).not.toHaveBeenCalledWith(healthyAccount.id);
   });
 
   it('fails a single-account health refresh after 10 seconds when the site never responds', async () => {
@@ -229,7 +326,7 @@ describe('accounts health refresh runtime state', () => {
     }
   }, 1000);
 
-  it('skips runtime refresh for proxy-only accounts', async () => {
+  it('auto-reactivates expired proxy-only accounts without balance refresh', async () => {
     const site = await db.insert(schema.sites).values({
       name: 'Proxy Site',
       url: 'https://proxy.example.com',
@@ -257,7 +354,7 @@ describe('accounts health refresh runtime state', () => {
       success: boolean;
       summary: {
         total: number;
-        skipped: number;
+        success: number;
         failed: number;
       };
       results: Array<{ status: string; state: string; message: string }>;
@@ -266,14 +363,162 @@ describe('accounts health refresh runtime state', () => {
     expect(body.success).toBe(true);
     expect(body.summary).toMatchObject({
       total: 1,
-      skipped: 1,
+      success: 1,
       failed: 0,
     });
     expect(body.results[0]).toMatchObject({
-      status: 'skipped',
+      status: 'success',
       state: 'unknown',
+      message: '已自动激活，等待模型探测',
     });
     expect(refreshBalanceMock).not.toHaveBeenCalled();
+    const updated = await db.select().from(schema.accounts).where(eq(schema.accounts.id, account.id)).get();
+    expect(updated?.status).toBe('active');
+  });
+
+  it('relogs expired accounts with stored username/password before refreshing health', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'Login Site',
+      url: 'https://login.example.com',
+      platform: 'new-api',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'expired-user',
+      accessToken: '',
+      status: 'expired',
+      extraConfig: JSON.stringify({
+        credentialMode: 'session',
+        autoRelogin: {
+          username: 'expired-user@example.com',
+          passwordCipher: 'cipher-text',
+        },
+      }),
+    }).returning().get();
+
+    adapterLoginMock.mockResolvedValueOnce({
+      success: true,
+      accessToken: 'fresh-session-token',
+      refreshToken: 'fresh-refresh-token',
+      tokenExpiresAt: 1782000000000,
+    });
+    refreshBalanceMock.mockImplementationOnce(async () => {
+      await db.update(schema.accounts)
+        .set({
+          status: 'active',
+          extraConfig: JSON.stringify({
+            credentialMode: 'session',
+            autoRelogin: {
+              username: 'expired-user@example.com',
+              passwordCipher: 'cipher-text',
+            },
+            sub2apiAuth: {
+              refreshToken: 'fresh-refresh-token',
+              tokenExpiresAt: 1782000000000,
+            },
+            runtimeHealth: {
+              state: 'healthy',
+              reason: '余额刷新成功',
+              source: 'balance',
+              checkedAt: '2026-06-20T01:00:00.000Z',
+            },
+          }),
+        })
+        .where(eq(schema.accounts.id, account.id))
+        .run();
+      return { balance: 100, used: 0, quota: 100 };
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/accounts/health/refresh',
+      payload: { accountId: account.id, wait: true },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as {
+      success: boolean;
+      summary: { success: number; failed: number; healthy: number };
+      results: Array<{ status: string; state: string; message: string }>;
+    };
+
+    expect(body.success).toBe(true);
+    expect(body.summary).toMatchObject({
+      success: 1,
+      failed: 0,
+      healthy: 1,
+    });
+    expect(body.results[0]).toMatchObject({
+      status: 'success',
+      state: 'healthy',
+    });
+    expect(decryptAccountPasswordMock).toHaveBeenCalledWith('cipher-text');
+    expect(adapterLoginMock).toHaveBeenCalledWith(
+      'https://login.example.com',
+      'expired-user@example.com',
+      'plain-password',
+    );
+    expect(refreshBalanceMock).toHaveBeenCalledWith(account.id);
+    const updated = await db.select().from(schema.accounts).where(eq(schema.accounts.id, account.id)).get();
+    expect(updated?.accessToken).toBe('fresh-session-token');
+    expect(updated?.status).toBe('active');
+    expect(JSON.parse(updated?.extraConfig || '{}').sub2apiAuth).toMatchObject({
+      refreshToken: 'fresh-refresh-token',
+      tokenExpiresAt: 1782000000000,
+    });
+  });
+
+  it('does not activate expired accounts when stored username/password relogin fails', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'Login Site',
+      url: 'https://login.example.com',
+      platform: 'new-api',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'expired-user',
+      accessToken: '',
+      status: 'expired',
+      extraConfig: JSON.stringify({
+        credentialMode: 'session',
+        autoRelogin: {
+          username: 'expired-user@example.com',
+          passwordCipher: 'cipher-text',
+        },
+      }),
+    }).returning().get();
+
+    adapterLoginMock.mockResolvedValueOnce({
+      success: false,
+      message: 'invalid credentials',
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/accounts/health/refresh',
+      payload: { accountId: account.id, wait: true },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as {
+      summary: { failed: number; unhealthy: number };
+      results: Array<{ status: string; state: string; message: string }>;
+    };
+
+    expect(body.summary).toMatchObject({
+      failed: 1,
+      unhealthy: 1,
+    });
+    expect(body.results[0]).toMatchObject({
+      status: 'failed',
+      state: 'unhealthy',
+      message: '账号密码重新登录失败：invalid credentials',
+    });
+    expect(refreshBalanceMock).not.toHaveBeenCalled();
+    const updated = await db.select().from(schema.accounts).where(eq(schema.accounts.id, account.id)).get();
+    expect(updated?.status).toBe('expired');
   });
 
   it('finishes the background refresh-all task after the 10 second site timeout instead of staying in progress', async () => {

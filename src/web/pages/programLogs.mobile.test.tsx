@@ -52,7 +52,7 @@ describe('ProgramLogs mobile layout', () => {
         id: 1,
         type: 'status',
         title: '同步完成',
-        message: '成功 3，失败 0',
+        message: '成功 3，失败 0\n开始时间：2026-06-20 01:00:00\n结束时间：2026-06-20 01:02:03',
         level: 'info',
         read: false,
         createdAt: '2026-03-04T06:43:03.000Z',
@@ -87,6 +87,8 @@ describe('ProgramLogs mobile layout', () => {
       expect(collectText(root!.root)).toContain('同步完成');
       expect(collectText(root!.root)).toContain('筛选');
       expect(collectText(root!.root)).toContain('标记已读');
+      expect(collectText(root!.root)).toContain('开始时间');
+      expect(collectText(root!.root)).toContain('结束时间');
 
       const markReadButton = findButtonByText(root!.root, '标记已读');
       await act(async () => {

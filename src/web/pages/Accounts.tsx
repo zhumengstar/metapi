@@ -229,6 +229,8 @@ export default function Accounts() {
     useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastRebindTargetRef = useRef<any | null>(null);
   const modelModalRequestSeqRef = useRef(0);
+  const autoHealthRefreshQueuedRef = useRef(false);
+  const autoHealthReloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const toast = useToast();
   if (rebindTarget) lastRebindTargetRef.current = rebindTarget;
   const activeRebindTarget = rebindTarget || lastRebindTargetRef.current;
@@ -249,6 +251,25 @@ export default function Accounts() {
           nextAccounts.some((account: any) => account.id === id),
         ),
       );
+      const hasUnhealthyAccounts = nextAccounts.some((account: any) => {
+        const state = account?.runtimeHealth?.state;
+        return account?.status === "expired" || ["unhealthy", "degraded", "unknown"].includes(state);
+      });
+      if (hasUnhealthyAccounts && !autoHealthRefreshQueuedRef.current) {
+        autoHealthRefreshQueuedRef.current = true;
+        void api.refreshAccountHealth({ scope: "unhealthy" })
+          .then(() => {
+            if (autoHealthReloadTimerRef.current) {
+              clearTimeout(autoHealthReloadTimerRef.current);
+            }
+            autoHealthReloadTimerRef.current = setTimeout(() => {
+              void load(true);
+            }, 12_000);
+          })
+          .catch(() => {
+            autoHealthRefreshQueuedRef.current = false;
+          });
+      }
     } catch (error: any) {
       toast.error(error?.message || "加载账号列表失败");
     } finally {
@@ -334,11 +355,30 @@ export default function Accounts() {
       (account) => resolveAccountCredentialMode(account) === activeSegment,
     );
   }, [activeSegment, sortedAccounts]);
+  const visibleAccountIdSignature = useMemo(
+    () => visibleAccounts
+      .map((account) => Number(account?.id))
+      .filter((id) => Number.isInteger(id) && id > 0)
+      .join(","),
+    [visibleAccounts],
+  );
   const allVisibleAccountsSelected =
     visibleAccounts.length > 0 &&
     visibleAccounts.every((account) => selectedAccountIds.includes(account.id));
   const verifyFailureHint = buildVerifyFailureHint(verifyResult);
   const addAccountPrereqHint = buildAddAccountPrereqHint(verifyResult);
+
+  useEffect(() => {
+    if (activeSegment === "tokens") return;
+    const visibleIds = visibleAccountIdSignature
+      ? visibleAccountIdSignature.split(",").map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0)
+      : [];
+
+    setSelectedAccountIds((current) => {
+      if (current.length === visibleIds.length && current.every((id, index) => id === visibleIds[index])) return current;
+      return visibleIds;
+    });
+  }, [activeSegment, visibleAccountIdSignature]);
 
   const setSegment = (nextSegment: ConnectionsSegment) => {
     const params = new URLSearchParams(location.search);
@@ -414,6 +454,9 @@ export default function Accounts() {
       }
       if (credentialPopoverCloseTimerRef.current) {
         clearTimeout(credentialPopoverCloseTimerRef.current);
+      }
+      if (autoHealthReloadTimerRef.current) {
+        clearTimeout(autoHealthReloadTimerRef.current);
       }
     };
   }, []);

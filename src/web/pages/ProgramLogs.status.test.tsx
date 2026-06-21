@@ -71,7 +71,7 @@ describe('ProgramLogs status label', () => {
     expect(targetRow).toBeTruthy();
 
     const tds = targetRow!.findAll((node) => node.type === 'td');
-    const statusCell = tds[5];
+    const statusCell = tds[6];
     expect(collectText(statusCell).trim()).toBe('成功');
     const statusBadge = statusCell.find((node) => node.type === 'span');
     expect(String(statusBadge.props.className || '')).toContain('badge-success');
@@ -107,7 +107,7 @@ describe('ProgramLogs status label', () => {
     expect(targetRow).toBeTruthy();
 
     const tds = targetRow!.findAll((node) => node.type === 'td');
-    const statusCell = tds[5];
+    const statusCell = tds[6];
     expect(collectText(statusCell).trim()).toBe('成功');
     const statusBadge = statusCell.find((node) => node.type === 'span');
     expect(String(statusBadge.props.className || '')).toContain('badge-success');
@@ -153,7 +153,77 @@ describe('ProgramLogs status label', () => {
 
     expect(startedRow).toBeTruthy();
     expect(runningRow).toBeTruthy();
-    expect(collectText(startedRow!.findAll((node) => node.type === 'td')[5]).trim()).toBe('进行中');
-    expect(collectText(runningRow!.findAll((node) => node.type === 'td')[5]).trim()).toBe('进行中');
+    expect(collectText(startedRow!.findAll((node) => node.type === 'td')[6]).trim()).toBe('进行中');
+    expect(collectText(runningRow!.findAll((node) => node.type === 'td')[6]).trim()).toBe('进行中');
+  });
+
+  it('shows task start and end time in dedicated columns', async () => {
+    apiMock.getEvents.mockResolvedValue([
+      {
+        id: 5,
+        type: 'status',
+        title: '获取全部账号分组已完成',
+        message: '获取全部账号分组已完成\n开始时间：2026-06-20 01:00:00\n结束时间：2026-06-20 01:02:03',
+        level: 'info',
+        read: false,
+        createdAt: '2026-06-20T01:02:03.000Z',
+      },
+    ]);
+
+    let root!: WebTestRenderer;
+    await act(async () => {
+      root = create(
+        <MemoryRouter initialEntries={['/events']}>
+          <ToastProvider>
+            <ProgramLogs />
+          </ToastProvider>
+        </MemoryRouter>,
+      );
+    });
+    await flushMicrotasks();
+
+    const rows = root!.root.findAll((node) => node.type === 'tr');
+    const targetRow = rows.find((row) => collectText(row).includes('获取全部账号分组已完成'));
+    expect(targetRow).toBeTruthy();
+
+    const tds = targetRow!.findAll((node) => node.type === 'td');
+    expect(collectText(tds[0])).toContain('2026');
+    expect(collectText(tds[1])).toContain('2026');
+    expect(collectText(tds[5])).not.toContain('开始时间');
+    expect(collectText(tds[5])).not.toContain('结束时间');
+  });
+
+  it('uses createdAt as the visible start time when the event has no embedded runtime lines', async () => {
+    apiMock.getEvents.mockResolvedValue([
+      {
+        id: 6,
+        type: 'token',
+        title: '账号令牌删除成功',
+        message: 'default: 删除成功',
+        level: 'info',
+        read: false,
+        createdAt: '2026-06-20T09:29:25.452Z',
+      },
+    ]);
+
+    let root!: WebTestRenderer;
+    await act(async () => {
+      root = create(
+        <MemoryRouter initialEntries={['/events']}>
+          <ToastProvider>
+            <ProgramLogs />
+          </ToastProvider>
+        </MemoryRouter>,
+      );
+    });
+    await flushMicrotasks();
+
+    const rows = root!.root.findAll((node) => node.type === 'tr');
+    const targetRow = rows.find((row) => collectText(row).includes('账号令牌删除成功'));
+    expect(targetRow).toBeTruthy();
+
+    const tds = targetRow!.findAll((node) => node.type === 'td');
+    expect(collectText(tds[0])).toContain('2026');
+    expect(collectText(tds[1])).toContain('2026');
   });
 });

@@ -28,6 +28,7 @@ describe('rebuildTokenRoutesFromAvailability', () => {
 
   beforeEach(async () => {
     await db.delete(schema.routeChannels).run();
+    await db.delete(schema.routeChannelStatSnapshots).run();
     await db.delete(schema.tokenRoutes).run();
     await db.delete(schema.tokenModelAvailability).run();
     await db.delete(schema.modelAvailability).run();
@@ -72,6 +73,7 @@ describe('rebuildTokenRoutesFromAvailability', () => {
       .where(eq(schema.tokenRoutes.modelPattern, 'gpt-5.2-codex'))
       .get();
     expect(route).toBeDefined();
+    expect(route?.routingStrategy).toBe('stable_first');
 
     const channels = await db.select().from(schema.routeChannels)
       .where(and(
@@ -83,6 +85,60 @@ describe('rebuildTokenRoutesFromAvailability', () => {
     expect(channels).toHaveLength(1);
     expect(channels[0]?.tokenId ?? null).toBeNull();
     expect(channels[0]?.manualOverride).toBe(false);
+  });
+
+  it('keeps existing route strategy while new auto-created routes use stable first', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'strategy-site',
+      url: 'https://strategy-site.example.com',
+      platform: 'new-api',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'strategy-user',
+      accessToken: '',
+      apiToken: 'sk-strategy-route',
+      status: 'active',
+      extraConfig: JSON.stringify({ credentialMode: 'apikey' }),
+    }).returning().get();
+
+    await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'existing-model',
+      routingStrategy: 'weighted',
+      enabled: true,
+    }).run();
+
+    await db.insert(schema.modelAvailability).values([
+      {
+        accountId: account.id,
+        modelName: 'existing-model',
+        available: true,
+        latencyMs: 100,
+        checkedAt: '2026-03-08T08:00:00.000Z',
+      },
+      {
+        accountId: account.id,
+        modelName: 'new-model',
+        available: true,
+        latencyMs: 120,
+        checkedAt: '2026-03-08T08:00:00.000Z',
+      },
+    ]).run();
+
+    const rebuild = await rebuildTokenRoutesFromAvailability();
+
+    expect(rebuild.createdRoutes).toBe(1);
+
+    const existingRoute = await db.select().from(schema.tokenRoutes)
+      .where(eq(schema.tokenRoutes.modelPattern, 'existing-model'))
+      .get();
+    const newRoute = await db.select().from(schema.tokenRoutes)
+      .where(eq(schema.tokenRoutes.modelPattern, 'new-model'))
+      .get();
+
+    expect(existingRoute?.routingStrategy).toBe('weighted');
+    expect(newRoute?.routingStrategy).toBe('stable_first');
   });
 
   it('ignores hidden account_tokens for direct apikey connections when rebuilding routes', async () => {
@@ -122,7 +178,11 @@ describe('rebuildTokenRoutesFromAvailability', () => {
       tokenId: hiddenToken.id,
       modelName: 'gpt-4.1',
       available: true,
+      routeEnabled: true,
       latencyMs: 180,
+      message: '请求成功',
+      httpStatus: 200,
+      responseText: 'OK',
       checkedAt: '2026-03-20T08:00:00.000Z',
     }).run();
 
@@ -144,6 +204,99 @@ describe('rebuildTokenRoutesFromAvailability', () => {
 
     expect(channels).toHaveLength(1);
     expect(channels[0]?.tokenId ?? null).toBeNull();
+  });
+
+  it('does not route account token models until they are explicitly enabled for routing', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'managed-site',
+      url: 'https://managed.example.com',
+      platform: 'new-api',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'managed-user',
+      accessToken: 'session-token',
+      status: 'active',
+      extraConfig: JSON.stringify({ credentialMode: 'session' }),
+    }).returning().get();
+
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'managed-token',
+      token: 'sk-managed-token',
+      source: 'synced',
+      enabled: true,
+      isDefault: true,
+    }).returning().get();
+
+    await db.insert(schema.tokenModelAvailability).values({
+      tokenId: token.id,
+      modelName: 'gpt-5.5',
+      available: true,
+      routeEnabled: false,
+    }).run();
+
+    const rebuild = await rebuildTokenRoutesFromAvailability();
+
+    expect(rebuild.models).toBe(0);
+    const route = await db.select().from(schema.tokenRoutes)
+      .where(eq(schema.tokenRoutes.modelPattern, 'gpt-5.5'))
+      .get();
+    expect(route).toBeUndefined();
+  });
+
+  it('routes image account token models when route-enabled even without a chat availability success', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'managed-image-site',
+      url: 'https://managed-image.example.com',
+      platform: 'new-api',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'managed-image-user',
+      accessToken: 'session-token',
+      status: 'active',
+      extraConfig: JSON.stringify({ credentialMode: 'session' }),
+    }).returning().get();
+
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'managed-image-token',
+      token: 'sk-managed-image-token',
+      source: 'synced',
+      enabled: true,
+      isDefault: true,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+
+    await db.insert(schema.tokenModelAvailability).values({
+      tokenId: token.id,
+      modelName: 'gpt-image-1',
+      available: false,
+      routeEnabled: true,
+      message: '图片模型不进行聊天可用性测试',
+      httpStatus: null,
+    }).run();
+
+    const rebuild = await rebuildTokenRoutesFromAvailability();
+
+    expect(rebuild.models).toBe(1);
+    const route = await db.select().from(schema.tokenRoutes)
+      .where(eq(schema.tokenRoutes.modelPattern, 'gpt-image-1'))
+      .get();
+    expect(route).toBeDefined();
+
+    const channels = await db.select().from(schema.routeChannels)
+      .where(and(
+        eq(schema.routeChannels.routeId, route!.id),
+        eq(schema.routeChannels.accountId, account.id),
+      ))
+      .all();
+
+    expect(channels).toHaveLength(1);
+    expect(channels[0]?.tokenId).toBe(token.id);
   });
 
   it('creates an exact route with an account-direct channel for oauth model availability', async () => {
@@ -279,6 +432,10 @@ describe('rebuildTokenRoutesFromAvailability', () => {
       tokenId: token.id,
       modelName: 'latest-model',
       available: true,
+      routeEnabled: true,
+      message: '请求成功',
+      httpStatus: 200,
+      responseText: 'OK',
     }).run();
 
     const staleRoute = await db.insert(schema.tokenRoutes).values({
@@ -331,5 +488,108 @@ describe('rebuildTokenRoutesFromAvailability', () => {
 
     const wildcardRouteAfter = await db.select().from(schema.tokenRoutes).where(eq(schema.tokenRoutes.id, wildcardRoute.id)).get();
     expect(wildcardRouteAfter).toBeDefined();
+  });
+
+  it('restores route channel statistics after automatic route deletion and recreation', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'stats-site',
+      url: 'https://stats.example.com',
+      platform: 'new-api',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'stats-user',
+      accessToken: 'session-token',
+      status: 'active',
+      extraConfig: JSON.stringify({ credentialMode: 'session' }),
+    }).returning().get();
+
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'stats-token',
+      token: 'sk-stats-token',
+      source: 'manual',
+      enabled: true,
+      isDefault: true,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+
+    await db.insert(schema.tokenModelAvailability).values({
+      tokenId: token.id,
+      modelName: 'stats-model',
+      available: true,
+      routeEnabled: true,
+      message: '请求成功',
+      httpStatus: 200,
+      responseText: 'OK',
+    }).run();
+
+    await rebuildTokenRoutesFromAvailability();
+
+    const initialRoute = await db.select().from(schema.tokenRoutes)
+      .where(eq(schema.tokenRoutes.modelPattern, 'stats-model'))
+      .get();
+    expect(initialRoute).toBeDefined();
+    const initialChannel = await db.select().from(schema.routeChannels)
+      .where(and(
+        eq(schema.routeChannels.routeId, initialRoute!.id),
+        eq(schema.routeChannels.tokenId, token.id),
+      ))
+      .get();
+    expect(initialChannel).toBeDefined();
+
+    await db.update(schema.routeChannels).set({
+      successCount: 17,
+      failCount: 3,
+      totalLatencyMs: 12000,
+      totalCost: 0.42,
+      totalInputTokens: 9000,
+      lastUsedAt: '2026-06-21T01:00:00.000Z',
+      lastSelectedAt: '2026-06-21T01:01:00.000Z',
+      lastFailAt: '2026-06-21T00:59:00.000Z',
+      consecutiveFailCount: 2,
+      cooldownLevel: 1,
+      cooldownUntil: '2026-06-21T01:05:00.000Z',
+    }).where(eq(schema.routeChannels.id, initialChannel!.id)).run();
+
+    await db.update(schema.tokenModelAvailability).set({ routeEnabled: false })
+      .where(eq(schema.tokenModelAvailability.tokenId, token.id))
+      .run();
+    await rebuildTokenRoutesFromAvailability();
+
+    const archived = await db.select().from(schema.routeChannelStatSnapshots).all();
+    expect(archived).toHaveLength(1);
+    expect(archived[0]?.successCount).toBe(17);
+    expect(archived[0]?.failCount).toBe(3);
+    expect(archived[0]?.totalInputTokens).toBe(9000);
+
+    await db.update(schema.tokenModelAvailability).set({ routeEnabled: true })
+      .where(eq(schema.tokenModelAvailability.tokenId, token.id))
+      .run();
+    await rebuildTokenRoutesFromAvailability();
+
+    const recreatedRoute = await db.select().from(schema.tokenRoutes)
+      .where(eq(schema.tokenRoutes.modelPattern, 'stats-model'))
+      .get();
+    expect(recreatedRoute).toBeDefined();
+    const recreatedChannel = await db.select().from(schema.routeChannels)
+      .where(and(
+        eq(schema.routeChannels.routeId, recreatedRoute!.id),
+        eq(schema.routeChannels.tokenId, token.id),
+      ))
+      .get();
+
+    expect(recreatedChannel?.successCount).toBe(17);
+    expect(recreatedChannel?.failCount).toBe(3);
+    expect(recreatedChannel?.totalLatencyMs).toBe(12000);
+    expect(recreatedChannel?.totalCost).toBe(0.42);
+    expect(recreatedChannel?.totalInputTokens).toBe(9000);
+    expect(recreatedChannel?.lastUsedAt).toBe('2026-06-21T01:00:00.000Z');
+    expect(recreatedChannel?.lastSelectedAt).toBe('2026-06-21T01:01:00.000Z');
+    expect(recreatedChannel?.lastFailAt).toBe('2026-06-21T00:59:00.000Z');
+    expect(recreatedChannel?.consecutiveFailCount).toBe(2);
+    expect(recreatedChannel?.cooldownLevel).toBe(1);
+    expect(recreatedChannel?.cooldownUntil).toBe('2026-06-21T01:05:00.000Z');
   });
 });

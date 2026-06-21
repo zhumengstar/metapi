@@ -1,16 +1,46 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-import {
-  __resetBackgroundTasksForTests,
-  appendBackgroundTaskLog,
-  getBackgroundTask,
-  startBackgroundTask,
-  subscribeToBackgroundTaskLogs,
-} from './backgroundTaskService.js';
+type DbModule = typeof import('../db/index.js');
+type BackgroundTaskModule = typeof import('./backgroundTaskService.js');
 
 describe('background task log streaming', () => {
-  afterEach(() => {
+  let db: DbModule['db'];
+  let schema: DbModule['schema'];
+  let __resetBackgroundTasksForTests: BackgroundTaskModule['__resetBackgroundTasksForTests'];
+  let appendBackgroundTaskLog: BackgroundTaskModule['appendBackgroundTaskLog'];
+  let getBackgroundTask: BackgroundTaskModule['getBackgroundTask'];
+  let startBackgroundTask: BackgroundTaskModule['startBackgroundTask'];
+  let subscribeToBackgroundTaskLogs: BackgroundTaskModule['subscribeToBackgroundTaskLogs'];
+  let waitForBackgroundTaskCompletion: BackgroundTaskModule['waitForBackgroundTaskCompletion'];
+  let dataDir = '';
+
+  beforeAll(async () => {
+    dataDir = mkdtempSync(join(tmpdir(), 'metapi-background-task-logs-'));
+    process.env.DATA_DIR = dataDir;
+
+    await import('../db/migrate.js');
+    const dbModule = await import('../db/index.js');
+    const backgroundTaskModule = await import('./backgroundTaskService.js');
+    db = dbModule.db;
+    schema = dbModule.schema;
+    __resetBackgroundTasksForTests = backgroundTaskModule.__resetBackgroundTasksForTests;
+    appendBackgroundTaskLog = backgroundTaskModule.appendBackgroundTaskLog;
+    getBackgroundTask = backgroundTaskModule.getBackgroundTask;
+    startBackgroundTask = backgroundTaskModule.startBackgroundTask;
+    subscribeToBackgroundTaskLogs = backgroundTaskModule.subscribeToBackgroundTaskLogs;
+    waitForBackgroundTaskCompletion = backgroundTaskModule.waitForBackgroundTaskCompletion;
+  });
+
+  afterEach(async () => {
     __resetBackgroundTasksForTests();
+    await db.delete(schema.events).run();
+  });
+
+  afterAll(() => {
+    delete process.env.DATA_DIR;
   });
 
   it('appends log entries in order and exposes them through task lookups', async () => {
@@ -40,6 +70,7 @@ describe('background task log streaming', () => {
     ]);
 
     releaseRunner?.();
+    await waitForBackgroundTaskCompletion(task.id);
   });
 
   it('notifies subscribers when new log entries arrive', async () => {
@@ -74,6 +105,7 @@ describe('background task log streaming', () => {
 
     unsubscribe();
     releaseRunner?.();
+    await waitForBackgroundTaskCompletion(task.id);
   });
 
   it('trims old log entries to a bounded buffer', async () => {
@@ -109,5 +141,29 @@ describe('background task log streaming', () => {
     });
 
     releaseRunner?.();
+    await waitForBackgroundTaskCompletion(task.id);
+  });
+
+  it('updates the original task event with start and end times instead of appending a terminal event', async () => {
+    const { task } = startBackgroundTask(
+      {
+        type: 'update-center.deploy',
+        title: '更新部署',
+      },
+      async () => ({ success: true }),
+    );
+
+    await waitForBackgroundTaskCompletion(task.id);
+
+    const rows = await db.select().from(schema.events).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      title: '更新部署 已完成',
+      level: 'info',
+      relatedType: 'task',
+    });
+    expect(rows[0]?.message).toContain('更新部署 已完成');
+    expect(rows[0]?.message).toContain('开始时间：');
+    expect(rows[0]?.message).toContain('结束时间：');
   });
 });

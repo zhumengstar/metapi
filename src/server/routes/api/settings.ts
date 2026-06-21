@@ -40,11 +40,9 @@ import { invalidateSiteProxyCache, normalizeSiteProxyUrl, withExplicitProxyReque
 import { performFactoryReset } from '../../services/factoryResetService.js';
 import { normalizeLogCleanupRetentionDays } from '../../shared/logCleanupRetentionDays.js';
 import { stopProxyLogRetentionService } from '../../services/proxyLogRetentionService.js';
-import {
-  startModelAvailabilityProbeScheduler,
-  stopModelAvailabilityProbeScheduler,
-} from '../../services/modelAvailabilityProbeService.js';
+import { stopModelAvailabilityProbeScheduler } from '../../services/modelAvailabilityProbeService.js';
 import { parsePayloadRulesConfigInput } from '../../services/payloadRules.js';
+import { deleteRouteChannelsPreservingStats } from '../../services/routeChannelStatsService.js';
 
 type RoutingWeights = typeof config.routingWeights;
 
@@ -415,12 +413,8 @@ function applyImportedSettingToRuntime(key: string, value: unknown) {
     }
     case 'model_availability_probe_enabled': {
       if (typeof value !== 'boolean') return;
-      config.modelAvailabilityProbeEnabled = value;
-      if (value) {
-        startModelAvailabilityProbeScheduler();
-      } else {
-        stopModelAvailabilityProbeScheduler();
-      }
+      config.modelAvailabilityProbeEnabled = false;
+      stopModelAvailabilityProbeScheduler();
       return;
     }
     case 'codex_upstream_websocket_enabled': {
@@ -721,7 +715,7 @@ function getRuntimeSettingsResponse(currentAdminIp = '') {
     logCleanupUsageLogsEnabled: config.logCleanupUsageLogsEnabled,
     logCleanupProgramLogsEnabled: config.logCleanupProgramLogsEnabled,
     logCleanupRetentionDays: config.logCleanupRetentionDays,
-    modelAvailabilityProbeEnabled: config.modelAvailabilityProbeEnabled,
+    modelAvailabilityProbeEnabled: false,
     codexUpstreamWebsocketEnabled: config.codexUpstreamWebsocketEnabled,
     responsesCompactFallbackToResponsesEnabled: config.responsesCompactFallbackToResponsesEnabled,
     disableCrossProtocolFallback: config.disableCrossProtocolFallback,
@@ -1168,16 +1162,14 @@ export async function settingsRoutes(app: FastifyInstance) {
         });
       }
 
-      if (nextValue !== config.modelAvailabilityProbeEnabled) {
-        changedLabels.push(nextValue ? '开启批量测活' : '关闭批量测活');
+      if (config.modelAvailabilityProbeEnabled) {
+        changedLabels.push('关闭批量测活');
+      } else if (nextValue) {
+        changedLabels.push('批量测活保持关闭');
       }
-      await upsertSetting('model_availability_probe_enabled', nextValue);
-      config.modelAvailabilityProbeEnabled = nextValue;
-      if (nextValue) {
-        startModelAvailabilityProbeScheduler();
-      } else {
-        stopModelAvailabilityProbeScheduler();
-      }
+      await upsertSetting('model_availability_probe_enabled', false);
+      config.modelAvailabilityProbeEnabled = false;
+      stopModelAvailabilityProbeScheduler();
     }
 
     if (body.codexUpstreamWebsocketEnabled !== undefined) {
@@ -1986,7 +1978,8 @@ export async function settingsRoutes(app: FastifyInstance) {
 
   app.post('/api/settings/maintenance/clear-cache', async (_, reply) => {
     const deletedModelAvailability = (await db.delete(schema.modelAvailability).run()).changes;
-    const deletedRouteChannels = (await db.delete(schema.routeChannels).run()).changes;
+    const existingRouteChannels = await db.select().from(schema.routeChannels).all();
+    const deletedRouteChannels = await deleteRouteChannelsPreservingStats(existingRouteChannels);
     const deletedTokenRoutes = (await db.delete(schema.tokenRoutes).run()).changes;
 
     const { task, reused } = startBackgroundTask(

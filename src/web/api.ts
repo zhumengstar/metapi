@@ -11,6 +11,8 @@ type RequestOptions = RequestInit & {
   timeoutMs?: number;
 };
 
+type RouteRoutingStrategyApi = "weighted" | "round_robin" | "stable_first";
+
 function requireAuthToken(): string {
   const token = getAuthToken(localStorage);
   if (!token) {
@@ -469,6 +471,8 @@ export type ProxyLogListItem = {
   username?: string | null;
   siteName?: string | null;
   siteUrl?: string | null;
+  tokenGroup?: string | null;
+  tokenGroupRatio?: number | null;
   errorMessage?: string | null;
   downstreamKeyId?: number | null;
   downstreamKeyName?: string | null;
@@ -484,6 +488,8 @@ export type ProxyLogListItem = {
   cacheHitRate?: number | null;
   completionTokens?: number | null;
   estimatedCost?: number | null;
+  rawEstimatedCost?: number | null;
+  rechargeRatio?: number | null;
 };
 
 export type ProxyLogDetail = ProxyLogListItem & {
@@ -862,7 +868,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ models }),
     }),
-  refreshAccountHealth: (data?: { accountId?: number; wait?: boolean }) =>
+  refreshAccountHealth: (data?: { accountId?: number; scope?: "all" | "unhealthy"; wait?: boolean }) =>
     request("/api/accounts/health/refresh", {
       method: "POST",
       body: JSON.stringify(data || {}),
@@ -914,11 +920,38 @@ export const api = {
     )}`, {
       timeoutMs: options?.refresh === false ? 30_000 : 60_000,
     }),
+  setAccountTokenModelRouteEnabled: (id: number, data: { modelName: string; routeEnabled: boolean }) =>
+    request(`/api/account-tokens/${id}/models/route-enabled`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  updateAccountTokenHealthCheck: (id: number, data: { enabled: boolean; model?: string; models?: string[]; intervalMinutes: number }) =>
+    request(`/api/account-tokens/${id}/health-check`, {
+      method: "PUT",
+      body: JSON.stringify(data),
+    }),
+  runAccountTokenHealthCheck: (id: number) =>
+    request(`/api/account-tokens/${id}/health-check/run`, {
+      method: "POST",
+      timeoutMs: 90_000,
+    }),
   testAccountTokenModelAvailability: (data: { model: string; tokenIds: number[] }) =>
     request("/api/account-tokens/models/test", {
       method: "POST",
       body: JSON.stringify(data),
       timeoutMs: 240_000,
+    }),
+  saveSkippedAccountTokenModelAvailability: (data: { results: Array<{
+    tokenId: number;
+    model: string;
+    available: false;
+    message?: string;
+    checkedAt?: string | null;
+  }> }) =>
+    request("/api/account-tokens/models/test-skipped", {
+      method: "POST",
+      body: JSON.stringify(data),
+      timeoutMs: 30_000,
     }),
   syncAccountTokens: (accountId: number) =>
     request(`/api/account-tokens/sync/${accountId}`, {
@@ -976,7 +1009,11 @@ export const api = {
     request(`/api/routes/${id}`, { method: "DELETE" }),
   clearRouteCooldown: (id: number) =>
     request(`/api/routes/${id}/cooldown/clear`, { method: "POST" }),
-  batchUpdateRoutes: (data: { ids: number[]; action: "enable" | "disable" }) =>
+  batchUpdateRoutes: (data: {
+    ids: number[];
+    action?: "enable" | "disable";
+    routingStrategy?: RouteRoutingStrategyApi;
+  }) =>
     request("/api/routes/batch", {
       method: "POST",
       body: JSON.stringify(data),
@@ -991,6 +1028,12 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(data),
     }),
+  testRouteChannelModelAvailability: (id: number, data: { model: string }) =>
+    request(`/api/channels/${id}/model-test`, {
+      method: "POST",
+      body: JSON.stringify(data),
+      timeoutMs: 90_000,
+    }),
   batchUpdateChannels: (updates: Array<{ id: number; priority: number }>) =>
     request("/api/channels/batch", {
       method: "PUT",
@@ -1003,6 +1046,12 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ refreshModels, ...(wait ? { wait: true } : {}) }),
       timeoutMs: wait ? 150_000 : 30_000,
+    }),
+  resetAutoRoutes: () =>
+    request("/api/routes/reset-auto", {
+      method: "POST",
+      body: JSON.stringify({}),
+      timeoutMs: 150_000,
     }),
   refreshRouteDecisionSnapshots: () =>
     request("/api/routes/decision/refresh", {

@@ -55,7 +55,7 @@ describe('settings model availability probe runtime setting', () => {
     delete process.env.DATA_DIR;
   });
 
-  it('persists enabling the model availability probe and starts the scheduler', async () => {
+  it('keeps the model availability probe disabled when enable is requested', async () => {
     const updateResponse = await app.inject({
       method: 'PUT',
       url: '/api/settings/runtime',
@@ -66,20 +66,20 @@ describe('settings model availability probe runtime setting', () => {
 
     expect(updateResponse.statusCode).toBe(200);
     const updated = updateResponse.json() as { modelAvailabilityProbeEnabled?: boolean };
-    expect(updated.modelAvailabilityProbeEnabled).toBe(true);
-    expect(config.modelAvailabilityProbeEnabled).toBe(true);
-    expect(startModelAvailabilityProbeSchedulerMock).toHaveBeenCalledTimes(1);
-    expect(stopModelAvailabilityProbeSchedulerMock).not.toHaveBeenCalled();
+    expect(updated.modelAvailabilityProbeEnabled).toBe(false);
+    expect(config.modelAvailabilityProbeEnabled).toBe(false);
+    expect(startModelAvailabilityProbeSchedulerMock).not.toHaveBeenCalled();
+    expect(stopModelAvailabilityProbeSchedulerMock).toHaveBeenCalledTimes(1);
 
     const saved = await db.select().from(schema.settings).where(eq(schema.settings.key, 'model_availability_probe_enabled')).get();
-    expect(saved?.value).toBe(JSON.stringify(true));
+    expect(saved?.value).toBe(JSON.stringify(false));
 
     const getResponse = await app.inject({
       method: 'GET',
       url: '/api/settings/runtime',
     });
     expect(getResponse.statusCode).toBe(200);
-    expect((getResponse.json() as { modelAvailabilityProbeEnabled?: boolean }).modelAvailabilityProbeEnabled).toBe(true);
+    expect((getResponse.json() as { modelAvailabilityProbeEnabled?: boolean }).modelAvailabilityProbeEnabled).toBe(false);
   });
 
   it('persists disabling the model availability probe and stops the scheduler', async () => {

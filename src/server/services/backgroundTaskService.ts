@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { eq } from 'drizzle-orm';
 import { db, schema } from '../db/index.js';
 import { sendNotification } from './notifyService.js';
 
@@ -50,6 +51,7 @@ const tasks = new Map<string, BackgroundTask>();
 const dedupeTaskIds = new Map<string, string>();
 const taskLogSeq = new Map<string, number>();
 const taskLogSubscribers = new Map<string, Set<(entry: BackgroundTaskLogEntry) => void>>();
+const taskEventWrites = new Map<string, Promise<number | null>>();
 let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
 function nowIso() {
@@ -95,6 +97,7 @@ function setTaskStatus(task: BackgroundTask, patch: Partial<BackgroundTask>) {
 function cleanupTaskInternals(taskId: string) {
   taskLogSeq.delete(taskId);
   taskLogSubscribers.delete(taskId);
+  taskEventWrites.delete(taskId);
 }
 
 export function appendBackgroundTaskLog(taskId: string, message: string): BackgroundTaskLogEntry | null {
@@ -153,18 +156,48 @@ export function subscribeToBackgroundTaskLogs(
   };
 }
 
-async function appendTaskEvent(level: 'info' | 'warning' | 'error', title: string, message: string, taskId: string) {
+function buildTaskEventMessage(message: string, task: Pick<BackgroundTask, 'createdAt' | 'startedAt' | 'finishedAt'>) {
+  const lines = [message.trim()];
+  lines.push(`开始时间：${task.startedAt || task.createdAt}`);
+  if (task.finishedAt) lines.push(`结束时间：${task.finishedAt}`);
+  return lines.join('\n');
+}
+
+async function appendTaskEvent(level: 'info' | 'warning' | 'error', title: string, message: string, task: BackgroundTask) {
   try {
-    await db.insert(schema.events).values({
+    const row = await db.insert(schema.events).values({
       type: 'status',
       title,
-      message,
+      message: buildTaskEventMessage(message, task),
       level,
       relatedType: 'task',
-      createdAt: nowIso(),
-    }).run();
-  } catch {}
-  void taskId;
+      createdAt: task.startedAt || task.createdAt,
+    }).returning({ id: schema.events.id }).get();
+    return row?.id ?? null;
+  } catch (error) {
+    console.warn(`[background-task] failed to persist ${level} event for ${task.id}: ${(error as Error)?.message || 'unknown error'}`);
+    return null;
+  }
+}
+
+async function updateTaskEvent(level: 'info' | 'warning' | 'error', title: string, message: string, task: BackgroundTask) {
+  const eventId = await taskEventWrites.get(task.id);
+  if (!eventId) {
+    console.warn(`[background-task] cannot update task event for ${task.id}: start event was not persisted`);
+    return;
+  }
+  try {
+    await db.update(schema.events)
+      .set({
+        title,
+        message: buildTaskEventMessage(message, task),
+        level,
+      })
+      .where(eq(schema.events.id, eventId))
+      .run();
+  } catch (error) {
+    console.warn(`[background-task] failed to update ${level} event for ${task.id}: ${(error as Error)?.message || 'unknown error'}`);
+  }
 }
 
 async function runTask(taskId: string, options: BackgroundTaskStartOptions, runner: () => Promise<unknown>) {
@@ -189,7 +222,7 @@ async function runTask(taskId: string, options: BackgroundTaskStartOptions, runn
     const eventTitle = resolveTaskMessage(options.successTitle, task, `${task.title} 已完成`);
     const eventMessage = resolveTaskMessage(options.successMessage, task, `${task.title} 已完成`);
     task = setTaskStatus(task, { message: eventMessage });
-    appendTaskEvent('info', eventTitle, eventMessage, task.id);
+    await updateTaskEvent('info', eventTitle, eventMessage, task);
 
     if (options.notifyOnSuccess) {
       await sendNotification(eventTitle, eventMessage, 'info');
@@ -206,7 +239,7 @@ async function runTask(taskId: string, options: BackgroundTaskStartOptions, runn
     const eventTitle = resolveTaskMessage(options.failureTitle, task, `${task.title} 失败`);
     const eventMessage = resolveTaskMessage(options.failureMessage, task, task.message);
     task = setTaskStatus(task, { message: eventMessage });
-    appendTaskEvent('error', eventTitle, eventMessage, task.id);
+    await updateTaskEvent('error', eventTitle, eventMessage, task);
 
     if (options.notifyOnFailure ?? true) {
       await sendNotification(eventTitle, eventMessage, 'error');
@@ -276,7 +309,7 @@ export function startBackgroundTask(
   taskLogSeq.set(task.id, 0);
   if (dedupeKey) dedupeTaskIds.set(dedupeKey, task.id);
 
-  appendTaskEvent('info', `${task.title}已开始`, `${task.title} 已开始执行`, task.id);
+  taskEventWrites.set(task.id, appendTaskEvent('info', `${task.title}进行中`, `${task.title} 正在执行`, task));
   void runTask(task.id, options, runner);
   return { task, reused: false };
 }
@@ -338,6 +371,7 @@ export function __resetBackgroundTasksForTests() {
   dedupeTaskIds.clear();
   taskLogSeq.clear();
   taskLogSubscribers.clear();
+  taskEventWrites.clear();
   if (cleanupTimer) {
     clearInterval(cleanupTimer);
     cleanupTimer = null;

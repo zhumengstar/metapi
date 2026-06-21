@@ -4,9 +4,10 @@ import { getInsertedRowId } from '../db/insertHelpers.js';
 import { getAdapter } from './platforms/index.js';
 import {
   ACCOUNT_TOKEN_VALUE_STATUS_READY,
-  ensureDefaultTokenForAccount,
   getPreferredAccountToken,
+  isReadyAccountToken,
   isMaskedTokenValue,
+  resolveAccountTokenManualEnabledPreference,
   isUsableAccountToken,
 } from './accountTokenService.js';
 import {
@@ -23,6 +24,12 @@ import { config } from '../config.js';
 import { setAccountRuntimeHealth } from './accountHealthService.js';
 import { clearAllRouteDecisionSnapshots } from './routeDecisionSnapshotStore.js';
 import { withAccountProxyOverride } from './siteProxy.js';
+import {
+  clearAccountTokenAutoDisabledAfterModels,
+  markAccountTokenAutoDisabledForEmptyModels,
+} from './accountTokenAutoDisableService.js';
+import { isSuccessfulManualTokenModelTest } from './tokenModelAvailabilityStatus.js';
+import { isImageGenerationModel } from './modelType.js';
 import { isCodexPlatform } from './oauth/codexAccount.js';
 import { buildStoredOauthStateFromAccount, getOauthInfoFromAccount } from './oauth/oauthAccount.js';
 import { refreshOauthAccessTokenSingleflight } from './oauth/refreshSingleflight.js';
@@ -36,6 +43,11 @@ import {
 } from './platformDiscoveryRegistry.js';
 import { probeRuntimeModel, type RuntimeModelProbeStatus } from './runtimeModelProbe.js';
 import { buildRouteChannelStorageIdentityKey } from './routeChannelIdentity.js';
+import {
+  deleteRouteChannelPreservingStats,
+  deleteRoutePreservingChannelStats,
+  resolveRouteChannelStats,
+} from './routeChannelStatsService.js';
 
 const API_TOKEN_DISCOVERY_TIMEOUT_MS = 8_000;
 const MODEL_DISCOVERY_TIMEOUT_MS = 12_000;
@@ -49,6 +61,7 @@ const GEMINI_CLI_STATIC_MODELS = [
   'gemini-3-flash-preview',
   'gemini-3.1-flash-lite-preview',
 ];
+
 let inFlightRefreshModelsAndRebuildRoutes: Promise<{
   refresh: ModelRefreshResult[];
   rebuild: Awaited<ReturnType<typeof rebuildTokenRoutesFromAvailability>>;
@@ -510,95 +523,12 @@ export async function probeSiteModels(
   return { success: true, scope, probed: details.length, unsupported: unsupportedModels.length, details };
 }
 
-async function runPostRefreshProbeIfEnabled(params: {
+async function runPostRefreshProbeIfEnabled(_params: {
   account: typeof schema.accounts.$inferSelect;
   site: typeof schema.sites.$inferSelect;
   discoveredModels: string[];
 }): Promise<ModelRefreshSuccessResult['postProbeResult']> {
-  if (!params.site.postRefreshProbeEnabled) return undefined;
-  if (params.discoveredModels.length === 0) return undefined;
-
-  const scope = (params.site.postRefreshProbeScope === 'all' ? 'all' : 'single') as 'single' | 'all';
-
-  // Determine which models to probe
-  let modelsToProbe: string[];
-  if (scope === 'all') {
-    modelsToProbe = params.discoveredModels;
-  } else {
-    const configModel = (params.site.postRefreshProbeModel || '').trim().toLowerCase();
-    const found = configModel
-      ? (params.discoveredModels.find((m) => m.toLowerCase() === configModel) ?? params.discoveredModels[0])
-      : params.discoveredModels[0];
-    modelsToProbe = [found];
-  }
-
-  // runPostRefreshProbeIfEnabled: apply latency threshold from site config
-  const threshold = params.site.postRefreshProbeLatencyThresholdMs ?? 0;
-  // Probe each model sequentially
-  const details: Array<{ modelName: string; status: RuntimeModelProbeStatus; latencyMs: number | null }> = [];
-  for (const modelName of modelsToProbe) {
-    try {
-      const result = await probeRuntimeModel({
-        site: params.site,
-        account: params.account,
-        modelName,
-        timeoutMs: config.modelAvailabilityProbeTimeoutMs,
-      });
-      const latencyExceeded = (
-        result.status === 'supported'
-        && threshold > 0
-        && result.latencyMs != null
-        && result.latencyMs > threshold
-      );
-      const effectiveStatus: RuntimeModelProbeStatus = latencyExceeded ? 'unsupported' : result.status;
-      details.push({ modelName, status: effectiveStatus, latencyMs: result.latencyMs });
-    } catch (err) {
-      console.warn(`[post-refresh-probe] probe failed for account ${params.account.id} model ${modelName}`, err);
-      details.push({ modelName, status: 'inconclusive', latencyMs: null });
-    }
-  }
-
-  // Handle unsupported models
-  const unsupportedModels = details.filter((d) => d.status === 'unsupported' || d.status === 'inconclusive').map((d) => d.modelName);
-  if (unsupportedModels.length > 0) {
-    const checkedAt = new Date().toISOString();
-    for (const modelName of unsupportedModels) {
-      // Mark model as unavailable
-      await db.update(schema.modelAvailability)
-        .set({ available: false, checkedAt })
-        .where(and(
-          eq(schema.modelAvailability.accountId, params.account.id),
-          eq(schema.modelAvailability.modelName, modelName),
-        ))
-        .run();
-      // Add to site-level disabled models
-      await db.insert(schema.siteDisabledModels)
-        .values({ siteId: params.site.id, modelName })
-        .onConflictDoNothing()
-        .run();
-    }
-    // Update account health
-    const reason = unsupportedModels.length === 1
-      ? `刷新后探测失败：模型 ${unsupportedModels[0]} 不可用`
-      : `刷新后探测失败：${unsupportedModels.length} 个模型不可用（${unsupportedModels.slice(0, 3).join('、')}${unsupportedModels.length > 3 ? '…' : ''}）`;
-    await setAccountRuntimeHealth(params.account.id, {
-      state: 'unhealthy',
-      reason,
-      source: 'post-refresh-probe',
-      checkedAt,
-    });
-    // Single route rebuild for all changes
-    rebuildTokenRoutesFromAvailability().catch((err) => {
-      console.warn('[post-refresh-probe] route rebuild failed', err);
-    });
-  }
-
-  return {
-    scope,
-    probed: details.length,
-    unsupported: unsupportedModels.length,
-    details,
-  };
+  return undefined;
 }
 
 export async function refreshModelsForAccount(
@@ -650,17 +580,6 @@ export async function refreshModelsForAccount(
         eq(schema.modelAvailability.isManual, false),
       ))
       .run();
-
-    const currentAccountTokens = await db.select({ id: schema.accountTokens.id })
-      .from(schema.accountTokens)
-      .where(eq(schema.accountTokens.accountId, accountId))
-      .all();
-
-    for (const token of currentAccountTokens) {
-      await db.delete(schema.tokenModelAvailability)
-        .where(eq(schema.tokenModelAvailability.tokenId, token.id))
-        .run();
-    }
   };
 
   const restorePreviousAvailability = async () => {
@@ -672,9 +591,22 @@ export async function refreshModelsForAccount(
       ).run();
     }
     if (previousTokenModelAvailability.length > 0) {
-      await db.insert(schema.tokenModelAvailability).values(
-        previousTokenModelAvailability.map(({ id: _id, ...row }) => row),
-      ).run();
+      for (const { id: _id, ...row } of previousTokenModelAvailability) {
+        await db.insert(schema.tokenModelAvailability).values(row)
+          .onConflictDoUpdate({
+            target: [schema.tokenModelAvailability.tokenId, schema.tokenModelAvailability.modelName],
+            set: {
+              available: row.available,
+              routeEnabled: row.routeEnabled,
+              message: row.message,
+              httpStatus: row.httpStatus,
+              responseText: row.responseText,
+              latencyMs: row.latencyMs,
+              checkedAt: row.checkedAt,
+            },
+          })
+          .run();
+      }
     }
   };
 
@@ -743,11 +675,6 @@ export async function refreshModelsForAccount(
         source: 'model-discovery',
         checkedAt,
       });
-      const codexPostProbeResult = await runPostRefreshProbeIfEnabled({
-        account: discoveryAccount,
-        site,
-        discoveredModels: codexModels,
-      });
       return buildSuccessfulRefreshResult({
         accountId,
         modelCount: codexModels.length,
@@ -755,7 +682,6 @@ export async function refreshModelsForAccount(
         tokenScanned: 0,
         discoveredByCredential: true,
         discoveredApiToken: false,
-        postProbeResult: codexPostProbeResult,
       });
     } catch (err) {
       discoveryAccount = getRefreshedOauthAccountFromError(err) || discoveryAccount;
@@ -1075,7 +1001,6 @@ export async function refreshModelsForAccount(
         `api token discovery timeout (${Math.round(API_TOKEN_DISCOVERY_TIMEOUT_MS / 1000)}s)`,
       );
       if (discoveredApiToken && !isMaskedTokenValue(discoveredApiToken)) {
-        await ensureDefaultTokenForAccount(account.id, discoveredApiToken, { name: 'default', source: 'sync' });
         await db.update(schema.accounts).set({
           apiToken: discoveredApiToken,
           updatedAt: new Date().toISOString(),
@@ -1092,29 +1017,11 @@ export async function refreshModelsForAccount(
       .from(schema.accountTokens)
       .where(and(
         eq(schema.accountTokens.accountId, account.id),
-        eq(schema.accountTokens.enabled, true),
         eq(schema.accountTokens.valueStatus, ACCOUNT_TOKEN_VALUE_STATUS_READY),
       ))
       .all()
     : [];
-  enabledTokens = enabledTokens.filter(isUsableAccountToken);
-
-  // Last fallback: if still no managed token but account has a legacy apiToken, mirror it into token table.
-  if (usesManagedTokens && enabledTokens.length === 0) {
-    const fallback = discoveredApiToken || account.apiToken || null;
-    if (fallback) {
-      await ensureDefaultTokenForAccount(account.id, fallback, { name: 'default', source: 'legacy' });
-      enabledTokens = await db.select()
-        .from(schema.accountTokens)
-        .where(and(
-          eq(schema.accountTokens.accountId, account.id),
-          eq(schema.accountTokens.enabled, true),
-          eq(schema.accountTokens.valueStatus, ACCOUNT_TOKEN_VALUE_STATUS_READY),
-        ))
-        .all();
-      enabledTokens = enabledTokens.filter(isUsableAccountToken);
-    }
-  }
+  enabledTokens = enabledTokens.filter(isReadyAccountToken);
 
   let aiBaseUrl: string;
   try {
@@ -1201,6 +1108,7 @@ export async function refreshModelsForAccount(
   for (const token of enabledTokens) {
     const startedAt = Date.now();
     let models: string[] = [];
+    const checkedAt = new Date().toISOString();
 
     try {
       models = normalizeModels(
@@ -1216,20 +1124,28 @@ export async function refreshModelsForAccount(
       models = [];
     }
 
-    if (models.length === 0) continue;
+    if (models.length === 0) {
+      await markAccountTokenAutoDisabledForEmptyModels(token, checkedAt);
+      continue;
+    }
 
     const latencyMs = Date.now() - startedAt;
-    const checkedAt = new Date().toISOString();
+    await clearAccountTokenAutoDisabledAfterModels(token, checkedAt);
 
-    await db.insert(schema.tokenModelAvailability).values(
-      models.map((modelName) => ({
+    for (const modelName of models) {
+      await db.insert(schema.tokenModelAvailability).values({
         tokenId: token.id,
         modelName,
-        available: true,
         latencyMs,
         checkedAt,
-      })),
-    ).run();
+      }).onConflictDoUpdate({
+        target: [schema.tokenModelAvailability.tokenId, schema.tokenModelAvailability.modelName],
+        set: {
+          latencyMs,
+          checkedAt,
+        },
+      }).run();
+    }
 
     scannedTokenCount++;
     mergeDiscoveredModels(models, latencyMs);
@@ -1278,11 +1194,6 @@ export async function refreshModelsForAccount(
   });
 
   const modelsPreview = Array.from(accountModels.values()).slice(0, 10);
-  const standardPostProbeResult = await runPostRefreshProbeIfEnabled({
-    account,
-    site,
-    discoveredModels: Array.from(accountModels.values()),
-  });
   return buildSuccessfulRefreshResult({
     accountId,
     modelCount: accountModels.size,
@@ -1290,7 +1201,6 @@ export async function refreshModelsForAccount(
     tokenScanned: scannedTokenCount,
     discoveredByCredential,
     discoveredApiToken: !!discoveredApiToken,
-    postProbeResult: standardPostProbeResult,
   });
 }
 
@@ -1315,7 +1225,7 @@ export async function rebuildTokenRoutesFromAvailability() {
     .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
     .where(
       and(
-        eq(schema.tokenModelAvailability.available, true),
+        eq(schema.tokenModelAvailability.routeEnabled, true),
         eq(schema.accountTokens.enabled, true),
         eq(schema.accountTokens.valueStatus, ACCOUNT_TOKEN_VALUE_STATUS_READY),
         eq(schema.accounts.status, 'active'),
@@ -1326,6 +1236,10 @@ export async function rebuildTokenRoutesFromAvailability() {
   const usableTokenRows = tokenRows.filter((row) => (
     isUsableAccountToken(row.account_tokens)
     && requiresManagedAccountTokens(row.accounts)
+    && (
+      isImageGenerationModel(row.token_model_availability.modelName)
+      || isSuccessfulManualTokenModelTest(row.token_model_availability)
+    )
   ));
 
   const accountRows = await db.select().from(schema.modelAvailability)
@@ -1447,6 +1361,7 @@ export async function rebuildTokenRoutesFromAvailability() {
     if (!route) {
       const inserted = await db.insert(schema.tokenRoutes).values({
         modelPattern: modelName,
+        routingStrategy: 'stable_first',
         enabled: true,
       }).run();
       const insertedId = getInsertedRowId(inserted);
@@ -1464,6 +1379,18 @@ export async function rebuildTokenRoutesFromAvailability() {
     for (const [candidateKey, candidate] of candidateMap.entries()) {
       const exists = routeChannels.some((channel) => buildChannelKey(channel) === candidateKey);
       if (exists) continue;
+      const usageSource = routeChannels.find((channel) => (
+        channel.accountId === candidate.accountId
+        && (channel.tokenId === candidate.tokenId || !channel.tokenId || !candidate.tokenId)
+        && (channel.oauthRouteUnitId || null) === (candidate.oauthRouteUnitId || null)
+      ));
+      const stats = await resolveRouteChannelStats({
+        modelPattern: route.modelPattern,
+        accountId: candidate.accountId,
+        tokenId: candidate.tokenId,
+        oauthRouteUnitId: candidate.oauthRouteUnitId,
+        sourceModel: null,
+      }, usageSource);
 
       const inserted = await db.insert(schema.routeChannels).values({
         routeId: route.id,
@@ -1474,6 +1401,17 @@ export async function rebuildTokenRoutesFromAvailability() {
         weight: 10,
         enabled: true,
         manualOverride: false,
+        successCount: stats.successCount,
+        failCount: stats.failCount,
+        totalLatencyMs: stats.totalLatencyMs,
+        totalCost: stats.totalCost,
+        totalInputTokens: stats.totalInputTokens,
+        lastUsedAt: stats.lastUsedAt,
+        lastSelectedAt: stats.lastSelectedAt,
+        lastFailAt: stats.lastFailAt,
+        consecutiveFailCount: stats.consecutiveFailCount,
+        cooldownLevel: stats.cooldownLevel,
+        cooldownUntil: stats.cooldownUntil,
       }).run();
       const insertedId = getInsertedRowId(inserted);
       if (insertedId == null) continue;
@@ -1502,7 +1440,7 @@ export async function rebuildTokenRoutesFromAvailability() {
       }
 
       if (!channel.manualOverride) {
-        await db.delete(schema.routeChannels).where(eq(schema.routeChannels.id, channel.id)).run();
+        await deleteRouteChannelPreservingStats(channel.id);
         removedChannels++;
       }
     }
@@ -1523,7 +1461,7 @@ export async function rebuildTokenRoutesFromAvailability() {
       removedChannels += routeChannelCount;
     }
 
-    const deleted = (await db.delete(schema.tokenRoutes).where(eq(schema.tokenRoutes.id, route.id)).run()).changes;
+    const deleted = await deleteRoutePreservingChannelStats(route.id);
     if (deleted > 0) {
       removedRoutes += deleted;
     }
