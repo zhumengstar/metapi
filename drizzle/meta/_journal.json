@@ -190,6 +190,62 @@
       "when": 1781860400000,
       "tag": "0027_token_group_pricing_cache",
       "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "6",
+      "when": 1781916000000,
+      "tag": "0028_account_token_group_preferences",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "6",
+      "when": 1781977200000,
+      "tag": "0029_token_model_availability_test_details",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "6",
+      "when": 1781979000000,
+      "tag": "0030_account_token_model_synced_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "6",
+      "when": 1782009600000,
+      "tag": "0031_token_model_route_enabled",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "6",
+      "when": 1782030600000,
+      "tag": "0032_site_recharge_ratio",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "6",
+      "when": 1782034200000,
+      "tag": "0033_route_channel_input_cost",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "6",
+      "when": 1782045600000,
+      "tag": "0035_account_token_health_check",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "6",
+      "when": 1782049200000,
+      "tag": "0036_route_channel_stat_snapshots",
+      "breakpoints": true
     }
   ]
 }

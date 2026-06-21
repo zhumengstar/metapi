@@ -1,5 +1,57 @@
 {
   "tables": {
+    "account_token_group_preferences": {
+      "columns": {
+        "id": {
+          "logicalType": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKey": true
+        },
+        "account_id": {
+          "logicalType": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "token_group": {
+          "logicalType": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "group_ratio": {
+          "logicalType": "real",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "group_ratio_key": {
+          "logicalType": "text",
+          "notNull": true,
+          "defaultValue": "''",
+          "primaryKey": false
+        },
+        "enabled": {
+          "logicalType": "boolean",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "created_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": "datetime('now')",
+          "primaryKey": false
+        },
+        "updated_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": "datetime('now')",
+          "primaryKey": false
+        }
+      }
+    },
     "account_tokens": {
       "columns": {
         "id": {
@@ -66,6 +118,78 @@
           "logicalType": "text",
           "notNull": true,
           "defaultValue": "'ready'",
+          "primaryKey": false
+        },
+        "model_synced_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "auto_disabled_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "auto_disabled_reason": {
+          "logicalType": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "auto_disabled_previous_enabled": {
+          "logicalType": "boolean",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "health_check_enabled": {
+          "logicalType": "boolean",
+          "notNull": false,
+          "defaultValue": "false",
+          "primaryKey": false
+        },
+        "health_check_interval_minutes": {
+          "logicalType": "integer",
+          "notNull": false,
+          "defaultValue": "60",
+          "primaryKey": false
+        },
+        "health_check_model": {
+          "logicalType": "text",
+          "notNull": false,
+          "defaultValue": "''",
+          "primaryKey": false
+        },
+        "health_check_last_run_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "health_check_next_run_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "health_check_last_available": {
+          "logicalType": "boolean",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "health_check_last_message": {
+          "logicalType": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "health_check_last_latency_ms": {
+          "logicalType": "integer",
+          "notNull": false,
+          "defaultValue": null,
           "primaryKey": false
         }
       }
@@ -1468,6 +1592,130 @@
         }
       }
     },
+    "route_channel_stat_snapshots": {
+      "columns": {
+        "id": {
+          "logicalType": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKey": true
+        },
+        "identity_key": {
+          "logicalType": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "model_pattern": {
+          "logicalType": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "account_id": {
+          "logicalType": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "token_id": {
+          "logicalType": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "oauth_route_unit_id": {
+          "logicalType": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "source_model": {
+          "logicalType": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "success_count": {
+          "logicalType": "integer",
+          "notNull": false,
+          "defaultValue": "0",
+          "primaryKey": false
+        },
+        "fail_count": {
+          "logicalType": "integer",
+          "notNull": false,
+          "defaultValue": "0",
+          "primaryKey": false
+        },
+        "total_latency_ms": {
+          "logicalType": "integer",
+          "notNull": false,
+          "defaultValue": "0",
+          "primaryKey": false
+        },
+        "total_cost": {
+          "logicalType": "real",
+          "notNull": false,
+          "defaultValue": "0",
+          "primaryKey": false
+        },
+        "total_input_tokens": {
+          "logicalType": "integer",
+          "notNull": false,
+          "defaultValue": "0",
+          "primaryKey": false
+        },
+        "last_used_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "last_selected_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "last_fail_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "consecutive_fail_count": {
+          "logicalType": "integer",
+          "notNull": true,
+          "defaultValue": "0",
+          "primaryKey": false
+        },
+        "cooldown_level": {
+          "logicalType": "integer",
+          "notNull": true,
+          "defaultValue": "0",
+          "primaryKey": false
+        },
+        "cooldown_until": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "created_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": "datetime('now')",
+          "primaryKey": false
+        },
+        "updated_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": "datetime('now')",
+          "primaryKey": false
+        }
+      }
+    },
     "route_channels": {
       "columns": {
         "id": {
@@ -1588,6 +1836,18 @@
           "logicalType": "integer",
           "notNull": false,
           "defaultValue": null,
+          "primaryKey": false
+        },
+        "total_input_tokens": {
+          "logicalType": "integer",
+          "notNull": false,
+          "defaultValue": "0",
+          "primaryKey": false
+        },
+        "image_upscale_enabled": {
+          "logicalType": "boolean",
+          "notNull": false,
+          "defaultValue": "false",
           "primaryKey": false
         }
       }
@@ -2113,6 +2373,12 @@
           "notNull": false,
           "defaultValue": "0",
           "primaryKey": false
+        },
+        "recharge_ratio": {
+          "logicalType": "real",
+          "notNull": true,
+          "defaultValue": "1",
+          "primaryKey": false
         }
       }
     },
@@ -2247,6 +2513,30 @@
           "notNull": false,
           "defaultValue": "datetime('now')",
           "primaryKey": false
+        },
+        "message": {
+          "logicalType": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "http_status": {
+          "logicalType": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "response_text": {
+          "logicalType": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "route_enabled": {
+          "logicalType": "boolean",
+          "notNull": false,
+          "defaultValue": "false",
+          "primaryKey": false
         }
       }
     },
@@ -2328,6 +2618,32 @@
     }
   },
   "indexes": [
+    {
+      "name": "account_token_group_preferences_account_group_ratio_unique",
+      "table": "account_token_group_preferences",
+      "columns": [
+        "account_id",
+        "token_group",
+        "group_ratio_key"
+      ],
+      "unique": true
+    },
+    {
+      "name": "account_token_group_preferences_account_idx",
+      "table": "account_token_group_preferences",
+      "columns": [
+        "account_id"
+      ],
+      "unique": false
+    },
+    {
+      "name": "account_token_group_preferences_group_idx",
+      "table": "account_token_group_preferences",
+      "columns": [
+        "token_group"
+      ],
+      "unique": false
+    },
     {
       "name": "account_tokens_account_enabled_idx",
       "table": "account_tokens",
@@ -2790,6 +3106,46 @@
       "unique": false
     },
     {
+      "name": "route_channel_stat_snapshots_account_id_idx",
+      "table": "route_channel_stat_snapshots",
+      "columns": [
+        "account_id"
+      ],
+      "unique": false
+    },
+    {
+      "name": "route_channel_stat_snapshots_identity_unique",
+      "table": "route_channel_stat_snapshots",
+      "columns": [
+        "identity_key"
+      ],
+      "unique": true
+    },
+    {
+      "name": "route_channel_stat_snapshots_model_pattern_idx",
+      "table": "route_channel_stat_snapshots",
+      "columns": [
+        "model_pattern"
+      ],
+      "unique": false
+    },
+    {
+      "name": "route_channel_stat_snapshots_oauth_route_unit_id_idx",
+      "table": "route_channel_stat_snapshots",
+      "columns": [
+        "oauth_route_unit_id"
+      ],
+      "unique": false
+    },
+    {
+      "name": "route_channel_stat_snapshots_token_id_idx",
+      "table": "route_channel_stat_snapshots",
+      "columns": [
+        "token_id"
+      ],
+      "unique": false
+    },
+    {
       "name": "route_channels_account_id_idx",
       "table": "route_channels",
       "columns": [
@@ -3081,6 +3437,15 @@
   ],
   "uniques": [
     {
+      "name": "account_token_group_preferences_account_group_ratio_unique",
+      "table": "account_token_group_preferences",
+      "columns": [
+        "account_id",
+        "token_group",
+        "group_ratio_key"
+      ]
+    },
+    {
       "name": "admin_snapshots_namespace_key_unique",
       "table": "admin_snapshots",
       "columns": [
@@ -3147,6 +3512,13 @@
       "table": "proxy_video_tasks",
       "columns": [
         "public_id"
+      ]
+    },
+    {
+      "name": "route_channel_stat_snapshots_identity_unique",
+      "table": "route_channel_stat_snapshots",
+      "columns": [
+        "identity_key"
       ]
     },
     {
@@ -3224,6 +3596,17 @@
     }
   ],
   "foreignKeys": [
+    {
+      "table": "account_token_group_preferences",
+      "columns": [
+        "account_id"
+      ],
+      "referencedTable": "accounts",
+      "referencedColumns": [
+        "id"
+      ],
+      "onDelete": "CASCADE"
+    },
     {
       "table": "account_tokens",
       "columns": [

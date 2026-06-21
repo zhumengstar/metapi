@@ -34,6 +34,7 @@ const TABLES_WITH_NUMERIC_ID = new Set([
   'token_routes',
   'route_group_sources',
   'route_channels',
+  'route_channel_stat_snapshots',
   'oauth_route_units',
   'oauth_route_unit_members',
   'proxy_logs',
@@ -186,6 +187,18 @@ function ensureTokenManagementSchema() {
       source text DEFAULT 'manual',
       enabled integer DEFAULT true,
       is_default integer DEFAULT false,
+      model_synced_at text,
+      auto_disabled_at text,
+      auto_disabled_reason text,
+      auto_disabled_previous_enabled integer,
+      health_check_enabled integer DEFAULT false,
+      health_check_interval_minutes integer DEFAULT 60,
+      health_check_model text DEFAULT '',
+      health_check_last_run_at text,
+      health_check_next_run_at text,
+      health_check_last_available integer,
+      health_check_last_message text,
+      health_check_last_latency_ms integer,
       created_at text DEFAULT (datetime('now')),
       updated_at text DEFAULT (datetime('now')),
       FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE cascade
@@ -201,6 +214,68 @@ function ensureTokenManagementSchema() {
   if (!tableColumnExists('account_tokens', 'value_status')) {
     execSqliteLegacyCompat("ALTER TABLE account_tokens ADD COLUMN value_status text NOT NULL DEFAULT 'ready';");
   }
+  if (!tableColumnExists('account_tokens', 'model_synced_at')) {
+    execSqliteLegacyCompat('ALTER TABLE account_tokens ADD COLUMN model_synced_at text;');
+  }
+  if (!tableColumnExists('account_tokens', 'auto_disabled_at')) {
+    execSqliteLegacyCompat('ALTER TABLE account_tokens ADD COLUMN auto_disabled_at text;');
+  }
+  if (!tableColumnExists('account_tokens', 'auto_disabled_reason')) {
+    execSqliteLegacyCompat('ALTER TABLE account_tokens ADD COLUMN auto_disabled_reason text;');
+  }
+  if (!tableColumnExists('account_tokens', 'auto_disabled_previous_enabled')) {
+    execSqliteLegacyCompat('ALTER TABLE account_tokens ADD COLUMN auto_disabled_previous_enabled integer;');
+  }
+  if (!tableColumnExists('account_tokens', 'health_check_enabled')) {
+    execSqliteLegacyCompat('ALTER TABLE account_tokens ADD COLUMN health_check_enabled integer DEFAULT false;');
+  }
+  if (!tableColumnExists('account_tokens', 'health_check_interval_minutes')) {
+    execSqliteLegacyCompat('ALTER TABLE account_tokens ADD COLUMN health_check_interval_minutes integer DEFAULT 60;');
+  }
+  if (!tableColumnExists('account_tokens', 'health_check_model')) {
+    execSqliteLegacyCompat("ALTER TABLE account_tokens ADD COLUMN health_check_model text DEFAULT '';");
+  }
+  if (!tableColumnExists('account_tokens', 'health_check_last_run_at')) {
+    execSqliteLegacyCompat('ALTER TABLE account_tokens ADD COLUMN health_check_last_run_at text;');
+  }
+  if (!tableColumnExists('account_tokens', 'health_check_next_run_at')) {
+    execSqliteLegacyCompat('ALTER TABLE account_tokens ADD COLUMN health_check_next_run_at text;');
+  }
+  if (!tableColumnExists('account_tokens', 'health_check_last_available')) {
+    execSqliteLegacyCompat('ALTER TABLE account_tokens ADD COLUMN health_check_last_available integer;');
+  }
+  if (!tableColumnExists('account_tokens', 'health_check_last_message')) {
+    execSqliteLegacyCompat('ALTER TABLE account_tokens ADD COLUMN health_check_last_message text;');
+  }
+  if (!tableColumnExists('account_tokens', 'health_check_last_latency_ms')) {
+    execSqliteLegacyCompat('ALTER TABLE account_tokens ADD COLUMN health_check_last_latency_ms integer;');
+  }
+
+  execSqliteLegacyCompat(`
+    CREATE TABLE IF NOT EXISTS account_token_group_preferences (
+      id integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+      account_id integer NOT NULL,
+      token_group text NOT NULL,
+      group_ratio real,
+      group_ratio_key text NOT NULL DEFAULT '',
+      enabled integer NOT NULL,
+      created_at text DEFAULT (datetime('now')),
+      updated_at text DEFAULT (datetime('now')),
+      FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE cascade
+    );
+  `);
+  execSqliteLegacyCompat(`
+    CREATE UNIQUE INDEX IF NOT EXISTS account_token_group_preferences_account_group_ratio_unique
+    ON account_token_group_preferences(account_id, token_group, group_ratio_key);
+  `);
+  execSqliteLegacyCompat(`
+    CREATE INDEX IF NOT EXISTS account_token_group_preferences_account_idx
+    ON account_token_group_preferences(account_id);
+  `);
+  execSqliteLegacyCompat(`
+    CREATE INDEX IF NOT EXISTS account_token_group_preferences_group_idx
+    ON account_token_group_preferences(token_group);
+  `);
 
   execSqliteStatement(`
     INSERT INTO account_tokens (account_id, name, token, source, enabled, is_default, created_at, updated_at)
@@ -232,11 +307,28 @@ function ensureTokenManagementSchema() {
       token_id integer NOT NULL,
       model_name text NOT NULL,
       available integer,
+      route_enabled integer DEFAULT false,
+      message text,
+      http_status integer,
+      response_text text,
       latency_ms integer,
       checked_at text DEFAULT (datetime('now')),
       FOREIGN KEY (token_id) REFERENCES account_tokens(id) ON DELETE cascade
     );
   `);
+
+  if (!tableColumnExists('token_model_availability', 'message')) {
+    execSqliteLegacyCompat(`ALTER TABLE token_model_availability ADD COLUMN message text;`);
+  }
+  if (!tableColumnExists('token_model_availability', 'route_enabled')) {
+    execSqliteLegacyCompat(`ALTER TABLE token_model_availability ADD COLUMN route_enabled integer DEFAULT false;`);
+  }
+  if (!tableColumnExists('token_model_availability', 'http_status')) {
+    execSqliteLegacyCompat(`ALTER TABLE token_model_availability ADD COLUMN http_status integer;`);
+  }
+  if (!tableColumnExists('token_model_availability', 'response_text')) {
+    execSqliteLegacyCompat(`ALTER TABLE token_model_availability ADD COLUMN response_text text;`);
+  }
 
   execSqliteLegacyCompat(`
     CREATE UNIQUE INDEX IF NOT EXISTS token_model_availability_token_model_unique
@@ -542,6 +634,14 @@ function ensureRouteGroupingSchema() {
     execSqliteLegacyCompat(`ALTER TABLE route_channels ADD COLUMN cooldown_level integer NOT NULL DEFAULT 0;`);
   }
 
+  if (!tableColumnExists('route_channels', 'total_input_tokens')) {
+    execSqliteLegacyCompat(`ALTER TABLE route_channels ADD COLUMN total_input_tokens integer DEFAULT 0;`);
+  }
+
+  if (!tableColumnExists('route_channels', 'image_upscale_enabled')) {
+    execSqliteLegacyCompat(`ALTER TABLE route_channels ADD COLUMN image_upscale_enabled integer DEFAULT 0;`);
+  }
+
   execSqliteLegacyCompat(`
     CREATE TABLE IF NOT EXISTS route_group_sources (
       id integer PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -557,6 +657,7 @@ function ensureRouteGroupingSchema() {
     CREATE INDEX IF NOT EXISTS route_group_sources_source_route_id_idx
     ON route_group_sources(source_route_id);
   `);
+
 }
 
 function ensureDownstreamApiKeySchema() {

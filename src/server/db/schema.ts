@@ -14,6 +14,7 @@ export const sites = sqliteTable('sites', {
   isPinned: integer('is_pinned', { mode: 'boolean' }).default(false),
   sortOrder: integer('sort_order').default(0),
   globalWeight: real('global_weight').default(1),
+  rechargeRatio: real('recharge_ratio').notNull().default(1),
   apiKey: text('api_key'),
   postRefreshProbeEnabled: integer('post_refresh_probe_enabled', { mode: 'boolean' }).default(false),
   postRefreshProbeModel: text('post_refresh_probe_model').default(''),
@@ -95,12 +96,40 @@ export const accountTokens = sqliteTable('account_tokens', {
   source: text('source').default('manual'), // 'manual' | 'sync' | 'legacy'
   enabled: integer('enabled', { mode: 'boolean' }).default(true),
   isDefault: integer('is_default', { mode: 'boolean' }).default(false),
+  modelSyncedAt: text('model_synced_at'),
+  autoDisabledAt: text('auto_disabled_at'),
+  autoDisabledReason: text('auto_disabled_reason'),
+  autoDisabledPreviousEnabled: integer('auto_disabled_previous_enabled', { mode: 'boolean' }),
+  healthCheckEnabled: integer('health_check_enabled', { mode: 'boolean' }).default(false),
+  healthCheckIntervalMinutes: integer('health_check_interval_minutes').default(60),
+  healthCheckModel: text('health_check_model').default(''),
+  healthCheckLastRunAt: text('health_check_last_run_at'),
+  healthCheckNextRunAt: text('health_check_next_run_at'),
+  healthCheckLastAvailable: integer('health_check_last_available', { mode: 'boolean' }),
+  healthCheckLastMessage: text('health_check_last_message'),
+  healthCheckLastLatencyMs: integer('health_check_last_latency_ms'),
   createdAt: text('created_at').default(sql`(datetime('now'))`),
   updatedAt: text('updated_at').default(sql`(datetime('now'))`),
 }, (table) => ({
   accountIdIdx: index('account_tokens_account_id_idx').on(table.accountId),
   accountEnabledIdx: index('account_tokens_account_enabled_idx').on(table.accountId, table.enabled),
   enabledIdx: index('account_tokens_enabled_idx').on(table.enabled),
+}));
+
+export const accountTokenGroupPreferences = sqliteTable('account_token_group_preferences', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  accountId: integer('account_id').notNull().references(() => accounts.id, { onDelete: 'cascade' }),
+  tokenGroup: text('token_group').notNull(),
+  groupRatio: real('group_ratio'),
+  groupRatioKey: text('group_ratio_key').notNull().default(''),
+  enabled: integer('enabled', { mode: 'boolean' }).notNull(),
+  createdAt: text('created_at').default(sql`(datetime('now'))`),
+  updatedAt: text('updated_at').default(sql`(datetime('now'))`),
+}, (table) => ({
+  accountGroupRatioUnique: uniqueIndex('account_token_group_preferences_account_group_ratio_unique')
+    .on(table.accountId, table.tokenGroup, table.groupRatioKey),
+  accountIdx: index('account_token_group_preferences_account_idx').on(table.accountId),
+  groupIdx: index('account_token_group_preferences_group_idx').on(table.tokenGroup),
 }));
 
 export const tokenGroupPricing = sqliteTable('token_group_pricing', {
@@ -158,6 +187,10 @@ export const tokenModelAvailability = sqliteTable('token_model_availability', {
   tokenId: integer('token_id').notNull().references(() => accountTokens.id, { onDelete: 'cascade' }),
   modelName: text('model_name').notNull(),
   available: integer('available', { mode: 'boolean' }),
+  routeEnabled: integer('route_enabled', { mode: 'boolean' }).default(false),
+  message: text('message'),
+  httpStatus: integer('http_status'),
+  responseText: text('response_text'),
   latencyMs: integer('latency_ms'),
   checkedAt: text('checked_at').default(sql`(datetime('now'))`),
 }, (table) => ({
@@ -242,11 +275,13 @@ export const routeChannels = sqliteTable('route_channels', {
   priority: integer('priority').default(0),
   weight: integer('weight').default(10),
   enabled: integer('enabled', { mode: 'boolean' }).default(true),
+  imageUpscaleEnabled: integer('image_upscale_enabled', { mode: 'boolean' }).default(false),
   manualOverride: integer('manual_override', { mode: 'boolean' }).default(false),
   successCount: integer('success_count').default(0),
   failCount: integer('fail_count').default(0),
   totalLatencyMs: integer('total_latency_ms').default(0),
   totalCost: real('total_cost').default(0),
+  totalInputTokens: integer('total_input_tokens').default(0),
   lastUsedAt: text('last_used_at'),
   lastSelectedAt: text('last_selected_at'),
   lastFailAt: text('last_fail_at'),
@@ -260,6 +295,35 @@ export const routeChannels = sqliteTable('route_channels', {
   oauthRouteUnitIdx: index('route_channels_oauth_route_unit_id_idx').on(table.oauthRouteUnitId),
   routeEnabledIdx: index('route_channels_route_enabled_idx').on(table.routeId, table.enabled),
   routeTokenIdx: index('route_channels_route_token_idx').on(table.routeId, table.tokenId),
+}));
+
+export const routeChannelStatSnapshots = sqliteTable('route_channel_stat_snapshots', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  identityKey: text('identity_key').notNull(),
+  modelPattern: text('model_pattern').notNull(),
+  accountId: integer('account_id').notNull(),
+  tokenId: integer('token_id'),
+  oauthRouteUnitId: integer('oauth_route_unit_id'),
+  sourceModel: text('source_model'),
+  successCount: integer('success_count').default(0),
+  failCount: integer('fail_count').default(0),
+  totalLatencyMs: integer('total_latency_ms').default(0),
+  totalCost: real('total_cost').default(0),
+  totalInputTokens: integer('total_input_tokens').default(0),
+  lastUsedAt: text('last_used_at'),
+  lastSelectedAt: text('last_selected_at'),
+  lastFailAt: text('last_fail_at'),
+  consecutiveFailCount: integer('consecutive_fail_count').notNull().default(0),
+  cooldownLevel: integer('cooldown_level').notNull().default(0),
+  cooldownUntil: text('cooldown_until'),
+  createdAt: text('created_at').default(sql`(datetime('now'))`),
+  updatedAt: text('updated_at').default(sql`(datetime('now'))`),
+}, (table) => ({
+  identityUnique: uniqueIndex('route_channel_stat_snapshots_identity_unique').on(table.identityKey),
+  modelPatternIdx: index('route_channel_stat_snapshots_model_pattern_idx').on(table.modelPattern),
+  accountIdIdx: index('route_channel_stat_snapshots_account_id_idx').on(table.accountId),
+  tokenIdIdx: index('route_channel_stat_snapshots_token_id_idx').on(table.tokenId),
+  oauthRouteUnitIdx: index('route_channel_stat_snapshots_oauth_route_unit_id_idx').on(table.oauthRouteUnitId),
 }));
 
 export const proxyLogs = sqliteTable('proxy_logs', {

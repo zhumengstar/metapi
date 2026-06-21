@@ -1,5 +1,21 @@
 export declare const ROUTE_DECISION_REFRESH_TASK_TYPE = "route-decision.refresh";
 export type RouteMode = 'pattern' | 'explicit_group';
+export type RouteDecisionScoreBreakdownRow = {
+    metric: string;
+    value: string;
+    formula: string;
+    weight: string;
+    contribution: string;
+    tone?: 'positive' | 'warning' | 'negative' | 'muted';
+};
+export type RouteDecisionScoreBreakdown = {
+    strategy: 'weighted' | 'stable_first' | 'round_robin';
+    formula: string;
+    contribution: number;
+    totalContribution: number;
+    probability: number;
+    rows: RouteDecisionScoreBreakdownRow[];
+};
 export type RouteDecisionCandidate = {
     channelId: number;
     accountId: number;
@@ -13,6 +29,7 @@ export type RouteDecisionCandidate = {
     avoidedByRecentFailure: boolean;
     probability: number;
     reason: string;
+    scoreBreakdown?: RouteDecisionScoreBreakdown;
 };
 export type RouteDecision = {
     requestedModel: string;

@@ -22,6 +22,7 @@ const routeChannelUpdatePayloadSchema = z.object({
   priority: z.number().optional(),
   weight: z.number().optional(),
   enabled: z.boolean().optional(),
+  imageUpscaleEnabled: z.boolean().optional(),
 }).passthrough();
 
 const tokenRouteCreatePayloadSchema = z.object({
@@ -49,6 +50,7 @@ const tokenRouteUpdatePayloadSchema = z.object({
 const tokenRouteBatchPayloadSchema = z.object({
   ids: z.array(z.number().int().positive()).optional(),
   action: z.string().optional(),
+  routingStrategy: z.string().optional(),
 }).passthrough();
 
 const routeRebuildPayloadSchema = z.object({
@@ -94,6 +96,9 @@ function formatTokenRoutePayloadError(error: z.ZodError): string {
   }
   if (firstPath === 'enabled') {
     return 'Invalid enabled. Expected boolean.';
+  }
+  if (firstPath === 'imageUpscaleEnabled') {
+    return 'Invalid imageUpscaleEnabled. Expected boolean.';
   }
   if (firstPath === 'sourceRouteIds') {
     return 'Invalid sourceRouteIds. Expected number[].';

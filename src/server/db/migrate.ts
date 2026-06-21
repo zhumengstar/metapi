@@ -80,6 +80,25 @@ const VERIFIED_SCHEMA_MARKERS: SchemaMarker[] = [
   { table: 'downstream_api_keys', column: 'tags' },
   // 0012: value_status column on account_tokens
   { table: 'account_tokens', column: 'value_status' },
+  // 0030: token model list refresh timestamp
+  { table: 'account_tokens', column: 'model_synced_at' },
+  { table: 'account_tokens', column: 'auto_disabled_at' },
+  { table: 'account_tokens', column: 'auto_disabled_reason' },
+  { table: 'account_tokens', column: 'auto_disabled_previous_enabled' },
+  // 0028: account token group manual enabled-state preferences
+  { table: 'account_token_group_preferences' },
+  // 0029: token model availability test details
+  { table: 'token_model_availability', column: 'message' },
+  { table: 'token_model_availability', column: 'http_status' },
+  { table: 'token_model_availability', column: 'response_text' },
+  // 0031: token model route opt-in flag
+  { table: 'token_model_availability', column: 'route_enabled' },
+  // 0033: route channel observed input-token cost
+  { table: 'route_channels', column: 'total_input_tokens' },
+  // 0034: image route channel upscaling flag
+  { table: 'route_channels', column: 'image_upscale_enabled' },
+  // 0036: durable route channel statistics snapshots
+  { table: 'route_channel_stat_snapshots' },
   // 0019: proxy log stream/timing columns
   { table: 'proxy_logs', column: 'is_stream' },
   { table: 'proxy_logs', column: 'first_byte_latency_ms' },

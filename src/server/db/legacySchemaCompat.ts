@@ -39,6 +39,7 @@ export interface LegacySchemaCompatInspector extends
 
 const BOOTSTRAP_OWNED_LEGACY_TABLES = [
   'account_tokens',
+  'account_token_group_preferences',
   'token_model_availability',
   'proxy_video_tasks',
   'downstream_api_keys',
@@ -61,10 +62,29 @@ const BOOTSTRAP_OWNED_LEGACY_COLUMNS = [
   'proxy_logs.client_app_name',
   'proxy_logs.client_confidence',
   'proxy_logs.downstream_api_key_id',
+  'account_tokens.model_synced_at',
+  'account_tokens.auto_disabled_at',
+  'account_tokens.auto_disabled_reason',
+  'account_tokens.auto_disabled_previous_enabled',
+  'account_tokens.health_check_enabled',
+  'account_tokens.health_check_interval_minutes',
+  'account_tokens.health_check_model',
+  'account_tokens.health_check_last_run_at',
+  'account_tokens.health_check_next_run_at',
+  'account_tokens.health_check_last_available',
+  'account_tokens.health_check_last_message',
+  'account_tokens.health_check_last_latency_ms',
+  'token_model_availability.message',
+  'token_model_availability.route_enabled',
+  'token_model_availability.http_status',
+  'token_model_availability.response_text',
 ];
 
 const BOOTSTRAP_OWNED_LEGACY_INDEXES = [
   'token_model_availability_token_model_unique',
+  'account_token_group_preferences_account_group_ratio_unique',
+  'account_token_group_preferences_account_idx',
+  'account_token_group_preferences_group_idx',
   'proxy_video_tasks_public_id_unique',
   'proxy_video_tasks_upstream_video_id_idx',
   'downstream_api_keys_key_unique',

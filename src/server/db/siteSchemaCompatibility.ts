@@ -70,6 +70,19 @@ export const SITE_COLUMN_COMPATIBILITY_SPECS: SiteColumnCompatibilitySpec[] = [
       postgres: 'UPDATE "sites" SET "global_weight" = 1 WHERE "global_weight" IS NULL OR "global_weight" <= 0',
     },
   },
+  {
+    column: 'recharge_ratio',
+    addSql: {
+      sqlite: 'ALTER TABLE sites ADD COLUMN recharge_ratio real NOT NULL DEFAULT 1;',
+      mysql: 'ALTER TABLE `sites` ADD COLUMN `recharge_ratio` DOUBLE NOT NULL DEFAULT 1',
+      postgres: 'ALTER TABLE "sites" ADD COLUMN "recharge_ratio" DOUBLE PRECISION NOT NULL DEFAULT 1',
+    },
+    normalizeSql: {
+      sqlite: 'UPDATE sites SET recharge_ratio = 1 WHERE recharge_ratio IS NULL OR recharge_ratio <= 0;',
+      mysql: 'UPDATE `sites` SET `recharge_ratio` = 1 WHERE `recharge_ratio` IS NULL OR `recharge_ratio` <= 0',
+      postgres: 'UPDATE "sites" SET "recharge_ratio" = 1 WHERE "recharge_ratio" IS NULL OR "recharge_ratio" <= 0',
+    },
+  },
 ];
 
 export const SITE_TABLE_COMPATIBILITY_SPECS: SiteTableCompatibilitySpec[] = [

@@ -47,6 +47,7 @@ const accountRebindSessionPayloadSchema = z.object({
 
 const accountHealthRefreshPayloadSchema = z.object({
   accountId: z.number().int().positive().optional(),
+  scope: z.enum(['all', 'unhealthy']).optional(),
   wait: z.boolean().optional(),
 }).passthrough();
 

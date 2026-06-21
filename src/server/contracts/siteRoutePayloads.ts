@@ -16,6 +16,7 @@ const siteCreatePayloadSchema = z.object({
   isPinned: unknownField,
   sortOrder: unknownField,
   globalWeight: unknownField,
+  rechargeRatio: unknownField,
 }).passthrough();
 
 const siteUpdatePayloadSchema = z.object({
@@ -30,6 +31,7 @@ const siteUpdatePayloadSchema = z.object({
   isPinned: unknownField,
   sortOrder: unknownField,
   globalWeight: unknownField,
+  rechargeRatio: unknownField,
 }).passthrough();
 
 const siteBatchPayloadSchema = z.object({
