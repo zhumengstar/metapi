@@ -1920,7 +1920,7 @@ body {
 
 .program-logs-table {
   table-layout: fixed;
-  min-width: 1120px;
+  min-width: 1040px;
 }
 
 .program-logs-table .program-logs-title-cell {
@@ -1929,6 +1929,7 @@ body {
   overflow-wrap: anywhere;
   word-break: normal;
   line-height: 1.5;
+  max-width: 260px;
 }
 
 .program-logs-table .program-logs-content-cell {
@@ -1937,10 +1938,16 @@ body {
   word-break: normal;
   line-height: 1.6;
   color: var(--color-text-secondary);
+  min-width: 260px;
 }
 
-.program-logs-table td:nth-child(6),
-.program-logs-table td:nth-child(7) {
+.program-logs-table .program-logs-title-cell,
+.program-logs-table .program-logs-content-cell {
+  vertical-align: top;
+}
+
+.program-logs-table td:nth-child(7),
+.program-logs-table td:nth-child(8) {
   white-space: nowrap;
 }
 
@@ -2032,6 +2039,31 @@ body {
 .token-table td > .badge,
 .token-table td .badge-link {
   max-width: 100%;
+}
+
+.token-inline-action {
+  border: 0;
+  justify-content: center;
+  cursor: pointer;
+  font-family: inherit;
+  line-height: 1.4;
+}
+
+.token-inline-action:disabled {
+  cursor: default;
+  opacity: 0.75;
+}
+
+.token-model-route-toggle {
+  border: 0;
+  cursor: pointer;
+  font-family: inherit;
+  line-height: 1.5;
+}
+
+.token-model-route-toggle:disabled {
+  cursor: default;
+  opacity: 0.75;
 }
 
 .token-availability-badge {
@@ -5782,6 +5814,18 @@ textarea {
   transition: border-color 0.18s ease, box-shadow 0.18s ease, background-color 0.18s ease;
 }
 
+.route-batch-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.route-batch-strategy-select {
+  min-width: 168px;
+}
+
 .proxy-logs-filter-select {
   min-width: 180px;
 }
@@ -7147,6 +7191,15 @@ textarea {
   .route-batch-bar {
     border-radius: 16px;
     padding: 9px 10px;
+  }
+
+  .route-batch-actions {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .route-batch-strategy-select {
+    flex: 1 1 180px;
   }
 
   .route-card-grid {
