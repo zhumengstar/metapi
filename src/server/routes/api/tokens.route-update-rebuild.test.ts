@@ -48,6 +48,10 @@ describe('PUT /api/routes/:id route rebuild', () => {
       tokenId: token.id,
       modelName,
       available: true,
+      routeEnabled: true,
+      message: '请求成功',
+      httpStatus: 200,
+      responseText: 'OK',
     }).run();
 
     return { site, account, token };
@@ -583,6 +587,95 @@ describe('PUT /api/routes/:id route rebuild', () => {
     });
   });
 
+  it('allows disabling a channel even when its token no longer supports the route model', async () => {
+    const seeded = await seedAccountWithToken('gpt-4o-mini');
+    await db.update(schema.tokenModelAvailability)
+      .set({ available: false })
+      .where(eq(schema.tokenModelAvailability.tokenId, seeded.token.id))
+      .run();
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-4o-mini',
+      enabled: true,
+    }).returning().get();
+    const channel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: seeded.account.id,
+      tokenId: seeded.token.id,
+      sourceModel: 'gpt-4o-mini',
+      priority: 0,
+      weight: 10,
+      enabled: true,
+      manualOverride: true,
+    }).returning().get();
+
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/api/channels/${channel.id}`,
+      payload: {
+        enabled: false,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: channel.id,
+      enabled: false,
+    });
+    const updated = await db.select().from(schema.routeChannels).where(eq(schema.routeChannels.id, channel.id)).get();
+    expect(updated?.enabled).toBe(false);
+  });
+
+  it('returns persisted model test result with route channels', async () => {
+    const seeded = await seedAccountWithToken('gpt-4o-mini');
+    await db.update(schema.tokenModelAvailability)
+      .set({
+        available: false,
+        message: '请求失败：HTTP 401',
+        responseText: 'unauthorized',
+        httpStatus: 401,
+        latencyMs: 1234,
+        checkedAt: '2026-06-21T01:02:03.000Z',
+      })
+      .where(eq(schema.tokenModelAvailability.tokenId, seeded.token.id))
+      .run();
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-4o-mini',
+      enabled: true,
+    }).returning().get();
+    await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: seeded.account.id,
+      tokenId: seeded.token.id,
+      sourceModel: 'gpt-4o-mini',
+      priority: 0,
+      weight: 10,
+      enabled: true,
+      manualOverride: true,
+    }).returning().get();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/routes/${route.id}/channels`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([
+      expect.objectContaining({
+        tokenId: seeded.token.id,
+        modelTestResult: expect.objectContaining({
+          tokenId: seeded.token.id,
+          model: 'gpt-4o-mini',
+          available: false,
+          message: '请求失败：HTTP 401',
+          responseText: 'unauthorized',
+          httpStatus: 401,
+          latencyMs: 1234,
+          checkedAt: '2026-06-21T01:02:03.000Z',
+        }),
+      }),
+    ]);
+  });
+
   it('rejects non-number accountId when batch-adding route channels', async () => {
     const seeded = await seedAccountWithToken('gpt-4o-mini');
     const route = await db.insert(schema.tokenRoutes).values({
@@ -623,6 +716,10 @@ describe('PUT /api/routes/:id route rebuild', () => {
       tokenId: alternateToken.id,
       modelName: 'gpt-4o-mini',
       available: true,
+      routeEnabled: true,
+      message: '请求成功',
+      httpStatus: 200,
+      responseText: 'OK',
     }).run();
 
     const route = await db.insert(schema.tokenRoutes).values({

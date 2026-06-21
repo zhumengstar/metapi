@@ -1,9 +1,13 @@
-import { and, eq } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 import { db, schema } from '../db/index.js';
 import { getProxyUrlFromExtraConfig, resolvePlatformUserId } from './accountExtraConfig.js';
 import { isReadyAccountToken } from './accountTokenService.js';
 import { getAdapter } from './platforms/index.js';
 import { withAccountProxyOverride } from './siteProxy.js';
+import {
+  clearAccountTokenAutoDisabledAfterModels,
+  markAccountTokenAutoDisabledForEmptyModels,
+} from './accountTokenAutoDisableService.js';
 
 const TOKEN_MODEL_DISCOVERY_TIMEOUT_MS = 30_000;
 
@@ -17,7 +21,8 @@ export type AccountTokenModelsResult = {
   tokenId: number;
   refreshed: boolean;
   source: 'cache' | 'upstream';
-  models: string[];
+  models: Array<{ name: string; routeEnabled: boolean }>;
+  modelNames: string[];
   modelCount: number;
   checkedAt: string | null;
   token: {
@@ -79,13 +84,11 @@ async function loadTokenModelRow(tokenId: number): Promise<AccountTokenModelRow 
 export async function loadCachedAccountTokenModels(tokenId: number) {
   const rows = await db.select({
     modelName: schema.tokenModelAvailability.modelName,
+    routeEnabled: schema.tokenModelAvailability.routeEnabled,
     checkedAt: schema.tokenModelAvailability.checkedAt,
   })
     .from(schema.tokenModelAvailability)
-    .where(and(
-      eq(schema.tokenModelAvailability.tokenId, tokenId),
-      eq(schema.tokenModelAvailability.available, true),
-    ))
+    .where(eq(schema.tokenModelAvailability.tokenId, tokenId))
     .all();
 
   let checkedAt: string | null = null;
@@ -95,14 +98,17 @@ export async function loadCachedAccountTokenModels(tokenId: number) {
   }
 
   return {
-    models: normalizeModels(rows.map((row) => row.modelName)),
+    models: normalizeModels(rows.map((row) => row.modelName)).map((modelName) => {
+      const matched = rows.find((row) => row.modelName.trim().toLowerCase() === modelName.toLowerCase());
+      return { name: modelName, routeEnabled: matched?.routeEnabled === true };
+    }),
     checkedAt,
   };
 }
 
 function buildResult(
   row: AccountTokenModelRow,
-  models: string[],
+  models: Array<{ name: string; routeEnabled: boolean }>,
   checkedAt: string | null,
   source: 'cache' | 'upstream',
   refreshed: boolean,
@@ -112,6 +118,7 @@ function buildResult(
     refreshed,
     source,
     models,
+    modelNames: models.map((model) => model.name),
     modelCount: models.length,
     checkedAt,
     token: {
@@ -147,9 +154,6 @@ export async function getAccountTokenModels(
   if ((row.sites.status || 'active') === 'disabled') {
     throw new Error('站点已禁用，无法拉取模型');
   }
-  if (!row.account_tokens.enabled) {
-    throw new Error('令牌已禁用，无法拉取模型');
-  }
   if (!isReadyAccountToken(row.account_tokens)) {
     throw new Error('令牌明文未补全，无法拉取模型');
   }
@@ -162,7 +166,7 @@ export async function getAccountTokenModels(
   const platformUserId = resolvePlatformUserId(row.accounts.extraConfig, row.accounts.username);
   const proxyUrl = getProxyUrlFromExtraConfig(row.accounts.extraConfig);
   const startedAt = Date.now();
-  const models = normalizeModels(await withTimeout(
+  const modelNames = normalizeModels(await withTimeout(
     () => withAccountProxyOverride(proxyUrl,
       () => adapter.getModels(row.sites.url, row.account_tokens.token, platformUserId)),
     TOKEN_MODEL_DISCOVERY_TIMEOUT_MS,
@@ -171,21 +175,30 @@ export async function getAccountTokenModels(
   const checkedAt = new Date().toISOString();
   const latencyMs = Date.now() - startedAt;
 
-  await db.delete(schema.tokenModelAvailability)
-    .where(eq(schema.tokenModelAvailability.tokenId, tokenId))
-    .run();
-
-  if (models.length > 0) {
-    await db.insert(schema.tokenModelAvailability)
-      .values(models.map((modelName) => ({
+  if (modelNames.length > 0) {
+    await clearAccountTokenAutoDisabledAfterModels(row.account_tokens, checkedAt);
+    for (const modelName of modelNames) {
+      await db.insert(schema.tokenModelAvailability)
+      .values({
         tokenId,
         modelName,
-        available: true,
+        routeEnabled: false,
         latencyMs,
         checkedAt,
-      })))
+      })
+      .onConflictDoUpdate({
+        target: [schema.tokenModelAvailability.tokenId, schema.tokenModelAvailability.modelName],
+        set: {
+          latencyMs,
+          checkedAt,
+        },
+      })
       .run();
+    }
+  } else {
+    await markAccountTokenAutoDisabledForEmptyModels(row.account_tokens, checkedAt);
   }
 
-  return buildResult(row, models, checkedAt, 'upstream', true);
+  const refreshedCache = await loadCachedAccountTokenModels(tokenId);
+  return buildResult(row, refreshedCache.models, checkedAt, 'upstream', true);
 }

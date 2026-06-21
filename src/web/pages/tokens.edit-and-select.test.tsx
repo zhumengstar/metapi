@@ -207,6 +207,16 @@ describe('Tokens edit modal and row selection', () => {
         return collectText(node).includes('focus-token');
       })[0];
       expect(tokenRow).toBeTruthy();
+      expect(collectText(root.root)).toContain('已选 1 项');
+
+      await act(async () => {
+        tokenRow.props.onClick({
+          target: { closest: () => null },
+        });
+      });
+      await flushMicrotasks();
+
+      expect(collectText(root.root)).not.toContain('已选 1 项');
 
       await act(async () => {
         tokenRow.props.onClick({
@@ -291,7 +301,7 @@ describe('Tokens edit modal and row selection', () => {
       await flushMicrotasks();
 
       const syncAccountSelect = root.root.findAllByType(ModernSelect)
-        .find((node) => node.props.placeholder === '选择账号后同步站点令牌');
+        .find((node) => node.props.placeholder === '选择账号筛选令牌');
       expect(syncAccountSelect).toBeTruthy();
       expect(syncAccountSelect!.props.searchable).toBe(true);
       expect(syncAccountSelect!.props.searchPlaceholder).toBe('筛选账号（名称 / 站点）');
@@ -436,6 +446,15 @@ describe('Tokens edit modal and row selection', () => {
     try {
       await act(async () => {
         root = buildTokensRoot();
+      });
+      await flushMicrotasks();
+
+      const syncAccountSelect = root.root.findAllByType(ModernSelect)
+        .find((node) => node.props.placeholder === '选择账号筛选令牌');
+      expect(syncAccountSelect).toBeTruthy();
+
+      await act(async () => {
+        syncAccountSelect!.props.onChange('1');
       });
       await flushMicrotasks();
 

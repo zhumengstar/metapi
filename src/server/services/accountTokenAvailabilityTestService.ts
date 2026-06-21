@@ -5,8 +5,9 @@ import { getProxyUrlFromExtraConfig } from './accountExtraConfig.js';
 import { isReadyAccountToken } from './accountTokenService.js';
 import { normalizePlatformBaseUrl } from './platforms/standardApiProvider.js';
 import { withAccountProxyOverride, withSiteProxyRequestInit } from './siteProxy.js';
+import { isImageGenerationModel } from './modelType.js';
 
-const TOKEN_MODEL_TEST_TIMEOUT_MS = 8_000;
+const TOKEN_MODEL_TEST_TIMEOUT_MS = 60_000;
 const TOKEN_MODEL_TEST_CONCURRENCY = 12;
 
 type AccountTokenAvailabilityRow = {
@@ -20,6 +21,7 @@ export type AccountTokenModelTestResult = {
   model: string;
   available: boolean;
   message: string;
+  responseText: string | null;
   httpStatus: number | null;
   latencyMs: number | null;
   checkedAt: string;
@@ -86,6 +88,9 @@ async function persistTokenModelTestResults(results: AccountTokenModelTestResult
         tokenId: result.tokenId,
         modelName: result.model,
         available: result.available,
+        message: result.message,
+        httpStatus: result.httpStatus,
+        responseText: result.responseText,
         latencyMs: result.latencyMs,
         checkedAt: result.checkedAt || checkedAt,
       })
@@ -93,6 +98,9 @@ async function persistTokenModelTestResults(results: AccountTokenModelTestResult
         target: [schema.tokenModelAvailability.tokenId, schema.tokenModelAvailability.modelName],
         set: {
           available: result.available,
+          message: result.message,
+          httpStatus: result.httpStatus,
+          responseText: result.responseText,
           latencyMs: result.latencyMs,
           checkedAt: result.checkedAt || checkedAt,
         },
@@ -108,12 +116,46 @@ async function persistTokenModelTestResults(results: AccountTokenModelTestResult
   }
 }
 
+export async function persistSkippedAccountTokenModelAvailability(
+  results: AccountTokenModelTestResult[],
+): Promise<void> {
+  await persistTokenModelTestResults(results);
+}
+
 function extractFailureMessage(payload: any, text: string, fallback: string): string {
   const message = payload?.error?.message || payload?.message || payload?.msg;
   if (typeof message === 'string' && message.trim()) return message.trim();
   const trimmed = text.trim();
   if (trimmed) return trimmed.slice(0, 180);
   return fallback;
+}
+
+function extractModelReply(payload: any, text: string): string | null {
+  const candidates = [
+    payload?.choices?.[0]?.message?.content,
+    payload?.choices?.[0]?.text,
+    payload?.output_text,
+    payload?.message,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim().slice(0, 500);
+  }
+  const output = payload?.output;
+  if (Array.isArray(output)) {
+    const parts: string[] = [];
+    for (const item of output) {
+      const content = item?.content;
+      if (!Array.isArray(content)) continue;
+      for (const block of content) {
+        const value = block?.text || block?.content;
+        if (typeof value === 'string' && value.trim()) parts.push(value.trim());
+      }
+    }
+    const joined = parts.join('\n').trim();
+    if (joined) return joined.slice(0, 500);
+  }
+  const trimmed = text.trim();
+  return trimmed ? trimmed.slice(0, 500) : null;
 }
 
 async function testOneTokenModel(
@@ -130,6 +172,7 @@ async function testOneTokenModel(
     model,
     available: false,
     message,
+    responseText: null,
     httpStatus,
     latencyMs,
     checkedAt,
@@ -138,11 +181,11 @@ async function testOneTokenModel(
   if ((row.sites.status || 'active') === 'disabled') {
     return unavailable('站点已禁用');
   }
-  if (!row.account_tokens.enabled) {
-    return unavailable('令牌已禁用');
-  }
   if (!isReadyAccountToken(row.account_tokens)) {
     return unavailable('令牌明文未补全');
+  }
+  if (isImageGenerationModel(model)) {
+    return unavailable('图片模型不进行聊天可用性测试');
   }
 
   const endpoint = resolveChatCompletionsUrl(row.sites.url);
@@ -161,8 +204,8 @@ async function testOneTokenModel(
         },
         body: JSON.stringify({
           model,
-          messages: [{ role: 'user', content: 'ping' }],
-          max_tokens: 1,
+          messages: [{ role: 'user', content: '你是什么模型？' }],
+          max_tokens: 80,
           temperature: 0,
           stream: false,
         }),
@@ -183,6 +226,7 @@ async function testOneTokenModel(
       model,
       available: true,
       message: '请求成功',
+      responseText: extractModelReply(payload, text),
       httpStatus: response.status,
       latencyMs,
       checkedAt,

@@ -180,6 +180,102 @@ describe('PUT /api/channels/batch', () => {
     expect(updatedRoute?.enabled).toBe(false);
   });
 
+  it('updates routing strategy in route batch operations', async () => {
+    const routeA = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-4o-mini',
+      routingStrategy: 'weighted',
+      enabled: true,
+    }).returning().get();
+    const routeB = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-4o',
+      routingStrategy: 'weighted',
+      enabled: true,
+    }).returning().get();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/routes/batch',
+      payload: {
+        ids: [routeA.id, routeB.id],
+        routingStrategy: 'round_robin',
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({
+      success: true,
+      updatedCount: 2,
+    });
+
+    const updatedRoutes = await db.select().from(schema.tokenRoutes)
+      .where(eq(schema.tokenRoutes.routingStrategy, 'round_robin'))
+      .all();
+    expect(updatedRoutes.map((route) => route.id).sort((a, b) => a - b)).toEqual([routeA.id, routeB.id].sort((a, b) => a - b));
+  });
+
+  it('syncs explicit group source route strategies during route batch operations', async () => {
+    const sourceRoute = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-4o-mini',
+      routeMode: 'pattern',
+      routingStrategy: 'weighted',
+      enabled: true,
+    }).returning().get();
+    const groupRoute = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5-ha',
+      displayName: 'gpt-5-ha',
+      routeMode: 'explicit_group',
+      routingStrategy: 'weighted',
+      enabled: true,
+    }).returning().get();
+    await db.insert(schema.routeGroupSources).values({
+      groupRouteId: groupRoute.id,
+      sourceRouteId: sourceRoute.id,
+    }).run();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/routes/batch',
+      payload: {
+        ids: [groupRoute.id],
+        routingStrategy: 'stable_first',
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({
+      success: true,
+      updatedCount: 1,
+      syncedSourceRouteIds: [sourceRoute.id],
+    });
+
+    const updatedSourceRoute = await db.select().from(schema.tokenRoutes)
+      .where(eq(schema.tokenRoutes.id, sourceRoute.id))
+      .get();
+    expect(updatedSourceRoute?.routingStrategy).toBe('stable_first');
+  });
+
+  it('rejects invalid route batch routing strategy values', async () => {
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-4o-mini',
+      enabled: true,
+    }).returning().get();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/routes/batch',
+      payload: {
+        ids: [route.id],
+        routingStrategy: 'unknown',
+      },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({
+      success: false,
+      message: 'routingStrategy 必须是 weighted、round_robin 或 stable_first',
+    });
+  });
+
   it('rejects route batch payloads whose ids include non-number values', async () => {
     const res = await app.inject({
       method: 'POST',

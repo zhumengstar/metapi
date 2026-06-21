@@ -20,6 +20,7 @@ import DeleteConfirmModal from '../components/DeleteConfirmModal.js';
 import { clearFocusParams, readFocusTokenId } from './helpers/navigationFocus.js';
 import { shouldIgnoreRowSelectionClick } from './helpers/rowSelection.js';
 import { tr } from '../i18n.js';
+import { isImageGenerationModel } from '../utils/modelType.js';
 
 type SyncStatus = 'success' | 'skipped' | 'failed';
 type TokensPanelProps = {
@@ -65,15 +66,20 @@ type TokenAvailabilityTestResult = {
   model: string;
   available: boolean;
   message?: string;
+  responseText?: string | null;
   httpStatus?: number | null;
   latencyMs?: number | null;
   checkedAt?: string | null;
 };
 
+type SkippedTokenAvailabilityTestResult = Omit<TokenAvailabilityTestResult, 'available'> & {
+  available: false;
+};
+
 type AvailabilityTooltipRow = {
   label: string;
   value?: string | number | null;
-  tone?: 'success' | 'error' | 'muted';
+  tone?: 'success' | 'error' | 'warning' | 'muted';
 };
 
 type AvailabilityTooltipState = {
@@ -82,8 +88,20 @@ type AvailabilityTooltipState = {
   top: number;
 };
 
+type TokenModelDialogItem = {
+  name: string;
+  routeEnabled: boolean;
+};
+
+type TokenHealthCheckForm = {
+  enabled: boolean;
+  model: string;
+  intervalMinutes: string;
+};
+
 const AVAILABILITY_TOOLTIP_WIDTH = 300;
 const AVAILABILITY_TOOLTIP_OFFSET = 12;
+const MODEL_TEST_CONCURRENCY = 6;
 
 type TokenSortKey =
   | 'account'
@@ -96,9 +114,60 @@ type TokenSortKey =
   | 'availability'
   | 'default'
   | 'updatedAt';
+type TokenSortRule = { key: TokenSortKey; order: 'asc' | 'desc' };
+type TokenStatusFilter = 'all' | 'enabled' | 'disabled' | 'pending' | 'autoDisabled';
+type TokenAvailabilityFilter = 'all' | 'available' | 'unavailable';
 
 const ACCOUNT_SELECT_SEARCH_PLACEHOLDER = '筛选账号（名称 / 站点）';
 const DEFAULT_BATCH_TEST_MODEL = 'gpt-5.5';
+const IMAGE_MODEL_TEST_SKIPPED_MESSAGE = '只有图片模型，未进行聊天可用性测试';
+const DEFAULT_TOKEN_SORT_RULES: TokenSortRule[] = [
+  { key: 'status', order: 'desc' },
+  { key: 'ratio', order: 'asc' },
+  { key: 'availability', order: 'desc' },
+];
+
+function getDefaultTokenSortOrder(key: TokenSortKey): 'asc' | 'desc' {
+  return key === 'status' || key === 'availability' || key === 'default' || key === 'updatedAt'
+    ? 'desc'
+    : 'asc';
+}
+
+function normalizeTokenModelDialogItems(models: unknown, routeStates?: Record<string, boolean> | null): TokenModelDialogItem[] {
+  const result: TokenModelDialogItem[] = [];
+  const seen = new Set<string>();
+  const input = Array.isArray(models) ? models : [];
+  for (const item of input) {
+    const modelName = typeof item === 'string'
+      ? item.trim()
+      : String((item as any)?.name ?? (item as any)?.modelName ?? '').trim();
+    if (!modelName) continue;
+    const key = modelName.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const itemRouteEnabled = typeof item === 'object' && item !== null
+      ? (item as any).routeEnabled === true
+      : routeStates?.[modelName] === true;
+    result.push({ name: modelName, routeEnabled: itemRouteEnabled });
+  }
+  return result.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+async function runWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+) {
+  let cursor = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (cursor < items.length) {
+      const item = items[cursor++];
+      if (item === undefined) continue;
+      await worker(item);
+    }
+  }));
+}
 
 function formatGroupRatio(value?: number | null) {
   if (!Number.isFinite(value)) return '';
@@ -119,7 +188,13 @@ function resolveTokenAvailabilityResult(
     return pendingResult;
   }
 
-  const rows = Array.isArray(token?.modelAvailability) ? token.modelAvailability : [];
+  const hasTestRecord = (row: any) => (
+    typeof row?.message === 'string' && row.message.trim().length > 0
+  ) || row?.httpStatus != null || (
+    typeof row?.responseText === 'string' && row.responseText.trim().length > 0
+  );
+  const rows = (Array.isArray(token?.modelAvailability) ? token.modelAvailability : [])
+    .filter(hasTestRecord);
   const matched = requestedModel
     ? rows.find((row: any) => String(row?.modelName || '').trim().toLowerCase() === requestedModel)
     : rows
@@ -135,7 +210,9 @@ function resolveTokenAvailabilityResult(
     tokenId,
     model: String(matched.modelName || modelSearch.trim() || ''),
     available: matched.available === true,
-    message: matched.available ? '请求成功' : '最近测试不可用',
+    message: String(matched.message || '').trim() || (matched.available ? '请求成功' : '最近测试不可用'),
+    responseText: matched.responseText ?? null,
+    httpStatus: matched.httpStatus ?? null,
     latencyMs: matched.latencyMs,
     checkedAt: matched.checkedAt,
   };
@@ -163,6 +240,41 @@ const resolveSyncMessage = (result: AccountTokenSyncResult | null | undefined, f
 
 const isMaskedPendingToken = (token: any): boolean => token?.valueStatus === 'masked_pending';
 
+const isManuallyDisabledToken = (token: any): boolean => (
+  token?.enabled === false
+  && token?.enabledPreference?.source === 'manual'
+  && token?.enabledPreference?.enabled === false
+);
+
+const isAutoDisabledToken = (token: any): boolean => (
+  token?.enabled === false
+  && typeof token?.autoDisabledAt === 'string'
+  && token.autoDisabledAt.trim().length > 0
+);
+
+const resolveTokenStatusBadgeClass = (token: any, isPending: boolean): string => {
+  if (isPending) return 'badge-warning';
+  if (token?.enabled) return 'badge-success';
+  if (isAutoDisabledToken(token)) return 'badge-info';
+  return isManuallyDisabledToken(token) ? 'badge-danger' : 'badge-muted';
+};
+
+const resolveTokenStatusLabel = (token: any, isPending: boolean): string => {
+  if (isPending) return '待补全';
+  if (token?.enabled) return '启用';
+  if (isAutoDisabledToken(token)) return '自动禁用';
+  return '禁用';
+};
+
+const buildManualEnabledPreferencePatch = (token: any, enabled: boolean) => ({
+  enabledPreference: {
+    enabled,
+    source: 'manual',
+    group: token?.tokenGroup || 'default',
+    groupRatio: token?.groupRatioAvailable ? token?.groupRatio ?? null : null,
+  },
+});
+
 const isMaskedPendingSyncResult = (result: AccountTokenSyncResult | null | undefined) =>
   String(result?.reason || '').trim().toLowerCase() === 'upstream_masked_tokens'
   && Number(result?.maskedPending || 0) > 0;
@@ -171,6 +283,20 @@ const normalizeTokenModelNames = (token: any): string[] => {
   const seen = new Set<string>();
   return (Array.isArray(token?.modelNames) ? token.modelNames : [])
     .map((item: unknown) => String(item || '').trim())
+    .filter((modelName: string) => {
+      if (!modelName) return false;
+      const key = modelName.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+};
+
+const parseHealthCheckModelList = (value: unknown): string[] => {
+  const seen = new Set<string>();
+  return String(value || '')
+    .split(/[\n,，]+/g)
+    .map((item) => item.trim())
     .filter((modelName) => {
       if (!modelName) return false;
       const key = modelName.toLowerCase();
@@ -180,10 +306,50 @@ const normalizeTokenModelNames = (token: any): string[] => {
     });
 };
 
+const formatHealthCheckModelList = (models: string[]): string => models.join(', ');
+
+const getHealthCheckModelOptions = (token: any): string[] => (
+  normalizeTokenModelNames(token)
+    .filter((modelName) => !isImageGenerationModel(modelName))
+    .sort((left, right) => left.localeCompare(right))
+);
+
 const resolveDefaultBatchTestModel = (token: any): string => {
   const modelNames = normalizeTokenModelNames(token);
-  return modelNames.find((modelName) => modelName.toLowerCase() === DEFAULT_BATCH_TEST_MODEL) || modelNames[0] || '';
+  const nonImageModels = modelNames.filter((modelName) => !isImageGenerationModel(modelName));
+  return nonImageModels.find((modelName) => modelName.toLowerCase() === DEFAULT_BATCH_TEST_MODEL)
+    || nonImageModels[0]
+    || '';
 };
+
+const hasOnlyImageModels = (token: any): boolean => {
+  const modelNames = normalizeTokenModelNames(token);
+  return modelNames.length > 0 && modelNames.every((modelName) => isImageGenerationModel(modelName));
+};
+
+const buildImageOnlySkippedResult = (token: any): SkippedTokenAvailabilityTestResult | null => {
+  const tokenId = Number(token?.id);
+  if (!Number.isInteger(tokenId) || tokenId <= 0) return null;
+  const model = normalizeTokenModelNames(token).find((modelName) => isImageGenerationModel(modelName)) || '图片模型';
+  return {
+    tokenId,
+    model,
+    available: false,
+    message: IMAGE_MODEL_TEST_SKIPPED_MESSAGE,
+    responseText: null,
+    httpStatus: null,
+    latencyMs: null,
+    checkedAt: new Date().toISOString(),
+  };
+};
+
+const isImageOnlySkippedAvailabilityResult = (result: TokenAvailabilityTestResult | null | undefined): boolean => (
+  !result?.available
+  && (
+    String(result?.message || '').trim() === IMAGE_MODEL_TEST_SKIPPED_MESSAGE
+    || String(result?.message || '').includes('图片模型不进行聊天可用性测试')
+  )
+);
 
 const resolveAccountLabel = (result: AccountTokenSyncResult | null | undefined) => {
   const name = typeof result?.accountName === 'string' ? result.accountName.trim() : '';
@@ -254,20 +420,29 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     tokenName?: string;
     count?: number;
   }>(null);
-  const [tokenSort, setTokenSort] = useState<{ key: TokenSortKey; order: 'asc' | 'desc' }>({
-    key: 'account',
-    order: 'asc',
-  });
+  const [tokenSortRules, setTokenSortRules] = useState<TokenSortRule[]>(DEFAULT_TOKEN_SORT_RULES);
   const [modelSearch, setModelSearch] = useState('');
+  const [tokenStatusFilter, setTokenStatusFilter] = useState<TokenStatusFilter>('all');
+  const [tokenAvailabilityFilter, setTokenAvailabilityFilter] = useState<TokenAvailabilityFilter>('all');
   const [testingModelTokens, setTestingModelTokens] = useState(false);
   const [testingAvailabilityTokenIds, setTestingAvailabilityTokenIds] = useState<number[]>([]);
   const [tokenAvailabilityById, setTokenAvailabilityById] = useState<Record<number, TokenAvailabilityTestResult>>({});
   const [availabilityTooltip, setAvailabilityTooltip] = useState<AvailabilityTooltipState | null>(null);
   const [modelDialogToken, setModelDialogToken] = useState<any | null>(null);
-  const [modelDialogModels, setModelDialogModels] = useState<string[]>([]);
+  const [modelDialogModels, setModelDialogModels] = useState<TokenModelDialogItem[]>([]);
   const [modelDialogLoading, setModelDialogLoading] = useState(false);
   const [modelDialogError, setModelDialogError] = useState('');
   const [modelDialogSearch, setModelDialogSearch] = useState('');
+  const [modelDialogModelLoading, setModelDialogModelLoading] = useState<Record<string, boolean>>({});
+  const [healthCheckToken, setHealthCheckToken] = useState<any | null>(null);
+  const [healthCheckForm, setHealthCheckForm] = useState<TokenHealthCheckForm>({
+    enabled: false,
+    model: DEFAULT_BATCH_TEST_MODEL,
+    intervalMinutes: '60',
+  });
+  const [healthCheckCustomModel, setHealthCheckCustomModel] = useState('');
+  const [healthCheckSaving, setHealthCheckSaving] = useState(false);
+  const [healthCheckRunning, setHealthCheckRunning] = useState(false);
   const [form, setForm] = useState(initialCreateForm);
   const [editForm, setEditForm] = useState({
     name: '',
@@ -445,36 +620,44 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
 
     return [...tokens].filter((token) => {
       if (syncingAccountId && Number(token?.accountId || 0) !== syncingAccountId) return false;
+      if (tokenStatusFilter === 'enabled' && !token?.enabled) return false;
+      if (tokenStatusFilter === 'disabled' && (token?.enabled || isMaskedPendingToken(token) || isAutoDisabledToken(token))) return false;
+      if (tokenStatusFilter === 'pending' && !isMaskedPendingToken(token)) return false;
+      if (tokenStatusFilter === 'autoDisabled' && !isAutoDisabledToken(token)) return false;
+      if (tokenAvailabilityFilter !== 'all') {
+        const tokenId = Number(token?.id);
+        const result = resolveTokenAvailabilityResult(token, modelSearch, tokenAvailabilityById[tokenId]);
+        if (tokenAvailabilityFilter === 'available' && result?.available !== true) return false;
+        if (tokenAvailabilityFilter === 'unavailable' && result?.available === true) return false;
+      }
       if (!normalizedModelSearch) return true;
       return tokenModelNames(token).some((modelName) => modelName.trim().toLowerCase() === normalizedModelSearch);
     }).sort((left, right) => {
-      let result = 0;
-      if (tokenSort.key === 'ratio') {
-        result = ratioValue(left) - ratioValue(right);
-      } else if (tokenSort.key === 'site') {
-        result = siteLabel(left).localeCompare(siteLabel(right));
-      } else if (tokenSort.key === 'name') {
-        result = tokenName(left).localeCompare(tokenName(right));
-      } else if (tokenSort.key === 'token') {
-        result = tokenValue(left).localeCompare(tokenValue(right));
-      } else if (tokenSort.key === 'group') {
-        result = groupLabel(left).localeCompare(groupLabel(right));
-      } else if (tokenSort.key === 'status') {
-        result = statusRank(left) - statusRank(right);
-      } else if (tokenSort.key === 'availability') {
-        result = availabilityRank(left) - availabilityRank(right);
-        if (result === 0) {
-          const ratioCmp = ratioValue(left) - ratioValue(right);
-          if (ratioCmp !== 0) return ratioCmp;
+      for (const rule of tokenSortRules) {
+        let result = 0;
+        if (rule.key === 'ratio') {
+          result = ratioValue(left) - ratioValue(right);
+        } else if (rule.key === 'site') {
+          result = siteLabel(left).localeCompare(siteLabel(right));
+        } else if (rule.key === 'name') {
+          result = tokenName(left).localeCompare(tokenName(right));
+        } else if (rule.key === 'token') {
+          result = tokenValue(left).localeCompare(tokenValue(right));
+        } else if (rule.key === 'group') {
+          result = groupLabel(left).localeCompare(groupLabel(right));
+        } else if (rule.key === 'status') {
+          result = statusRank(left) - statusRank(right);
+        } else if (rule.key === 'availability') {
+          result = availabilityRank(left) - availabilityRank(right);
+        } else if (rule.key === 'default') {
+          result = defaultRank(left) - defaultRank(right);
+        } else if (rule.key === 'updatedAt') {
+          result = updatedAtValue(left) - updatedAtValue(right);
+        } else {
+          result = accountLabel(left).localeCompare(accountLabel(right));
         }
-      } else if (tokenSort.key === 'default') {
-        result = defaultRank(left) - defaultRank(right);
-      } else if (tokenSort.key === 'updatedAt') {
-        result = updatedAtValue(left) - updatedAtValue(right);
-      } else {
-        result = accountLabel(left).localeCompare(accountLabel(right));
+        if (result !== 0) return rule.order === 'desc' ? -result : result;
       }
-      if (result !== 0) return tokenSort.order === 'desc' ? -result : result;
       const accountCmp = accountLabel(left).localeCompare(accountLabel(right));
       if (accountCmp !== 0) return accountCmp;
       const siteCmp = siteLabel(left).localeCompare(siteLabel(right));
@@ -483,9 +666,26 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       if (nameCmp !== 0) return nameCmp;
       return Number(left?.id || 0) - Number(right?.id || 0);
     });
-  }, [modelSearch, syncingAccountId, tokenAvailabilityById, tokenSort, tokens]);
+  }, [modelSearch, syncingAccountId, tokenAvailabilityById, tokenAvailabilityFilter, tokenSortRules, tokenStatusFilter, tokens]);
   const allVisibleTokensSelected = accountClusteredTokens.length > 0
     && accountClusteredTokens.every((token) => selectedTokenIds.includes(token.id));
+  const visibleTokenIdSignature = useMemo(() => (
+    accountClusteredTokens
+      .map((token: any) => Number(token?.id))
+      .filter((id) => Number.isInteger(id) && id > 0)
+      .join(',')
+  ), [accountClusteredTokens]);
+
+  useEffect(() => {
+    const visibleIds = visibleTokenIdSignature
+      ? visibleTokenIdSignature.split(',').map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0)
+      : [];
+
+    setSelectedTokenIds((current) => {
+      if (current.length === visibleIds.length && current.every((id, index) => id === visibleIds[index])) return current;
+      return visibleIds;
+    });
+  }, [visibleTokenIdSignature]);
 
   const activeAccounts = useMemo(() => accounts.filter(isAccountSyncable), [accounts]);
   const activeAccountSelectOptions = useMemo(() => (
@@ -602,11 +802,32 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
 
   const handleSetDefaultToken = useCallback(async (token: any) => {
     const loadingKey = `token-${token.id}-default`;
-    await withRowLoading(loadingKey, async () => {
-      await api.setDefaultAccountToken(token.id);
-      markTokenAsDefault(token);
-      toast.success('默认令牌已更新');
-    });
+    try {
+      await withRowLoading(loadingKey, async () => {
+        const res = await api.setDefaultAccountToken(token.id);
+        const returnedTokens = Array.isArray(res?.accountTokens) ? res.accountTokens : [];
+        if (returnedTokens.length > 0) {
+          const stateById = new Map<number, { isDefault?: boolean; enabled?: boolean; updatedAt?: string }>(
+            returnedTokens.map((item: any) => [Number(item?.id), item]),
+          );
+          setTokens((current) => current.map((item) => {
+            const nextState = stateById.get(Number(item?.id));
+            if (!nextState) return item;
+            return {
+              ...item,
+              isDefault: nextState.isDefault === true,
+              enabled: nextState.enabled ?? item.enabled,
+              updatedAt: nextState.updatedAt || item.updatedAt,
+            };
+          }));
+        } else {
+          markTokenAsDefault(token);
+        }
+        toast.success('默认令牌已更新');
+      });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '默认令牌更新失败');
+    }
   }, [markTokenAsDefault, toast]);
 
   const patchTokenRow = useCallback((tokenId: number, patch: Record<string, unknown>) => {
@@ -614,6 +835,214 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       Number(item?.id || 0) === tokenId ? { ...item, ...patch } : item
     )));
   }, []);
+
+  const patchTokenFromHealthCheckResponse = useCallback((
+    tokenId: number,
+    responseToken: any,
+    result?: TokenAvailabilityTestResult | null,
+    results?: TokenAvailabilityTestResult[] | null,
+  ) => {
+    const resultList = (Array.isArray(results) && results.length > 0)
+      ? results
+      : (result ? [result] : []);
+    const patch: Record<string, unknown> = {
+      healthCheckEnabled: responseToken?.healthCheckEnabled,
+      healthCheckIntervalMinutes: responseToken?.healthCheckIntervalMinutes,
+      healthCheckModel: responseToken?.healthCheckModel,
+      healthCheckLastRunAt: responseToken?.healthCheckLastRunAt,
+      healthCheckNextRunAt: responseToken?.healthCheckNextRunAt,
+      healthCheckLastAvailable: responseToken?.healthCheckLastAvailable,
+      healthCheckLastMessage: responseToken?.healthCheckLastMessage,
+      healthCheckLastLatencyMs: responseToken?.healthCheckLastLatencyMs,
+      updatedAt: responseToken?.updatedAt || new Date().toISOString(),
+    };
+    setTokens((current) => current.map((item) => {
+      if (Number(item?.id || 0) !== tokenId) return item;
+      const next: any = { ...item, ...patch };
+      if (resultList.length > 0) {
+        const existingAvailability = Array.isArray(item.modelAvailability) ? item.modelAvailability : [];
+        const resultModelKeys = new Set(resultList
+          .map((entry) => String(entry?.model || '').trim().toLowerCase())
+          .filter(Boolean));
+        next.modelAvailability = [
+          ...existingAvailability.filter((entry: any) => (
+            !resultModelKeys.has(String(entry?.modelName || entry?.model || '').trim().toLowerCase())
+          )),
+          ...resultList.map((entry) => {
+            const model = String(entry?.model || '').trim();
+            return {
+              modelName: model,
+              model,
+              available: entry.available,
+              message: entry.message || '',
+              responseText: entry.responseText || null,
+              httpStatus: entry.httpStatus ?? null,
+              latencyMs: entry.latencyMs ?? null,
+              checkedAt: entry.checkedAt || null,
+            };
+          }),
+        ].filter((entry) => String(entry?.modelName || entry?.model || '').trim());
+        const nextModelNames = normalizeTokenModelNames(item);
+        for (const entry of resultList) {
+          const model = String(entry?.model || '').trim();
+          if (model && !nextModelNames.some((name) => name.toLowerCase() === model.toLowerCase())) {
+            nextModelNames.push(model);
+          }
+        }
+        if (nextModelNames.length !== normalizeTokenModelNames(item).length) {
+          next.modelNames = nextModelNames.sort((left, right) => left.localeCompare(right));
+          next.modelCount = next.modelNames.length;
+        }
+        const routeStates = { ...(item.modelRouteStates || {}) };
+        for (const entry of resultList) {
+          const model = String(entry?.model || '').trim();
+          if (model && entry.available) routeStates[model] = true;
+        }
+        next.modelRouteStates = routeStates;
+      }
+      return next;
+    }));
+  }, []);
+
+  const handleToggleTokenEnabled = useCallback(async (token: any) => {
+    const loadingKey = `token-${token.id}-toggle`;
+    await withRowLoading(loadingKey, async () => {
+      const nextEnabled = !token.enabled;
+      await api.updateAccountToken(token.id, { enabled: nextEnabled });
+      toast.success(token.enabled ? '令牌已禁用' : '令牌已启用');
+      patchTokenRow(token.id, {
+        enabled: nextEnabled,
+        autoDisabledAt: null,
+        autoDisabledReason: null,
+        autoDisabledPreviousEnabled: null,
+        ...buildManualEnabledPreferencePatch(token, nextEnabled),
+        updatedAt: new Date().toISOString(),
+      });
+    });
+  }, [patchTokenRow, toast]);
+
+  const resolveHealthCheckDefaultModel = useCallback((token: any) => {
+    const searched = modelSearch.trim();
+    if (searched) return searched;
+    const configured = String(token?.healthCheckModel || '').trim();
+    if (configured) return configured;
+    const nonImageModel = normalizeTokenModelNames(token).find((modelName) => !isImageGenerationModel(modelName));
+    return nonImageModel || DEFAULT_BATCH_TEST_MODEL;
+  }, [modelSearch]);
+
+  const openHealthCheckPanel = useCallback((token: any) => {
+    setHealthCheckToken(token);
+    setHealthCheckCustomModel('');
+    setHealthCheckForm({
+      enabled: token?.healthCheckEnabled === true,
+      model: resolveHealthCheckDefaultModel(token),
+      intervalMinutes: String(token?.healthCheckIntervalMinutes || 60),
+    });
+  }, [resolveHealthCheckDefaultModel]);
+
+  const closeHealthCheckPanel = useCallback(() => {
+    if (healthCheckSaving || healthCheckRunning) return;
+    setHealthCheckToken(null);
+  }, [healthCheckRunning, healthCheckSaving]);
+
+  const saveHealthCheckPanel = useCallback(async () => {
+    if (!healthCheckToken) return;
+    const model = formatHealthCheckModelList(parseHealthCheckModelList(healthCheckForm.model));
+    const intervalMinutes = Number.parseInt(healthCheckForm.intervalMinutes, 10);
+    if (healthCheckForm.enabled && !model) {
+      toast.error('开启定时测活时必须填写模型');
+      return;
+    }
+    if (!Number.isFinite(intervalMinutes) || intervalMinutes <= 0) {
+      toast.error('测活间隔必须是正数分钟');
+      return;
+    }
+    setHealthCheckSaving(true);
+    try {
+      const res = await api.updateAccountTokenHealthCheck(healthCheckToken.id, {
+        enabled: healthCheckForm.enabled,
+        model,
+        intervalMinutes,
+      });
+      if (res?.token) {
+        patchTokenFromHealthCheckResponse(Number(healthCheckToken.id), res.token, null);
+        setHealthCheckToken((current: any | null) => (
+          current && Number(current.id) === Number(healthCheckToken.id)
+            ? { ...current, ...res.token }
+            : current
+        ));
+      }
+      toast.success(healthCheckForm.enabled ? '定时测活已保存' : '定时测活已关闭');
+    } catch (error: any) {
+      toast.error(error?.message || '保存测活配置失败');
+    } finally {
+      setHealthCheckSaving(false);
+    }
+  }, [healthCheckForm.enabled, healthCheckForm.intervalMinutes, healthCheckForm.model, healthCheckToken, patchTokenFromHealthCheckResponse, toast]);
+
+  const runHealthCheckNow = useCallback(async () => {
+    if (!healthCheckToken) return;
+    const tokenId = Number(healthCheckToken.id);
+    const model = formatHealthCheckModelList(parseHealthCheckModelList(healthCheckForm.model));
+    if (!model) {
+      toast.error('请至少选择一个测活模型');
+      return;
+    }
+    setHealthCheckRunning(true);
+    setTestingAvailabilityTokenIds((current) => Array.from(new Set([...current, tokenId])));
+    try {
+      const shouldSaveFirst = (
+        model !== formatHealthCheckModelList(parseHealthCheckModelList(healthCheckToken.healthCheckModel))
+        || Number.parseInt(healthCheckForm.intervalMinutes, 10) !== Number(healthCheckToken.healthCheckIntervalMinutes || 60)
+        || healthCheckForm.enabled !== (healthCheckToken.healthCheckEnabled === true)
+      );
+      let tokenForRun = healthCheckToken;
+      if (shouldSaveFirst) {
+        const intervalMinutes = Number.parseInt(healthCheckForm.intervalMinutes, 10);
+        const res = await api.updateAccountTokenHealthCheck(tokenId, {
+          enabled: healthCheckForm.enabled,
+          model,
+          intervalMinutes: Number.isFinite(intervalMinutes) && intervalMinutes > 0 ? intervalMinutes : 60,
+        });
+        if (res?.token) tokenForRun = { ...tokenForRun, ...res.token };
+      }
+      const res = await api.runAccountTokenHealthCheck(tokenId);
+      const result = res?.result as TokenAvailabilityTestResult | undefined;
+      const results = Array.isArray(res?.results) ? res.results as TokenAvailabilityTestResult[] : [];
+      const responseToken = res?.token || tokenForRun;
+      if (responseToken) {
+        patchTokenFromHealthCheckResponse(tokenId, responseToken, result || null, results);
+        setHealthCheckToken((current: any | null) => (
+          current && Number(current.id) === tokenId
+            ? {
+              ...current,
+              ...responseToken,
+              healthCheckLastRunAt: result?.checkedAt || responseToken.healthCheckLastRunAt,
+              healthCheckLastAvailable: result?.available ?? responseToken.healthCheckLastAvailable,
+              healthCheckLastMessage: result?.message || responseToken.healthCheckLastMessage,
+              healthCheckLastLatencyMs: result?.latencyMs ?? responseToken.healthCheckLastLatencyMs,
+            }
+            : current
+        ));
+      }
+      const latestResult = result || results.find((item) => item.available) || results[0];
+      if (latestResult) {
+        setTokenAvailabilityById((current) => ({ ...current, [tokenId]: latestResult }));
+      }
+      const successCount = results.length > 0 ? results.filter((item) => item.available).length : (result?.available ? 1 : 0);
+      const totalCount = results.length > 0 ? results.length : (result ? 1 : 0);
+      if (successCount > 0) {
+        toast.success(`测活成功 ${successCount}/${totalCount}，已加入路由`);
+      } else {
+        toast.error(`测活失败：${result?.message || '未知错误'}`);
+      }
+    } catch (error: any) {
+      toast.error(error?.message || '立即测活失败');
+    } finally {
+      setTestingAvailabilityTokenIds((current) => current.filter((id) => id !== tokenId));
+      setHealthCheckRunning(false);
+    }
+  }, [healthCheckForm.enabled, healthCheckForm.intervalMinutes, healthCheckForm.model, healthCheckToken, patchTokenFromHealthCheckResponse, toast]);
 
   const removeTokenRows = useCallback((tokenIds: number[]) => {
     const idSet = new Set(tokenIds.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0));
@@ -640,23 +1069,34 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
   };
 
   const toggleTokenSort = useCallback((key: TokenSortKey) => {
-    setTokenSort((current) => (
-      current.key === key
-        ? { key, order: current.order === 'asc' ? 'desc' : 'asc' }
-        : { key, order: key === 'availability' ? 'desc' : 'asc' }
-    ));
+    setTokenSortRules((current) => {
+      const existing = current.find((rule) => rule.key === key);
+      if (existing) {
+        return current.map((rule) => (
+          rule.key === key
+            ? { ...rule, order: rule.order === 'asc' ? 'desc' : 'asc' }
+            : rule
+        ));
+      }
+      return [...current, { key, order: getDefaultTokenSortOrder(key) }];
+    });
   }, []);
 
-  const renderTokenSortLabel = useCallback((label: string, key: TokenSortKey) => (
-    <button
-      type="button"
-      onClick={() => toggleTokenSort(key)}
-      className="btn btn-link"
-      style={{ padding: 0, fontWeight: 700, color: 'inherit' }}
-    >
-      {label}{tokenSort.key === key ? (tokenSort.order === 'asc' ? ' ↑' : ' ↓') : ''}
-    </button>
-  ), [toggleTokenSort, tokenSort]);
+  const renderTokenSortLabel = useCallback((label: string, key: TokenSortKey) => {
+    const sortIndex = tokenSortRules.findIndex((rule) => rule.key === key);
+    const sortRule = sortIndex >= 0 ? tokenSortRules[sortIndex] : null;
+    return (
+      <button
+        type="button"
+        onClick={() => toggleTokenSort(key)}
+        className="btn btn-link"
+        style={{ padding: 0, fontWeight: 700, color: 'inherit' }}
+        title={sortRule ? `排序优先级 ${sortIndex + 1}` : '点击加入排序'}
+      >
+        {label}{sortRule ? ` ${sortRule.order === 'asc' ? '↑' : '↓'}${sortIndex + 1}` : ''}
+      </button>
+    );
+  }, [toggleTokenSort, tokenSortRules]);
 
   const toggleTokenDetails = (tokenId: number) => {
     setExpandedTokenIds((current) => (
@@ -691,7 +1131,12 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       } else {
         setTokens((current) => current.map((item) => (
           successIds.includes(Number(item?.id || 0))
-            ? { ...item, enabled: action === 'enable', updatedAt: new Date().toISOString() }
+            ? {
+              ...item,
+              enabled: action === 'enable',
+              ...buildManualEnabledPreferencePatch(item, action === 'enable'),
+              updatedAt: new Date().toISOString(),
+            }
             : item
         )));
       }
@@ -802,6 +1247,10 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         name: latest.name ?? editForm.name.trim() ?? editingToken.name,
         tokenGroup: latest.tokenGroup ?? editForm.group ?? 'default',
         enabled: latest.enabled ?? editForm.enabled,
+        ...buildManualEnabledPreferencePatch(
+          { ...editingToken, tokenGroup: latest.tokenGroup ?? editForm.group ?? editingToken.tokenGroup },
+          latest.enabled ?? editForm.enabled,
+        ),
         isDefault: latest.isDefault ?? editForm.isDefault,
         valueStatus: latest.valueStatus || (editForm.token.trim() ? 'ready' : editingToken.valueStatus),
         updatedAt: latest.updatedAt || new Date().toISOString(),
@@ -853,18 +1302,50 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
 
   const handleAccountFilterChange = useCallback((nextValue: string) => {
     setSyncingAccountId(Number.parseInt(nextValue, 10) || 0);
-    setSelectedTokenIds([]);
   }, []);
 
   const openTokenModels = useCallback((token: any) => {
-    const cachedModels = Array.isArray(token?.modelNames)
-      ? token.modelNames.map((item: unknown) => String(item || '').trim()).filter(Boolean)
-      : [];
+    const cachedModels = normalizeTokenModelDialogItems(token?.modelNames, token?.modelRouteStates);
     setModelDialogToken(token);
     setModelDialogModels(cachedModels);
     setModelDialogSearch('');
     setModelDialogError('');
-    setModelDialogLoading(false);
+    setModelDialogLoading(true);
+    setModelDialogModelLoading({});
+    api.getAccountTokenModels(token.id, { refresh: false })
+      .then((res: any) => {
+        const serverModels = normalizeTokenModelDialogItems(res?.models, token?.modelRouteStates);
+        setModelDialogModels(serverModels);
+        const routeStates = Object.fromEntries(serverModels.map((item) => [item.name, item.routeEnabled]));
+        setModelDialogToken((current: any | null) => (
+          current && Number(current.id) === Number(token.id)
+            ? {
+              ...current,
+              modelNames: serverModels.map((item) => item.name),
+              modelRouteStates: routeStates,
+              modelSyncedAt: res?.checkedAt || current.modelSyncedAt || null,
+            }
+            : current
+        ));
+        setTokens((current) => current.map((item) => (
+          Number(item?.id) === Number(token.id)
+            ? {
+              ...item,
+              modelNames: serverModels.map((model) => model.name),
+              modelRouteStates: routeStates,
+              modelCount: serverModels.length,
+              modelSyncedAt: res?.checkedAt || item.modelSyncedAt || null,
+            }
+            : item
+        )));
+        setModelDialogError('');
+      })
+      .catch((error: any) => {
+        setModelDialogError(error?.message || '读取令牌模型缓存失败');
+      })
+      .finally(() => {
+        setModelDialogLoading(false);
+      });
   }, []);
 
   const closeModelDialog = useCallback(() => {
@@ -873,7 +1354,57 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     setModelDialogError('');
     setModelDialogSearch('');
     setModelDialogLoading(false);
+    setModelDialogModelLoading({});
   }, []);
+
+  const toggleModelRouteEnabled = useCallback(async (model: TokenModelDialogItem) => {
+    if (!modelDialogToken) return;
+    const tokenId = Number(modelDialogToken.id);
+    if (!Number.isInteger(tokenId) || tokenId <= 0) return;
+    const nextRouteEnabled = !model.routeEnabled;
+    const loadingKey = model.name.toLowerCase();
+    setModelDialogModelLoading((current) => ({ ...current, [loadingKey]: true }));
+    try {
+      const res = await api.setAccountTokenModelRouteEnabled(tokenId, {
+        modelName: model.name,
+        routeEnabled: nextRouteEnabled,
+      });
+      const serverModels = normalizeTokenModelDialogItems(res?.models, null);
+      const nextModels = serverModels.length > 0
+        ? serverModels
+        : modelDialogModels.map((item) => (
+          item.name.toLowerCase() === model.name.toLowerCase()
+            ? { ...item, routeEnabled: nextRouteEnabled }
+            : item
+        ));
+      const nextRouteStates = Object.fromEntries(nextModels.map((item) => [item.name, item.routeEnabled]));
+      setModelDialogModels(nextModels);
+      setTokens((current) => current.map((token) => {
+        if (Number(token?.id) !== tokenId) return token;
+        return {
+          ...token,
+          modelNames: nextModels.map((item) => item.name),
+          modelRouteStates: nextRouteStates,
+          modelCount: nextModels.length,
+          modelSyncedAt: res?.checkedAt || token.modelSyncedAt || null,
+        };
+      }));
+      setModelDialogToken((current: any | null) => {
+        if (!current || Number(current.id) !== tokenId) return current;
+        return {
+          ...current,
+          modelNames: nextModels.map((item) => item.name),
+          modelRouteStates: nextRouteStates,
+          modelSyncedAt: res?.checkedAt || current.modelSyncedAt || null,
+        };
+      });
+      toast.success(nextRouteEnabled ? '模型已点亮，可用于路由' : '模型已取消点亮');
+    } catch (error: any) {
+      toast.error(error?.message || '更新模型路由状态失败');
+    } finally {
+      setModelDialogModelLoading((current) => ({ ...current, [loadingKey]: false }));
+    }
+  }, [modelDialogModels, modelDialogToken, toast]);
 
   const applyModelAvailabilityResults = useCallback((model: string, results: TokenAvailabilityTestResult[]) => {
     const nextModel = model.trim();
@@ -889,6 +1420,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
           model: nextModel,
           available: !!result.available,
           message: result.message,
+          responseText: result.responseText,
           httpStatus: result.httpStatus,
           latencyMs: result.latencyMs,
           checkedAt: result.checkedAt,
@@ -909,6 +1441,9 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         nextAvailabilityRows.push({
           modelName: nextModel,
           available: !!result.available,
+          message: result.message,
+          responseText: result.responseText,
+          httpStatus: result.httpStatus,
           latencyMs: result.latencyMs,
           checkedAt: result.checkedAt,
         });
@@ -919,6 +1454,11 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         const existingModels = Array.isArray(token?.modelNames)
           ? token.modelNames.map((item: unknown) => String(item || '').trim()).filter(Boolean)
           : [];
+        const existingRouteStates = token?.modelRouteStates && typeof token.modelRouteStates === 'object'
+          ? token.modelRouteStates
+          : {};
+        const existingRouteStateEntry = Object.entries(existingRouteStates)
+          .find(([modelName]) => modelName.trim().toLowerCase() === nextModel.toLowerCase());
         const hasModel = existingModels.some((item: string) => item.toLowerCase() === nextModel.toLowerCase());
         const nextModelNames = hasModel
           ? existingModels
@@ -927,8 +1467,13 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         return {
           ...token,
           modelNames: nextModelNames,
+          modelRouteStates: {
+            ...existingRouteStates,
+            [nextModel]: existingRouteStateEntry?.[1] === true,
+          },
           modelCount: nextModelNames.length,
           modelAvailability: nextAvailabilityRows,
+          modelSyncedAt: result.checkedAt || token.modelSyncedAt || null,
           updatedAt: result.checkedAt || new Date().toISOString(),
         };
     }));
@@ -951,14 +1496,23 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     setTestingModelTokens(true);
     setTestingAvailabilityTokenIds(normalizedTokenIds);
     try {
-      const res = await api.testAccountTokenModelAvailability({
-        model,
-        tokenIds: normalizedTokenIds,
+      let availableCount = 0;
+      let finishedCount = 0;
+      await runWithConcurrency(normalizedTokenIds, MODEL_TEST_CONCURRENCY, async (tokenId) => {
+        try {
+          const res = await api.testAccountTokenModelAvailability({
+            model,
+            tokenIds: [tokenId],
+          });
+          const results: TokenAvailabilityTestResult[] = Array.isArray(res?.results) ? res.results : [];
+          applyModelAvailabilityResults(model, results);
+          availableCount += results.filter((result) => result.available).length;
+          finishedCount += results.length;
+        } finally {
+          setTestingAvailabilityTokenIds((current) => current.filter((id) => id !== tokenId));
+        }
       });
-      const results: TokenAvailabilityTestResult[] = Array.isArray(res?.results) ? res.results : [];
-      applyModelAvailabilityResults(model, results);
-      const availableCount = results.filter((result) => result.available).length;
-      toast.success(`测试完成：可用 ${availableCount}，不可用 ${Math.max(results.length - availableCount, 0)}`);
+      toast.success(`测试完成：可用 ${availableCount}，不可用 ${Math.max(finishedCount - availableCount, 0)}`);
     } catch (error: any) {
       toast.error(error?.message || '测试令牌可用性失败');
     } finally {
@@ -981,10 +1535,16 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     const selectedIdSet = new Set(selectedTokenIds);
     const selectedTokens = tokens.filter((token) => selectedIdSet.has(Number(token?.id)));
     const groupedTokenIds = new Map<string, number[]>();
+    const imageOnlySkippedResults: SkippedTokenAvailabilityTestResult[] = [];
     const skippedCount = selectedTokens.reduce((count, token) => {
       const tokenId = Number(token?.id);
       if (!Number.isInteger(tokenId) || tokenId <= 0) return count + 1;
       const testModel = resolveDefaultBatchTestModel(token);
+      if (!testModel && hasOnlyImageModels(token)) {
+        const skippedResult = buildImageOnlySkippedResult(token);
+        if (skippedResult) imageOnlySkippedResults.push(skippedResult);
+        return count;
+      }
       if (!testModel) return count + 1;
       const group = groupedTokenIds.get(testModel) || [];
       group.push(tokenId);
@@ -993,7 +1553,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     }, 0);
 
     const testGroups = Array.from(groupedTokenIds.entries());
-    if (testGroups.length === 0) {
+    if (testGroups.length === 0 && imageOnlySkippedResults.length === 0) {
       toast.info(selectedTokenIds.length > 0 ? '所选令牌没有可检测的模型列表' : '请先选择需要检测的令牌');
       return;
     }
@@ -1004,17 +1564,39 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     try {
       let total = 0;
       let availableCount = 0;
-      for (const [testModel, tokenIds] of testGroups) {
-        const res = await api.testAccountTokenModelAvailability({
-          model: testModel,
-          tokenIds,
-        });
-        const results: TokenAvailabilityTestResult[] = Array.isArray(res?.results) ? res.results : [];
-        applyModelAvailabilityResults(testModel, results);
-        total += results.length;
-        availableCount += results.filter((result) => result.available).length;
+      if (imageOnlySkippedResults.length > 0) {
+        await api.saveSkippedAccountTokenModelAvailability({ results: imageOnlySkippedResults });
+        const resultsByModel = new Map<string, TokenAvailabilityTestResult[]>();
+        for (const result of imageOnlySkippedResults) {
+          const group = resultsByModel.get(result.model) || [];
+          group.push(result);
+          resultsByModel.set(result.model, group);
+        }
+        for (const [skippedModel, results] of resultsByModel) {
+          applyModelAvailabilityResults(skippedModel, results);
+        }
+        total += imageOnlySkippedResults.length;
       }
-      const skippedText = skippedCount > 0 ? `，跳过 ${skippedCount} 个无模型令牌` : '';
+      const testJobs = testGroups.flatMap(([testModel, tokenIds]) => tokenIds.map((tokenId) => ({ testModel, tokenId })));
+      await runWithConcurrency(testJobs, MODEL_TEST_CONCURRENCY, async ({ testModel, tokenId }) => {
+        try {
+          const res = await api.testAccountTokenModelAvailability({
+            model: testModel,
+            tokenIds: [tokenId],
+          });
+          const results: TokenAvailabilityTestResult[] = Array.isArray(res?.results) ? res.results : [];
+          applyModelAvailabilityResults(testModel, results);
+          total += results.length;
+          availableCount += results.filter((result) => result.available).length;
+        } finally {
+          setTestingAvailabilityTokenIds((current) => current.filter((id) => id !== tokenId));
+        }
+      });
+      const skippedParts = [
+        skippedCount > 0 ? `跳过 ${skippedCount} 个无模型令牌` : '',
+        imageOnlySkippedResults.length > 0 ? `${imageOnlySkippedResults.length} 个仅图片模型` : '',
+      ].filter(Boolean);
+      const skippedText = skippedParts.length > 0 ? `，${skippedParts.join('，')}` : '';
       toast.success(`测试完成：可用 ${availableCount}，不可用 ${Math.max(total - availableCount, 0)}${skippedText}`);
     } catch (error: any) {
       toast.error(error?.message || '测试令牌可用性失败');
@@ -1097,17 +1679,27 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       );
     }
     const checkedAt = result.checkedAt ? formatDateTimeLocal(result.checkedAt) : '';
+    const imageOnlySkipped = isImageOnlySkippedAvailabilityResult(result);
     const rows: AvailabilityTooltipRow[] = [
       { label: '模型', value: result.model || '-' },
-      { label: '结果', value: result.available ? '可用' : '不可用', tone: result.available ? 'success' : 'error' },
+      {
+        label: '结果',
+        value: result.available ? '可用' : (imageOnlySkipped ? '未测试：仅图片模型' : '不可用'),
+        tone: result.available ? 'success' : (imageOnlySkipped ? 'warning' : 'error'),
+      },
       { label: '说明', value: result.available ? result.message : '' },
-      { label: '上游报错', value: result.available ? '' : result.message, tone: result.available ? undefined : 'error' },
+      {
+        label: imageOnlySkipped ? '说明' : '上游报错',
+        value: result.available ? '' : result.message,
+        tone: result.available ? undefined : (imageOnlySkipped ? 'warning' : 'error'),
+      },
+      { label: '模型答复', value: result.responseText || '' },
       { label: '耗时', value: Number.isFinite(Number(result.latencyMs)) ? `${result.latencyMs}ms` : '' },
       { label: '检测时间', value: checkedAt },
     ];
     return (
       <span
-        className={`badge ${result.available ? 'badge-success' : 'badge-info'} token-availability-badge`}
+        className={`badge ${result.available ? 'badge-success' : (imageOnlySkipped ? 'badge-warning' : 'badge-info')} token-availability-badge`}
         style={{ fontSize: 11 }}
         tabIndex={0}
         onMouseEnter={(event) => showAvailabilityTooltip(event, rows)}
@@ -1119,6 +1711,49 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       </span>
     );
   }, [hideAvailabilityTooltip, modelSearch, showAvailabilityTooltip, testingAvailabilityTokenIds, tokenAvailabilityById]);
+
+  const renderStatusAction = useCallback((token: any, isPending: boolean, loadingPrefix: string) => {
+    if (isPending) {
+      return <span className="badge badge-warning" style={{ fontSize: 11 }}>待补全</span>;
+    }
+    const loading = !!rowLoading[`${loadingPrefix}-toggle`];
+    return (
+      <button
+        type="button"
+        className={`badge ${resolveTokenStatusBadgeClass(token, isPending)} token-inline-action`}
+        style={{ fontSize: 11 }}
+        disabled={loading}
+        title={token.enabled ? '点击禁用' : '点击启用'}
+        onClick={(event) => {
+          event.stopPropagation();
+          void handleToggleTokenEnabled(token);
+        }}
+      >
+        {loading ? <span className="spinner spinner-sm" /> : resolveTokenStatusLabel(token, isPending)}
+      </button>
+    );
+  }, [handleToggleTokenEnabled, rowLoading]);
+
+  const renderDefaultAction = useCallback((token: any, isPending: boolean, loadingPrefix: string) => {
+    if (isPending) return '-';
+    const loading = !!rowLoading[`${loadingPrefix}-default`];
+    return (
+      <button
+        type="button"
+        className={`badge ${token.isDefault ? 'badge-warning' : 'badge-muted'} token-inline-action`}
+        style={{ fontSize: 11 }}
+        disabled={loading || token.isDefault}
+        title={token.isDefault ? '当前默认' : '点击设为默认'}
+        onClick={(event) => {
+          event.stopPropagation();
+          if (token.isDefault) return;
+          void handleSetDefaultToken(token);
+        }}
+      >
+        {loading ? <span className="spinner spinner-sm" /> : (token.isDefault ? '默认' : '设默认')}
+      </button>
+    );
+  }, [handleSetDefaultToken, rowLoading]);
 
   const handleAddToken = async () => {
     if (!form.accountId) return;
@@ -1200,7 +1835,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     try {
       const res = await api.syncAllAccountTokens();
       if (res?.queued) {
-        toast.info(res.message || '已开始同步令牌，请稍后查看日志');
+        toast.info(res.message || '令牌同步进行中，请稍后查看日志');
         await load();
         return;
       }
@@ -1260,7 +1895,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     try {
       const res = await api.ensureAllAccountGroupTokens();
       if (res?.queued) {
-        toast.info(res.message || '已开始获取分组并补齐令牌，请稍后查看日志');
+        toast.info(res.message || '获取分组并补齐令牌进行中，请稍后查看日志');
         await load();
         return;
       }
@@ -1283,6 +1918,25 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     });
   }, []);
 
+  const accountFilterOptions = useMemo(() => ([
+    { value: '0', label: '全部账号令牌' },
+    ...activeAccountSelectOptions,
+  ]), [activeAccountSelectOptions]);
+
+  const statusFilterOptions = useMemo(() => ([
+    { value: 'all', label: '全部状态' },
+    { value: 'enabled', label: '仅启用' },
+    { value: 'disabled', label: '仅禁用' },
+    { value: 'autoDisabled', label: '自动禁用' },
+    { value: 'pending', label: '待补全' },
+  ]), []);
+
+  const availabilityFilterOptions = useMemo(() => ([
+    { value: 'all', label: '全部可用' },
+    { value: 'available', label: '可用：是' },
+    { value: 'unavailable', label: '可用：否' },
+  ]), []);
+
   const inputStyle: React.CSSProperties = {
     width: '100%',
     padding: '10px 14px',
@@ -1300,16 +1954,16 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         display: 'flex',
         alignItems: compact ? 'stretch' : 'center',
         gap: 8,
-        flexWrap: 'nowrap',
+        flexWrap: compact ? 'nowrap' : 'wrap',
         flexDirection: compact ? 'column' : 'row',
-        width: compact ? '100%' : 'min(100%, 560px)',
+        width: '100%',
       }}
     >
       <input
         value={modelSearch}
         onChange={(event) => setModelSearch(event.target.value)}
         placeholder="输入完整模型名称精准筛选"
-        style={{ ...inputStyle, flex: compact ? undefined : '1 1 auto', minWidth: compact ? undefined : 0 }}
+        style={{ ...inputStyle, flex: compact ? undefined : '1 1 260px', minWidth: compact ? undefined : 220 }}
       />
       <button
         type="button"
@@ -1321,8 +1975,56 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       >
         {testingModelTokens ? <><span className="spinner spinner-sm" /> 测试中...</> : `测试筛选令牌${modelTestTokenIds.length > 0 ? ` (${modelTestTokenIds.length})` : ''}`}
       </button>
+      <div style={{ minWidth: compact ? undefined : 220, flex: compact ? undefined : '0 1 260px', position: 'relative', zIndex: 20 }}>
+        <ModernSelect
+          size="sm"
+          value={String(syncingAccountId || 0)}
+          onChange={handleAccountFilterChange}
+          options={accountFilterOptions}
+          placeholder="选择账号筛选令牌"
+          searchable
+          searchPlaceholder={ACCOUNT_SELECT_SEARCH_PLACEHOLDER}
+        />
+      </div>
+      <div style={{ minWidth: compact ? undefined : 132, flex: compact ? undefined : '0 0 132px', position: 'relative', zIndex: 19 }}>
+        <ModernSelect
+          size="sm"
+          value={tokenStatusFilter}
+          onChange={(nextValue) => {
+            setTokenStatusFilter((nextValue || 'all') as TokenStatusFilter);
+            setSelectedTokenIds([]);
+          }}
+          options={statusFilterOptions}
+          placeholder="筛选状态"
+        />
+      </div>
+      <div style={{ minWidth: compact ? undefined : 132, flex: compact ? undefined : '0 0 132px', position: 'relative', zIndex: 18 }}>
+        <ModernSelect
+          size="sm"
+          value={tokenAvailabilityFilter}
+          onChange={(nextValue) => {
+            setTokenAvailabilityFilter((nextValue || 'all') as TokenAvailabilityFilter);
+            setSelectedTokenIds([]);
+          }}
+          options={availabilityFilterOptions}
+          placeholder="筛选可用"
+        />
+      </div>
     </div>
-  ), [handleTestFilteredModelTokens, inputStyle, modelSearch, modelTestTokenIds.length, testingModelTokens]);
+  ), [
+    accountFilterOptions,
+    availabilityFilterOptions,
+    handleAccountFilterChange,
+    handleTestFilteredModelTokens,
+    inputStyle,
+    modelSearch,
+    modelTestTokenIds.length,
+    statusFilterOptions,
+    syncingAccountId,
+    testingModelTokens,
+    tokenAvailabilityFilter,
+    tokenStatusFilter,
+  ]);
 
   const sectionCardStyle: React.CSSProperties = {
     display: 'flex',
@@ -1376,20 +2078,6 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         </>
       ) : (
         <>
-          <div style={{ minWidth: 220, position: 'relative', zIndex: 20 }}>
-            <ModernSelect
-              size="sm"
-              value={String(syncingAccountId || 0)}
-              onChange={handleAccountFilterChange}
-              options={[
-                { value: '0', label: '全部账号令牌' },
-                ...activeAccountSelectOptions,
-              ]}
-              placeholder="选择账号筛选令牌"
-              searchable
-              searchPlaceholder={ACCOUNT_SELECT_SEARCH_PLACEHOLDER}
-            />
-          </div>
           <button
             onClick={handleSync}
             disabled={syncing || syncingAll || ensuringGroupTokens || !syncingAccountId}
@@ -1423,7 +2111,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         {showAdd ? '取消' : '+ 新增令牌'}
       </button>
     </div>
-  ), [activeAccountSelectOptions, activeAccounts.length, allVisibleTokensSelected, embedded, ensuringGroupTokens, handleAccountFilterChange, handleEnsureGroupTokens, handleSync, handleSyncAll, handleToggleAdd, isMobile, showAdd, syncing, syncingAccountId, syncingAll]);
+  ), [activeAccounts.length, allVisibleTokensSelected, embedded, ensuringGroupTokens, handleEnsureGroupTokens, handleSync, handleSyncAll, handleToggleAdd, isMobile, showAdd, syncing, syncingAccountId, syncingAll]);
 
   useEffect(() => {
     if (!embedded || !onEmbeddedActionsChange) return;
@@ -1450,22 +2138,8 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         mobileContent={(
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>模型筛选</div>
+              <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>模型 / 账号 / 状态筛选</div>
               {renderModelFilterControl(true)}
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>账号筛选 / 同步账号</div>
-              <ModernSelect
-                value={String(syncingAccountId || 0)}
-                onChange={handleAccountFilterChange}
-                options={[
-                  { value: '0', label: '全部账号令牌' },
-                  ...activeAccountSelectOptions,
-                ]}
-                placeholder="选择账号筛选令牌"
-                searchable
-                searchPlaceholder={ACCOUNT_SELECT_SEARCH_PLACEHOLDER}
-              />
             </div>
             <button
               onClick={handleSync}
@@ -1540,7 +2214,10 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
               }}
             >
               <span>{modelDialogToken.name || `token-${modelDialogToken.id}`} @ {modelDialogToken.site?.name || '-'}</span>
-              <span>{`${modelDialogModels.length} 个模型`}</span>
+              <span>
+                {`${modelDialogModels.length} 个模型`}
+                {modelDialogToken.modelSyncedAt ? ` · 拉取时间 ${formatDateTimeLocal(modelDialogToken.modelSyncedAt)}` : ' · 未拉取'}
+              </span>
             </div>
             <input
               value={modelDialogSearch}
@@ -1574,28 +2251,274 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
             >
               {(() => {
                 const keyword = modelDialogSearch.trim().toLowerCase();
-                const visibleModels = modelDialogModels.filter((modelName) => (
-                  !keyword || modelName.toLowerCase().includes(keyword)
+                const visibleModels = modelDialogModels.filter((model) => (
+                  !keyword || model.name.toLowerCase().includes(keyword)
                 ));
+                if (modelDialogLoading) {
+                  return <div style={{ padding: 20, color: 'var(--color-text-muted)' }}><span className="spinner spinner-sm" /> 读取模型中...</div>;
+                }
                 if (visibleModels.length === 0) {
                   return <div style={{ padding: 20, color: 'var(--color-text-muted)' }}>暂无模型</div>;
                 }
                 return (
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                    {visibleModels.map((modelName) => (
-                      <span
-                        key={modelName}
-                        className="badge badge-muted"
+                    {visibleModels.map((model) => {
+                      const loadingKey = model.name.toLowerCase();
+                      const loading = !!modelDialogModelLoading[loadingKey];
+                      return (
+                      <button
+                        key={model.name}
+                        type="button"
+                        className={`badge ${model.routeEnabled ? 'badge-success' : 'badge-muted'} token-model-route-toggle`}
                         style={{ fontSize: 12, maxWidth: '100%', wordBreak: 'break-all' }}
+                        disabled={loading}
+                        title={model.routeEnabled ? '点击取消路由点亮' : '点击点亮后可用于路由'}
+                        onClick={() => void toggleModelRouteEnabled(model)}
                       >
-                        {modelName}
-                      </span>
-                    ))}
+                        {loading ? <span className="spinner spinner-sm" /> : null}
+                        <span>{model.name}</span>
+                      </button>
+                      );
+                    })}
                   </div>
                 );
               })()}
             </div>
           </>
+        ) : null}
+      </CenteredModal>
+
+      <CenteredModal
+        open={Boolean(healthCheckToken)}
+        onClose={closeHealthCheckPanel}
+        title="令牌测活"
+        maxWidth={760}
+        closeOnBackdrop
+        bodyStyle={{ display: 'flex', flexDirection: 'column', gap: 12 }}
+        footer={(
+          <>
+            <button onClick={closeHealthCheckPanel} disabled={healthCheckSaving || healthCheckRunning} className="btn btn-ghost">关闭</button>
+            <button onClick={() => void saveHealthCheckPanel()} disabled={healthCheckSaving || healthCheckRunning} className="btn btn-ghost" style={{ border: '1px solid var(--color-border)' }}>
+              {healthCheckSaving ? <><span className="spinner spinner-sm" /> 保存中...</> : '保存配置'}
+            </button>
+            <button onClick={() => void runHealthCheckNow()} disabled={healthCheckSaving || healthCheckRunning || parseHealthCheckModelList(healthCheckForm.model).length === 0} className="btn btn-primary">
+              {healthCheckRunning ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 测活中...</> : '立即测活'}
+            </button>
+          </>
+        )}
+      >
+        {healthCheckToken ? (
+          (() => {
+            const selectedModels = parseHealthCheckModelList(healthCheckForm.model);
+            const selectedModelKeys = new Set(selectedModels.map((modelName) => modelName.toLowerCase()));
+            const modelOptions = getHealthCheckModelOptions(healthCheckToken);
+            const updateSelectedModels = (models: string[]) => {
+              setHealthCheckForm((current) => ({
+                ...current,
+                model: formatHealthCheckModelList(models),
+              }));
+            };
+            const addModel = (modelName: string) => {
+              const normalized = modelName.trim();
+              if (!normalized) return;
+              if (selectedModelKeys.has(normalized.toLowerCase())) return;
+              updateSelectedModels([...selectedModels, normalized]);
+            };
+            const removeModel = (modelName: string) => {
+              updateSelectedModels(selectedModels.filter((item) => item.toLowerCase() !== modelName.toLowerCase()));
+            };
+            const lastLatency = Number(healthCheckToken.healthCheckLastLatencyMs);
+            const hasLastLatency = Number.isFinite(lastLatency) && lastLatency >= 0;
+            return (
+              <>
+                <div
+                  style={{
+                    border: '1px solid var(--color-border-light)',
+                    borderRadius: 'var(--radius-md)',
+                    background: 'linear-gradient(180deg, color-mix(in srgb, var(--color-primary) 7%, var(--color-bg-card)), var(--color-bg-card))',
+                    padding: 14,
+                    display: 'grid',
+                    gap: 8,
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontWeight: 700, color: 'var(--color-text-primary)', wordBreak: 'break-word' }}>
+                        {healthCheckToken.name || `token-${healthCheckToken.id}`}
+                      </div>
+                      <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginTop: 3 }}>
+                        {healthCheckToken.site?.name || '-'} · {healthCheckToken.account?.username || `account-${healthCheckToken.accountId}`}
+                      </div>
+                    </div>
+                    <span className={`badge ${healthCheckForm.enabled ? 'badge-success' : 'badge-muted'}`} style={{ fontSize: 12 }}>
+                      {healthCheckForm.enabled ? '定时开启' : '定时关闭'}
+                    </span>
+                  </div>
+                </div>
+
+                <label style={{ ...toggleCardStyle, alignItems: 'center', borderRadius: 'var(--radius-md)' }}>
+                  <input
+                    type="checkbox"
+                    checked={healthCheckForm.enabled}
+                    onChange={(event) => setHealthCheckForm((current) => ({ ...current, enabled: event.target.checked }))}
+                  />
+                  <span>
+                    <span style={{ display: 'block', fontWeight: 700, color: 'var(--color-text-primary)' }}>开启定时测活</span>
+                    <span style={{ display: 'block', fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.5 }}>成功后点亮对应模型并自动重建路由；测活模型支持多选。</span>
+                  </span>
+                </label>
+
+                <div style={{ ...sectionCardStyle, gap: 12 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+                    <div>
+                      <div style={sectionLabelStyle}>测活模型</div>
+                      <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>已选 {selectedModels.length} 个，仅展示非图片模型。</div>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>间隔</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={10080}
+                        value={healthCheckForm.intervalMinutes}
+                        onChange={(event) => setHealthCheckForm((current) => ({ ...current, intervalMinutes: event.target.value }))}
+                        style={{ ...inputStyle, width: 110, textAlign: 'center' }}
+                      />
+                      <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>分钟</span>
+                    </div>
+                  </div>
+
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, minHeight: 30 }}>
+                    {selectedModels.length > 0 ? selectedModels.map((modelName) => (
+                      <button
+                        key={modelName}
+                        type="button"
+                        className="badge badge-info"
+                        style={{ fontSize: 12, border: '1px solid color-mix(in srgb, var(--color-primary) 24%, transparent)' }}
+                        onClick={() => removeModel(modelName)}
+                        title="点击移除"
+                      >
+                        {modelName} ×
+                      </button>
+                    )) : (
+                      <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>请选择或添加至少一个模型</span>
+                    )}
+                  </div>
+
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <input
+                      value={healthCheckCustomModel}
+                      onChange={(event) => setHealthCheckCustomModel(event.target.value)}
+                      placeholder="添加自定义模型"
+                      style={inputStyle}
+                      onKeyDown={(event) => {
+                        if (event.key !== 'Enter') return;
+                        event.preventDefault();
+                        addModel(healthCheckCustomModel);
+                        setHealthCheckCustomModel('');
+                      }}
+                    />
+                    <button
+                      type="button"
+                      className="btn btn-ghost"
+                      style={{ border: '1px solid var(--color-border)', whiteSpace: 'nowrap' }}
+                      onClick={() => {
+                        addModel(healthCheckCustomModel);
+                        setHealthCheckCustomModel('');
+                      }}
+                    >
+                      添加
+                    </button>
+                  </div>
+
+                  <div
+                    style={{
+                      maxHeight: 190,
+                      overflow: 'auto',
+                      border: '1px solid var(--color-border-light)',
+                      borderRadius: 'var(--radius-sm)',
+                      padding: 10,
+                      background: 'var(--color-bg)',
+                    }}
+                  >
+                    {modelOptions.length > 0 ? (
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: 8 }}>
+                        {modelOptions.map((modelName) => (
+                          <label
+                            key={modelName}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 8,
+                              minWidth: 0,
+                              fontSize: 13,
+                              padding: '7px 8px',
+                              border: '1px solid var(--color-border-light)',
+                              borderRadius: 'var(--radius-sm)',
+                              background: selectedModelKeys.has(modelName.toLowerCase()) ? 'color-mix(in srgb, var(--color-primary) 8%, var(--color-bg-card))' : 'var(--color-bg-card)',
+                              cursor: 'pointer',
+                            }}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={selectedModelKeys.has(modelName.toLowerCase())}
+                              onChange={(event) => {
+                                if (event.target.checked) {
+                                  addModel(modelName);
+                                } else {
+                                  removeModel(modelName);
+                                }
+                              }}
+                            />
+                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{modelName}</span>
+                          </label>
+                        ))}
+                      </div>
+                    ) : (
+                      <div style={{ padding: 8, color: 'var(--color-text-muted)', fontSize: 13 }}>暂无可选模型，可手动添加。</div>
+                    )}
+                  </div>
+                </div>
+
+                <div style={{ ...sectionCardStyle, gap: 12 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+                    <div style={sectionLabelStyle}>最近测活</div>
+                    <span className={`badge ${healthCheckToken.healthCheckLastAvailable === true ? 'badge-success' : (healthCheckToken.healthCheckLastAvailable === false ? 'badge-info' : 'badge-muted')}`} style={{ fontSize: 12 }}>
+                      {healthCheckToken.healthCheckLastAvailable === true ? '成功' : (healthCheckToken.healthCheckLastAvailable === false ? '失败' : '未测')}
+                    </span>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10, fontSize: 13 }}>
+                    <div>
+                      <div style={{ color: 'var(--color-text-muted)', fontSize: 12 }}>上次时间</div>
+                      <div>{healthCheckToken.healthCheckLastRunAt ? formatDateTimeLocal(healthCheckToken.healthCheckLastRunAt) : '-'}</div>
+                    </div>
+                    <div>
+                      <div style={{ color: 'var(--color-text-muted)', fontSize: 12 }}>下次时间</div>
+                      <div>{healthCheckToken.healthCheckNextRunAt ? formatDateTimeLocal(healthCheckToken.healthCheckNextRunAt) : '-'}</div>
+                    </div>
+                    <div>
+                      <div style={{ color: 'var(--color-text-muted)', fontSize: 12 }}>耗时</div>
+                      <div>{hasLastLatency ? `${lastLatency}ms` : '-'}</div>
+                    </div>
+                  </div>
+                  {healthCheckToken.healthCheckLastMessage ? (
+                    <div
+                      style={{
+                        fontSize: 12,
+                        color: 'var(--color-text-secondary)',
+                        lineHeight: 1.6,
+                        wordBreak: 'break-word',
+                        borderTop: '1px solid var(--color-border-light)',
+                        paddingTop: 10,
+                      }}
+                    >
+                      {healthCheckToken.healthCheckLastMessage}
+                    </div>
+                  ) : null}
+                </div>
+              </>
+            );
+          })()
         ) : null}
       </CenteredModal>
 
@@ -1956,6 +2879,17 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                             模型
                           </button>
                         ) : null}
+                        {!isPending ? (
+                          <button
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              openHealthCheckPanel(token);
+                            }}
+                            className="btn btn-link btn-link-info"
+                          >
+                            测活
+                          </button>
+                        ) : null}
                         <button
                           onClick={(event) => {
                             event.stopPropagation();
@@ -1973,11 +2907,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                     <MobileField label="倍率" value={formatGroupRatio(token.groupRatio) || '-'} />
                     <MobileField
                       label="状态"
-                      value={(
-                        <span className={`badge ${isPending ? 'badge-warning' : (token.enabled ? 'badge-success' : 'badge-muted')}`} style={{ fontSize: 11 }}>
-                          {isPending ? '待补全' : (token.enabled ? '启用' : '禁用')}
-                        </span>
-                      )}
+                      value={renderStatusAction(token, isPending, loadingPrefix)}
                     />
                     <MobileField label="可用" value={renderAvailabilityBadge(token)} />
                     {isExpanded ? (
@@ -2008,41 +2938,10 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                         />
                         <MobileField
                           label="默认"
-                          value={token.isDefault ? <span className="badge badge-warning" style={{ fontSize: 11 }}>默认</span> : '-'}
+                          value={renderDefaultAction(token, isPending, loadingPrefix)}
                         />
                         <MobileField label="更新时间" value={formatDateTimeLocal(token.updatedAt)} />
                         <div className="mobile-card-actions">
-                          {!isPending && !token.isDefault && (
-                            <button
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                void handleSetDefaultToken(token);
-                              }}
-                              disabled={!!rowLoading[`${loadingPrefix}-default`]}
-                              className="btn btn-link btn-link-info"
-                            >
-                              {rowLoading[`${loadingPrefix}-default`] ? <span className="spinner spinner-sm" /> : '设默认'}
-                            </button>
-                          )}
-                          {!isPending ? (
-                            <button
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                void withRowLoading(`${loadingPrefix}-toggle`, async () => {
-                                  await api.updateAccountToken(token.id, { enabled: !token.enabled });
-                                  toast.success(token.enabled ? '令牌已禁用' : '令牌已启用');
-                                  patchTokenRow(token.id, {
-                                    enabled: !token.enabled,
-                                    updatedAt: new Date().toISOString(),
-                                  });
-                                });
-                              }}
-                              disabled={!!rowLoading[`${loadingPrefix}-toggle`]}
-                              className={`btn btn-link ${token.enabled ? 'btn-link-warning' : 'btn-link-primary'}`}
-                            >
-                              {rowLoading[`${loadingPrefix}-toggle`] ? <span className="spinner spinner-sm" /> : (token.enabled ? '禁用' : '启用')}
-                            </button>
-                          ) : null}
                           <button
                             onClick={(event) => {
                               event.stopPropagation();
@@ -2140,31 +3039,13 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                       </span>
                     </td>
                     <td>
-                      {isPending ? (
-                        <span className="badge badge-warning" style={{ fontSize: 11 }}>待补全</span>
-                      ) : (
-                        <span className={`badge ${token.enabled ? 'badge-success' : 'badge-muted'}`} style={{ fontSize: 11 }}>
-                          {token.enabled ? '启用' : '禁用'}
-                        </span>
-                      )}
+                      {renderStatusAction(token, isPending, loadingPrefix)}
                     </td>
                     <td>{renderAvailabilityBadge(token)}</td>
-                    <td>{token.isDefault ? <span className="badge badge-warning" style={{ fontSize: 11 }}>默认</span> : '-'}</td>
+                    <td>{renderDefaultAction(token, isPending, loadingPrefix)}</td>
                     <td style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>{formatDateTimeLocal(token.updatedAt)}</td>
                     <td className="token-actions-cell">
                       <div className="token-table-actions">
-                        {!isPending && !token.isDefault && (
-                          <button
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              void handleSetDefaultToken(token);
-                            }}
-                            disabled={!!rowLoading[`${loadingPrefix}-default`]}
-                            className="btn btn-link btn-link-info token-table-action-btn"
-                          >
-                            {rowLoading[`${loadingPrefix}-default`] ? <span className="spinner spinner-sm" /> : '设默认'}
-                          </button>
-                        )}
                         {!isPending ? (
                           <button
                             onClick={(event) => {
@@ -2189,6 +3070,17 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                             模型
                           </button>
                         ) : null}
+                        {!isPending ? (
+                          <button
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              openHealthCheckPanel(token);
+                            }}
+                            className="btn btn-link btn-link-info token-table-action-btn"
+                          >
+                            测活
+                          </button>
+                        ) : null}
                         <button
                           onClick={(event) => {
                             event.stopPropagation();
@@ -2198,25 +3090,6 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                         >
                           {isPending ? '编辑补全' : '编辑'}
                         </button>
-                        {!isPending ? (
-                          <button
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              void withRowLoading(`${loadingPrefix}-toggle`, async () => {
-                                await api.updateAccountToken(token.id, { enabled: !token.enabled });
-                                toast.success(token.enabled ? '令牌已禁用' : '令牌已启用');
-                                patchTokenRow(token.id, {
-                                  enabled: !token.enabled,
-                                  updatedAt: new Date().toISOString(),
-                                });
-                              });
-                            }}
-                            disabled={!!rowLoading[`${loadingPrefix}-toggle`]}
-                            className={`btn btn-link ${token.enabled ? 'btn-link-warning' : 'btn-link-primary'} token-table-action-btn`}
-                          >
-                            {rowLoading[`${loadingPrefix}-toggle`] ? <span className="spinner spinner-sm" /> : (token.enabled ? '禁用' : '启用')}
-                          </button>
-                        ) : null}
                         <button
                           onClick={(event) => {
                             event.stopPropagation();

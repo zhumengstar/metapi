@@ -1,5 +1,5 @@
 ﻿import { FastifyInstance } from 'fastify';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { db, schema } from '../../db/index.js';
 import { insertAndGetById } from '../../db/insertHelpers.js';
 import {
@@ -14,12 +14,14 @@ import {
   repairDefaultToken,
   resolveAccountTokenValueStatus,
   setDefaultToken,
+  upsertAccountTokenGroupEnabledPreference,
 } from '../../services/accountTokenService.js';
 import { getAdapter } from '../../services/platforms/index.js';
 import { getCredentialModeFromExtraConfig, getProxyUrlFromExtraConfig, resolvePlatformUserId } from '../../services/accountExtraConfig.js';
 import { appendBackgroundTaskLog, startBackgroundTask } from '../../services/backgroundTaskService.js';
 import { withAccountProxyOverride } from '../../services/siteProxy.js';
-import { type ModelRefreshResult } from '../../services/modelService.js';
+import { rebuildTokenRoutesFromAvailability, type ModelRefreshResult } from '../../services/modelService.js';
+import { deleteRouteChannelsByTokenIdsPreservingStats } from '../../services/routeChannelStatsService.js';
 import {
   type CoverageBatchRebuildResult,
   convergeAccountMutation,
@@ -37,7 +39,15 @@ import {
   syncTokenGroupPricingCache,
 } from '../../services/tokenGroupPricingOverviewService.js';
 import { getAccountTokenModels } from '../../services/accountTokenModelService.js';
-import { testAccountTokenModelAvailability } from '../../services/accountTokenAvailabilityTestService.js';
+import {
+  persistSkippedAccountTokenModelAvailability,
+  testAccountTokenModelAvailability,
+} from '../../services/accountTokenAvailabilityTestService.js';
+import {
+  runAccountTokenHealthCheck,
+  updateAccountTokenHealthCheckConfig,
+} from '../../services/accountTokenHealthCheckService.js';
+import { invalidateTokenRouterCache } from '../../services/tokenRouter.js';
 
 type AccountWithSiteRow = {
   accounts: typeof schema.accounts.$inferSelect;
@@ -59,6 +69,7 @@ type SyncExecutionResult = {
   updated: number;
   maskedPending?: number;
   pendingTokenIds?: number[];
+  deleted?: number;
   total: number;
   defaultTokenId?: number | null;
 };
@@ -300,6 +311,38 @@ function normalizeTokenValueKey(value: unknown): string {
   return String(value || '').trim();
 }
 
+async function removeRouteChannelsForAccountTokens(tokenIds: number[]): Promise<number> {
+  const removed = await deleteRouteChannelsByTokenIdsPreservingStats(tokenIds);
+  invalidateTokenRouterCache();
+  return removed;
+}
+
+async function saveAccountTokenEnabledPreference(token: typeof schema.accountTokens.$inferSelect): Promise<void> {
+  await upsertAccountTokenGroupEnabledPreference({
+    accountId: token.accountId,
+    tokenGroup: token.tokenGroup,
+    tokenName: token.name,
+    enabled: token.enabled === true,
+  });
+}
+
+async function rebuildAccountTokenRoutesNow(): Promise<Awaited<ReturnType<typeof rebuildTokenRoutesFromAvailability>>> {
+  const routeRebuild = await rebuildTokenRoutesFromAvailability();
+  invalidateTokenRouterCache();
+  return routeRebuild;
+}
+
+async function removeRouteChannelsForDisabledAccountTokens(accountId: number): Promise<number> {
+  const disabledTokens = await db.select({ id: schema.accountTokens.id })
+    .from(schema.accountTokens)
+    .where(and(
+      eq(schema.accountTokens.accountId, accountId),
+      eq(schema.accountTokens.enabled, false),
+    ))
+    .all();
+  return removeRouteChannelsForAccountTokens(disabledTokens.map((token) => token.id));
+}
+
 function normalizeGeneratedTokenName(group: string, index: number): string {
   const collapsed = group.replace(/\s+/g, '');
   const sanitized = collapsed.replace(/[^\p{L}\p{N}_-]+/gu, '-').replace(/^-+|-+$/g, '');
@@ -325,6 +368,7 @@ function buildCapturedTokenSyncResult(
     updated: tokenSync?.updated || 0,
     maskedPending: tokenSync?.maskedPending || 0,
     pendingTokenIds: tokenSync?.pendingTokenIds || [],
+    deleted: 0,
     total: tokenSync?.total || 0,
     defaultTokenId: tokenSync?.defaultTokenId || null,
   };
@@ -384,40 +428,6 @@ async function executeAccountTokenSync(row: AccountWithSiteRow): Promise<SyncExe
   }
 
   if (!row.accounts.accessToken) {
-    if (row.accounts.apiToken) {
-      try {
-        const convergence = await convergeAccountMutation({
-          accountId,
-          preferredApiToken: row.accounts.apiToken,
-          defaultTokenSource: 'legacy',
-        });
-        if (convergence.defaultTokenId != null) {
-          return {
-            ...base,
-            status: 'synced',
-            reason: 'legacy_default_token_restored',
-            message: 'restored local default token from legacy api token',
-            synced: true,
-            created: 0,
-            updated: 0,
-            total: 0,
-            defaultTokenId: convergence.defaultTokenId,
-          };
-        }
-      } catch (error: any) {
-        return {
-          ...base,
-          status: 'failed',
-          reason: 'sync_error',
-          message: error?.message || 'sync failed',
-          synced: false,
-          created: 0,
-          updated: 0,
-          total: 0,
-          defaultTokenId: null,
-        };
-      }
-    }
     return {
       ...base,
       status: 'skipped',
@@ -448,7 +458,7 @@ async function executeAccountTokenSync(row: AccountWithSiteRow): Promise<SyncExe
   try {
     const platformUserId = resolvePlatformUserId(row.accounts.extraConfig, row.accounts.username);
     const accountProxyUrl = getProxyUrlFromExtraConfig(row.accounts.extraConfig);
-    let tokens = await withTimeout(
+    const tokens = await withTimeout(
       () => withAccountProxyOverride(accountProxyUrl,
         () => adapter.getApiTokens(row.sites.url, row.accounts.accessToken, platformUserId)),
       TOKEN_SYNC_TIMEOUT_MS,
@@ -456,26 +466,18 @@ async function executeAccountTokenSync(row: AccountWithSiteRow): Promise<SyncExe
     );
 
     if (tokens.length === 0) {
-      const fallback = await withTimeout(
-        () => withAccountProxyOverride(accountProxyUrl,
-          () => adapter.getApiToken(row.sites.url, row.accounts.accessToken, platformUserId)),
-        TOKEN_SYNC_TIMEOUT_MS,
-        `token sync timeout (${Math.round(TOKEN_SYNC_TIMEOUT_MS / 1000)}s)`,
-      );
-      if (fallback) {
-        tokens = [{ name: 'default', key: fallback, enabled: true, tokenGroup: 'default' }];
-      }
-    }
-
-    if (tokens.length === 0) {
+      const deleted = await deleteAllLocalAccountTokens(accountId);
       return {
         ...base,
-        status: 'skipped',
+        status: deleted > 0 ? 'synced' : 'skipped',
         reason: 'no_upstream_tokens',
-        message: 'upstream returned no api tokens',
-        synced: false,
+        message: deleted > 0
+          ? 'upstream returned no api tokens; local account tokens were cleared'
+          : 'upstream returned no api tokens',
+        synced: deleted > 0,
         created: 0,
         updated: 0,
+        deleted,
         total: 0,
         defaultTokenId: null,
       };
@@ -486,6 +488,8 @@ async function executeAccountTokenSync(row: AccountWithSiteRow): Promise<SyncExe
       upstreamTokens: tokens,
     });
     const synced = convergence.tokenSync!;
+    const deleted = await deleteMissingUpstreamTokens(accountId, tokens);
+    await removeRouteChannelsForDisabledAccountTokens(accountId);
     if ((synced.maskedPending || 0) > 0) {
       return {
         ...base,
@@ -494,6 +498,7 @@ async function executeAccountTokenSync(row: AccountWithSiteRow): Promise<SyncExe
         message: `上游返回 ${synced.maskedPending} 条脱敏令牌，已保存为待补全记录，请手动补全明文 token。`,
         synced: true,
         ...synced,
+        deleted,
       };
     }
     return {
@@ -501,6 +506,7 @@ async function executeAccountTokenSync(row: AccountWithSiteRow): Promise<SyncExe
       status: 'synced',
       synced: true,
       ...synced,
+      deleted,
     };
   } catch (error: any) {
     return {
@@ -525,7 +531,7 @@ async function appendTokenSyncEvent(result: SyncExecutionResult) {
     ? 'info'
     : (result.status === 'skipped' ? 'warning' : 'error');
   const detail = result.status === 'synced'
-    ? `新增 ${result.created}，更新 ${result.updated}，待补全 ${result.maskedPending || 0}，总数 ${result.total}`
+    ? `新增 ${result.created}，更新 ${result.updated}，删除本地多余 ${result.deleted || 0}，待补全 ${result.maskedPending || 0}，总数 ${result.total}`
     : (result.message || result.reason || 'sync skipped');
 
   try {
@@ -546,6 +552,13 @@ async function executeSyncAllAccountTokens() {
     .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
     .where(eq(schema.accounts.status, 'active'))
     .all();
+
+  let pricingRefresh: Awaited<ReturnType<typeof buildTokenGroupPricingOverview>> | null = null;
+  try {
+    pricingRefresh = await buildTokenGroupPricingOverview({ refresh: true });
+  } catch (error: any) {
+    console.warn(`[account-tokens] group pricing refresh failed before sync-all: ${error?.message || error}`);
+  }
 
   const results: SyncExecutionResult[] = [];
   for (let offset = 0; offset < rows.length; offset += SYNC_ALL_BATCH_SIZE) {
@@ -573,9 +586,12 @@ async function executeSyncAllAccountTokens() {
     failed: results.filter((item) => item.status === 'failed').length,
     created: results.reduce((acc, item) => acc + item.created, 0),
     updated: results.reduce((acc, item) => acc + item.updated, 0),
+    deleted: results.reduce((acc, item) => acc + (item.deleted || 0), 0),
+    pricingAvailableCount: pricingRefresh?.summary?.pricingAvailableCount || 0,
+    pricingRefreshFailed: pricingRefresh === null,
   };
 
-  return { summary, results, coverageRefresh };
+  return { summary, results, coverageRefresh, pricingRefresh };
 }
 
 async function fetchUpstreamApiTokens(row: AccountWithSiteRow, timeoutMs = TOKEN_SYNC_TIMEOUT_MS) {
@@ -583,57 +599,67 @@ async function fetchUpstreamApiTokens(row: AccountWithSiteRow, timeoutMs = TOKEN
   if (!adapter) throw new Error(`不支持的平台: ${row.sites.platform}`);
   const platformUserId = resolvePlatformUserId(row.accounts.extraConfig, row.accounts.username);
   const accountProxyUrl = getProxyUrlFromExtraConfig(row.accounts.extraConfig);
-  let tokens = await withTimeout(
+  const tokens = await withTimeout(
     () => withAccountProxyOverride(accountProxyUrl,
       () => adapter.getApiTokens(row.sites.url, row.accounts.accessToken, platformUserId)),
     timeoutMs,
     `token sync timeout (${Math.round(timeoutMs / 1000)}s)`,
   );
-
-  if (tokens.length === 0) {
-    const fallback = await withTimeout(
-      () => withAccountProxyOverride(accountProxyUrl,
-        () => adapter.getApiToken(row.sites.url, row.accounts.accessToken, platformUserId)),
-      timeoutMs,
-      `token sync timeout (${Math.round(timeoutMs / 1000)}s)`,
-    );
-    if (fallback) {
-      tokens = [{ name: 'default', key: fallback, enabled: true, tokenGroup: 'default' }];
-    }
-  }
   return tokens;
 }
 
-async function disableMissingUpstreamTokens(accountId: number, upstreamTokens: Array<{ key?: string | null; name?: string | null; tokenGroup?: string | null }>) {
+async function deleteAllLocalAccountTokens(accountId: number) {
+  const localTokens = await db.select()
+    .from(schema.accountTokens)
+    .where(eq(schema.accountTokens.accountId, accountId))
+    .all();
+  if (localTokens.length === 0) return 0;
+
+  await removeRouteChannelsForAccountTokens(localTokens.map((token) => token.id));
+  for (const token of localTokens) {
+    await db.delete(schema.accountTokens)
+      .where(eq(schema.accountTokens.id, token.id))
+      .run();
+  }
+  await repairDefaultToken(accountId);
+  return localTokens.length;
+}
+
+async function deleteMissingUpstreamTokens(accountId: number, upstreamTokens: Array<{ key?: string | null; name?: string | null; tokenGroup?: string | null }>) {
   const upstreamTokenValues = new Set(upstreamTokens.map((token) => normalizeTokenValueKey(token.key)).filter(Boolean));
-  if (upstreamTokenValues.size === 0) return 0;
   const upstreamNameGroupKeys = new Set(upstreamTokens.map((token) => {
     const name = String(token.name || '').trim();
     const group = normalizeTokenGroupKey(token.tokenGroup || token.name);
     return name || group ? `${name}::${group}` : '';
   }).filter(Boolean));
+  if (upstreamTokenValues.size === 0 && upstreamNameGroupKeys.size === 0) return 0;
 
   const localTokens = await db.select()
     .from(schema.accountTokens)
     .where(eq(schema.accountTokens.accountId, accountId))
     .all();
-  const now = new Date().toISOString();
-  let disabled = 0;
+  const tokensToDelete: typeof schema.accountTokens.$inferSelect[] = [];
   for (const token of localTokens) {
-    if (!isUsableAccountToken(token)) continue;
     if (upstreamTokenValues.has(normalizeTokenValueKey(token.token))) continue;
     const localNameGroupKey = `${String(token.name || '').trim()}::${normalizeTokenGroupKey(token.tokenGroup || token.name)}`;
     if (upstreamNameGroupKeys.has(localNameGroupKey)) continue;
-    await db.update(schema.accountTokens)
-      .set({ enabled: false, isDefault: false, updatedAt: now })
+    tokensToDelete.push(token);
+  }
+
+  if (tokensToDelete.length === 0) return 0;
+
+  const deletedTokenIds = tokensToDelete.map((token) => token.id);
+  const defaultDeleted = tokensToDelete.some((token) => token.isDefault === true);
+  await removeRouteChannelsForAccountTokens(deletedTokenIds);
+  for (const token of tokensToDelete) {
+    await db.delete(schema.accountTokens)
       .where(eq(schema.accountTokens.id, token.id))
       .run();
-    disabled++;
   }
-  if (disabled > 0) {
+  if (defaultDeleted) {
     await repairDefaultToken(accountId);
   }
-  return disabled;
+  return tokensToDelete.length;
 }
 
 async function executeEnsureGroupTokensForAccount(row: AccountWithSiteRow): Promise<EnsureGroupTokensExecutionResult> {
@@ -680,7 +706,8 @@ async function executeEnsureGroupTokensForAccount(row: AccountWithSiteRow): Prom
     const syncedBeforeCreate = upstreamTokens.length > 0
       ? (await convergeAccountMutation({ accountId, upstreamTokens })).tokenSync
       : null;
-    const disabled = upstreamTokens.length > 0 ? await disableMissingUpstreamTokens(accountId, upstreamTokens) : 0;
+    let deleted = upstreamTokens.length > 0 ? await deleteMissingUpstreamTokens(accountId, upstreamTokens) : 0;
+    await removeRouteChannelsForDisabledAccountTokens(accountId);
     const existingGroups = new Set(upstreamTokens.map((token) => normalizeTokenGroupKey(token.tokenGroup || token.name)).filter(Boolean));
     const missingGroups = normalizedGroups.filter((group) => !existingGroups.has(group));
     let created = 0;
@@ -720,6 +747,8 @@ async function executeEnsureGroupTokensForAccount(row: AccountWithSiteRow): Prom
         createdViaUpstream = true;
         upstreamTokens = refreshedTokens;
         await convergeAccountMutation({ accountId, upstreamTokens: refreshedTokens });
+        deleted += await deleteMissingUpstreamTokens(accountId, refreshedTokens);
+        await removeRouteChannelsForDisabledAccountTokens(accountId);
       }
       if (!createdViaUpstream) continue;
       created++;
@@ -729,6 +758,7 @@ async function executeEnsureGroupTokensForAccount(row: AccountWithSiteRow): Prom
           accountId,
           upstreamTokens: [{ ...capturedToken, name, tokenGroup: group }],
         });
+        await removeRouteChannelsForDisabledAccountTokens(accountId);
       } else {
         createdWithoutClearToken++;
       }
@@ -738,6 +768,8 @@ async function executeEnsureGroupTokensForAccount(row: AccountWithSiteRow): Prom
       upstreamTokens = await fetchUpstreamApiTokens(row, GROUP_TOKEN_ENSURE_TIMEOUT_MS);
       if (upstreamTokens.length > 0) {
         await convergeAccountMutation({ accountId, upstreamTokens });
+        deleted += await deleteMissingUpstreamTokens(accountId, upstreamTokens);
+        await removeRouteChannelsForDisabledAccountTokens(accountId);
       }
     }
 
@@ -747,7 +779,7 @@ async function executeEnsureGroupTokensForAccount(row: AccountWithSiteRow): Prom
       groupCount: normalizedGroups.length,
       missingGroupCount: missingGroups.length,
       created,
-      disabled,
+      disabled: deleted,
       syncedCreated: syncedBeforeCreate?.created || 0,
       syncedUpdated: syncedBeforeCreate?.updated || 0,
     };
@@ -1220,6 +1252,8 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     }
     appendDeleteLog(options.taskId, `${tokenLabel} 原站点删除成功`);
 
+    await saveAccountTokenEnabledPreference(existing);
+    await removeRouteChannelsForAccountTokens([tokenId]);
     await db.delete(schema.accountTokens).where(eq(schema.accountTokens.id, tokenId)).run();
     if (existing.isDefault) {
       await repairDefaultToken(existing.accountId);
@@ -1326,12 +1360,14 @@ export async function accountTokensRoutes(app: FastifyInstance) {
         failedItems: [],
         message: reused
           ? '账号令牌删除任务执行中，请稍后查看程序日志'
-          : '已开始账号令牌删除，请稍后查看程序日志',
+          : '账号令牌删除进行中，请稍后查看程序日志',
       });
     }
 
     const successIds: number[] = [];
     const failedItems: Array<{ id: number; message: string }> = [];
+    let removedRouteChannels = 0;
+    let routeRebuild: Awaited<ReturnType<typeof rebuildTokenRoutesFromAvailability>> | null = null;
 
     for (const id of ids) {
       try {
@@ -1358,12 +1394,24 @@ export async function accountTokensRoutes(app: FastifyInstance) {
         await db.update(schema.accountTokens)
           .set({
             enabled: action === 'enable',
+            autoDisabledAt: null,
+            autoDisabledReason: null,
+            autoDisabledPreviousEnabled: null,
             updatedAt: new Date().toISOString(),
           })
           .where(eq(schema.accountTokens.id, id))
           .run();
-        if (existing.isDefault && action === 'disable') {
-          repairDefaultToken(existing.accountId);
+        await upsertAccountTokenGroupEnabledPreference({
+          accountId: existing.accountId,
+          tokenGroup: existing.tokenGroup,
+          tokenName: existing.name,
+          enabled: action === 'enable',
+        });
+        if (action === 'disable') {
+          removedRouteChannels += await removeRouteChannelsForAccountTokens([id]);
+          if (existing.isDefault) {
+            await repairDefaultToken(existing.accountId);
+          }
         }
 
         successIds.push(id);
@@ -1372,10 +1420,17 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       }
     }
 
+    if (successIds.length > 0 && action === 'enable') {
+      routeRebuild = await rebuildAccountTokenRoutesNow();
+    }
+
     return {
       success: true,
+      localOnly: true,
       successIds,
       failedItems,
+      removedRouteChannels,
+      routeRebuild,
     };
   });
 
@@ -1431,7 +1486,12 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       updates.enabled = false;
       updates.isDefault = false;
     } else {
-      if (body.enabled !== undefined) updates.enabled = body.enabled;
+      if (body.enabled !== undefined) {
+        updates.enabled = body.enabled;
+        updates.autoDisabledAt = null;
+        updates.autoDisabledReason = null;
+        updates.autoDisabledPreviousEnabled = null;
+      }
       if (body.isDefault !== undefined) updates.isDefault = body.isDefault;
     }
     if (body.source !== undefined) updates.source = body.source;
@@ -1441,6 +1501,17 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     let latest = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, tokenId)).get();
     if (!latest) {
       return reply.code(500).send({ success: false, message: '更新失败' });
+    }
+
+    let removedRouteChannels = 0;
+    let routeRebuild: Awaited<ReturnType<typeof rebuildTokenRoutesFromAvailability>> | null = null;
+    if (nextValueStatus !== ACCOUNT_TOKEN_VALUE_STATUS_MASKED_PENDING && body.enabled !== undefined) {
+      await saveAccountTokenEnabledPreference(latest);
+      if (latest.enabled === false) {
+        removedRouteChannels = await removeRouteChannelsForAccountTokens([tokenId]);
+      }
+    } else if (nextValueStatus === ACCOUNT_TOKEN_VALUE_STATUS_MASKED_PENDING) {
+      removedRouteChannels = await removeRouteChannelsForAccountTokens([tokenId]);
     }
 
     if (body.isDefault === true && isUsableAccountToken(latest)) {
@@ -1458,7 +1529,11 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       return reply.code(500).send({ success: false, message: '更新失败' });
     }
 
-    return { success: true, token: latest };
+    if (body.enabled !== undefined && latest.enabled === true && isUsableAccountToken(latest)) {
+      routeRebuild = await rebuildAccountTokenRoutesNow();
+    }
+
+    return { success: true, localOnly: body.enabled !== undefined, token: latest, removedRouteChannels, routeRebuild };
   });
 
   app.post<{ Params: { id: string } }>('/api/account-tokens/:id/default', async (request, reply) => {
@@ -1482,9 +1557,20 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     }
     const success = await setDefaultToken(tokenId);
     if (!success) {
-      return reply.code(404).send({ success: false, message: '令牌不存在' });
+      return reply.code(400).send({ success: false, message: '令牌不可设为默认，请先补全明文 token' });
     }
-    return { success: true };
+    const accountTokens = await db.select({
+      id: schema.accountTokens.id,
+      accountId: schema.accountTokens.accountId,
+      isDefault: schema.accountTokens.isDefault,
+      enabled: schema.accountTokens.enabled,
+      updatedAt: schema.accountTokens.updatedAt,
+    })
+      .from(schema.accountTokens)
+      .where(eq(schema.accountTokens.accountId, tokenRow.accountId))
+      .all();
+    const token = accountTokens.find((item) => item.id === tokenId) || null;
+    return { success: true, token, accountTokens };
   });
 
   app.get<{ Params: { id: string } }>('/api/account-tokens/:id/value', async (request, reply) => {
@@ -1548,6 +1634,108 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     }
   });
 
+  app.post<{ Params: { id: string }; Body: unknown }>('/api/account-tokens/:id/models/route-enabled', async (request, reply) => {
+    const tokenId = Number.parseInt(request.params.id, 10);
+    if (Number.isNaN(tokenId)) {
+      return reply.code(400).send({ success: false, message: '令牌 ID 无效' });
+    }
+    const body = (request.body || {}) as Record<string, unknown>;
+    const modelName = typeof body.modelName === 'string' ? body.modelName.trim() : '';
+    if (!modelName) {
+      return reply.code(400).send({ success: false, message: '模型名称不能为空' });
+    }
+    if (typeof body.routeEnabled !== 'boolean') {
+      return reply.code(400).send({ success: false, message: 'routeEnabled 必须是布尔值' });
+    }
+
+    const tokenRow = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, tokenId)).get();
+    if (!tokenRow) {
+      return reply.code(404).send({ success: false, message: '令牌不存在' });
+    }
+
+    const modelRow = await db.select()
+      .from(schema.tokenModelAvailability)
+      .where(and(
+        eq(schema.tokenModelAvailability.tokenId, tokenId),
+        eq(schema.tokenModelAvailability.modelName, modelName),
+      ))
+      .get();
+    if (!modelRow) {
+      return reply.code(404).send({ success: false, message: '模型不存在，请先拉取令牌模型列表' });
+    }
+
+    const now = new Date().toISOString();
+    await db.update(schema.tokenModelAvailability)
+      .set({
+        routeEnabled: body.routeEnabled,
+        checkedAt: modelRow.checkedAt || now,
+      })
+      .where(eq(schema.tokenModelAvailability.id, modelRow.id))
+      .run();
+    const routeRebuild = await rebuildTokenRoutesFromAvailability();
+    const cachedModels = await getAccountTokenModels(tokenId, { refresh: false });
+    invalidateTokenRouterCache();
+
+    return {
+      success: true,
+      tokenId,
+      modelName,
+      routeEnabled: body.routeEnabled,
+      models: cachedModels?.models || [],
+      modelNames: cachedModels?.modelNames || [],
+      checkedAt: cachedModels?.checkedAt || null,
+      routeRebuild,
+    };
+  });
+
+  app.put<{ Params: { id: string }; Body: unknown }>('/api/account-tokens/:id/health-check', async (request, reply) => {
+    const tokenId = Number.parseInt(request.params.id, 10);
+    if (Number.isNaN(tokenId)) {
+      return reply.code(400).send({ success: false, message: '令牌 ID 无效' });
+    }
+    const body = (request.body || {}) as Record<string, unknown>;
+    const enabled = typeof body.enabled === 'boolean' ? body.enabled : undefined;
+    const model = Array.isArray(body.models)
+      ? body.models.map((item) => String(item || '').trim()).filter(Boolean).join(', ')
+      : (typeof body.model === 'string' ? body.model.trim() : undefined);
+    const intervalMinutes = body.intervalMinutes === undefined ? undefined : Number(body.intervalMinutes);
+    if (enabled === true && !model) {
+      return reply.code(400).send({ success: false, message: '开启定时测活时必须填写模型' });
+    }
+    if (intervalMinutes !== undefined && (!Number.isFinite(intervalMinutes) || intervalMinutes <= 0)) {
+      return reply.code(400).send({ success: false, message: '测活间隔必须是正数分钟' });
+    }
+
+    const token = await updateAccountTokenHealthCheckConfig(tokenId, {
+      enabled,
+      model,
+      intervalMinutes,
+    });
+    if (!token) {
+      return reply.code(404).send({ success: false, message: '令牌不存在' });
+    }
+    return { success: true, token };
+  });
+
+  app.post<{ Params: { id: string } }>('/api/account-tokens/:id/health-check/run', async (request, reply) => {
+    const tokenId = Number.parseInt(request.params.id, 10);
+    if (Number.isNaN(tokenId)) {
+      return reply.code(400).send({ success: false, message: '令牌 ID 无效' });
+    }
+    try {
+      const result = await runAccountTokenHealthCheck(tokenId);
+      if (!result) {
+        return reply.code(404).send({ success: false, message: '令牌不存在' });
+      }
+      return { success: true, ...result };
+    } catch (error: any) {
+      return reply.code(502).send({
+        success: false,
+        message: error?.message || '令牌测活失败',
+      });
+    }
+  });
+
   app.post<{ Body: unknown }>('/api/account-tokens/models/test', async (request, reply) => {
     const body = (request.body || {}) as Record<string, unknown>;
     const model = typeof body.model === 'string' ? body.model.trim() : '';
@@ -1587,6 +1775,46 @@ export async function accountTokensRoutes(app: FastifyInstance) {
         message: error?.message || '测试令牌可用性失败',
       });
     }
+  });
+
+  app.post<{ Body: unknown }>('/api/account-tokens/models/test-skipped', async (request, reply) => {
+    const body = (request.body || {}) as Record<string, unknown>;
+    const rawResults = Array.isArray(body.results) ? body.results : [];
+    const results = rawResults
+      .map((item) => {
+        const tokenId = Number((item as any)?.tokenId);
+        const model = typeof (item as any)?.model === 'string' ? (item as any).model.trim() : '';
+        if (!Number.isInteger(tokenId) || tokenId <= 0 || !model) return null;
+        return {
+          tokenId,
+          model,
+          available: false,
+          message: typeof (item as any)?.message === 'string' && (item as any).message.trim()
+            ? (item as any).message.trim()
+            : '跳过测试',
+          responseText: null,
+          httpStatus: null,
+          latencyMs: null,
+          checkedAt: typeof (item as any)?.checkedAt === 'string' && (item as any).checkedAt.trim()
+            ? (item as any).checkedAt.trim()
+            : new Date().toISOString(),
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => !!item);
+
+    if (results.length === 0) {
+      return reply.code(400).send({ success: false, message: '没有可保存的跳过结果' });
+    }
+    if (results.length > 100) {
+      return reply.code(400).send({ success: false, message: '单次最多保存 100 个跳过结果' });
+    }
+
+    await persistSkippedAccountTokenModelAvailability(results);
+    return {
+      success: true,
+      total: results.length,
+      results,
+    };
   });
 
   app.get<{ Params: { accountId: string } }>('/api/account-tokens/groups/:accountId', async (request, reply) => {
@@ -1648,7 +1876,7 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       status: task.status,
       message: reused
         ? '账号令牌删除任务执行中，请稍后查看程序日志'
-        : '已开始账号令牌删除，请稍后查看程序日志',
+        : '账号令牌删除进行中，请稍后查看程序日志',
     });
   });
 
@@ -1727,7 +1955,7 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       status: task.status,
       message: reused
         ? '令牌同步任务执行中，请稍后查看程序日志'
-        : '已开始全部账号令牌同步，请稍后查看程序日志',
+        : '全部账号令牌同步进行中，请稍后查看程序日志',
     });
   });
 
@@ -1772,7 +2000,7 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       status: task.status,
       message: reused
         ? '账号分组补齐任务执行中，请稍后查看程序日志'
-        : '已开始获取全部账号分组并补齐令牌，请稍后查看程序日志',
+        : '获取全部账号分组并补齐令牌进行中，请稍后查看程序日志',
     });
   });
 

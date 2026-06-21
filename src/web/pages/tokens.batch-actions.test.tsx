@@ -131,7 +131,7 @@ describe('Tokens batch actions', () => {
     }
   });
 
-  it('selects a token when clicking the row instead of only the checkbox', async () => {
+  it('selects visible tokens by default and toggles a token when clicking the row', async () => {
     let root!: WebTestRenderer;
     try {
       await act(async () => {
@@ -146,13 +146,44 @@ describe('Tokens batch actions', () => {
       await flushMicrotasks();
 
       const row = root.root.find((node) => node.props['data-testid'] === 'token-row-1');
+      const checkboxBefore = root.root.find((node) => node.props['data-testid'] === 'token-select-1');
+      expect(checkboxBefore.props.checked).toBe(true);
+
       await act(async () => {
         row.props.onClick({ target: { closest: () => null } });
       });
       await flushMicrotasks();
 
-      const checkbox = root.root.find((node) => node.props['data-testid'] === 'token-select-1');
-      expect(checkbox.props.checked).toBe(true);
+      const checkboxAfter = root.root.find((node) => node.props['data-testid'] === 'token-select-1');
+      expect(checkboxAfter.props.checked).toBe(false);
+    } finally {
+      root?.unmount();
+    }
+  });
+
+  it('selects the exact model search results by default', async () => {
+    let root!: WebTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <ToastProvider>
+            <MemoryRouter initialEntries={['/accounts?segment=tokens']}>
+              <TokensPanel />
+            </MemoryRouter>
+          </ToastProvider>,
+        );
+      });
+      await flushMicrotasks();
+
+      const modelInput = root.root.find((node) => node.type === 'input' && node.props.placeholder === '输入完整模型名称精准筛选');
+      await act(async () => {
+        modelInput.props.onChange({ target: { value: 'gpt-5.5' } });
+      });
+      await flushMicrotasks();
+
+      const checkboxA = root.root.find((node) => node.props['data-testid'] === 'token-select-1');
+      expect(checkboxA.props.checked).toBe(true);
+      expect(root.root.findAll((node) => node.props['data-testid'] === 'token-select-2')).toHaveLength(0);
     } finally {
       root?.unmount();
     }

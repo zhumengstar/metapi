@@ -1,8 +1,11 @@
-﻿import { and, eq, ne } from 'drizzle-orm';
+﻿import { and, eq, inArray, ne } from 'drizzle-orm';
 import { db, schema } from '../db/index.js';
 import { getInsertedRowId } from '../db/insertHelpers.js';
 import { getCredentialModeFromExtraConfig } from './accountExtraConfig.js';
-import { fetchModelPricingCatalog } from './modelPricingService.js';
+import {
+  hasManualTokenModelTestRecord,
+  isSuccessfulManualTokenModelTest,
+} from './tokenModelAvailabilityStatus.js';
 
 type UpstreamApiToken = {
   name?: string | null;
@@ -167,18 +170,32 @@ type GroupRatioMappingEntry = {
   group: string | null;
 };
 
+type AccountTokenGroupPreferenceEntry = {
+  enabled: boolean;
+  group: string;
+  ratio: number | null;
+  ratioKey: string;
+};
+
 function setGroupRatioMapping(
   map: Map<string, GroupRatioMappingEntry>,
   accountId: number,
   value: string | null | undefined,
   ratio: number,
   group: string | null,
+  options: { preserveExisting?: boolean } = {},
 ) {
   const entry = { ratio, group };
   const exact = normalizeTokenGroup(value, null);
-  if (exact) map.set(`${accountId}:${exact}`, entry);
+  if (exact) {
+    const key = `${accountId}:${exact}`;
+    if (!options.preserveExisting || !map.has(key)) map.set(key, entry);
+  }
   const lookup = normalizePricingLookupKey(value);
-  if (lookup) map.set(`${accountId}:lookup:${lookup}`, entry);
+  if (lookup) {
+    const key = `${accountId}:lookup:${lookup}`;
+    if (!options.preserveExisting || !map.has(key)) map.set(key, entry);
+  }
 }
 
 function resolveGroupRatioMapping(
@@ -203,6 +220,154 @@ function resolveGroupRatioMapping(
 
 function isStoredPricingAvailable(value: unknown): boolean {
   return value === true || value === 1 || value === '1';
+}
+
+export function normalizeAccountTokenGroupRatioKey(ratio: number | null | undefined): string {
+  const value = Number(ratio);
+  if (!Number.isFinite(value) || value <= 0) return '';
+  return Number(value.toFixed(12)).toString();
+}
+
+function buildAccountTokenGroupPreferenceKey(accountId: number, group: string | null | undefined, ratio: number | null | undefined): string {
+  return `${accountId}:${normalizeTokenGroup(group, null) || 'default'}:${normalizeAccountTokenGroupRatioKey(ratio)}`;
+}
+
+async function loadStoredGroupRatioMappings(accountId?: number): Promise<Map<string, GroupRatioMappingEntry>> {
+  const base = db.select({
+    accountId: schema.tokenGroupPricing.accountId,
+    group: schema.tokenGroupPricing.group,
+    groupName: schema.tokenGroupPricing.groupName,
+    ratio: schema.tokenGroupPricing.ratio,
+    pricingAvailable: schema.tokenGroupPricing.pricingAvailable,
+  }).from(schema.tokenGroupPricing);
+  const rows = accountId
+    ? await base.where(eq(schema.tokenGroupPricing.accountId, accountId)).all()
+    : await base.all();
+
+  const ratioByAccountAndGroup = new Map<string, GroupRatioMappingEntry>();
+  for (const row of rows) {
+    if (!isStoredPricingAvailable(row.pricingAvailable)) continue;
+    const group = normalizeTokenGroup(row.group, null);
+    const groupName = normalizeTokenGroup(row.groupName, null);
+    const ratio = Number(row.ratio);
+    if (!row.accountId || !group || !Number.isFinite(ratio) || ratio <= 0) continue;
+    const displayGroup = groupName || group;
+    setGroupRatioMapping(ratioByAccountAndGroup, row.accountId, group, ratio, displayGroup);
+    if (groupName) setGroupRatioMapping(ratioByAccountAndGroup, row.accountId, groupName, ratio, displayGroup);
+  }
+  return ratioByAccountAndGroup;
+}
+
+async function loadAccountTokenGroupPreferences(accountId?: number): Promise<Map<string, AccountTokenGroupPreferenceEntry>> {
+  const base = db.select().from(schema.accountTokenGroupPreferences);
+  const rows = accountId
+    ? await base.where(eq(schema.accountTokenGroupPreferences.accountId, accountId)).all()
+    : await base.all();
+
+  const preferences = new Map<string, AccountTokenGroupPreferenceEntry>();
+  for (const row of rows) {
+    const group = normalizeTokenGroup(row.tokenGroup, null) || 'default';
+    const ratio = Number(row.groupRatio);
+    const normalizedRatio = Number.isFinite(ratio) && ratio > 0 ? ratio : null;
+    const ratioKey = row.groupRatioKey || normalizeAccountTokenGroupRatioKey(normalizedRatio);
+    preferences.set(`${row.accountId}:${group}:${ratioKey}`, {
+      enabled: row.enabled === true,
+      group,
+      ratio: normalizedRatio,
+      ratioKey,
+    });
+  }
+  return preferences;
+}
+
+function resolveGroupPreferenceEnabled(
+  preferences: Map<string, AccountTokenGroupPreferenceEntry>,
+  accountId: number,
+  group: string | null | undefined,
+  ratio: number | null | undefined,
+): boolean | undefined {
+  return preferences.get(buildAccountTokenGroupPreferenceKey(accountId, group, ratio))?.enabled;
+}
+
+function resolveSyncedAccountTokenEnabled(
+  preferenceEnabled: boolean | undefined,
+  existingToken?: typeof schema.accountTokens.$inferSelect | null,
+): boolean {
+  if (preferenceEnabled !== undefined) return preferenceEnabled;
+  if (existingToken?.source === 'manual' && existingToken.enabled === true) return true;
+  return false;
+}
+
+export async function resolveAccountTokenManualEnabledPreference(input: {
+  accountId: number;
+  tokenGroup?: string | null;
+  tokenName?: string | null;
+  groupRatio?: number | null;
+}): Promise<boolean | undefined> {
+  const accountId = Number(input.accountId);
+  if (!Number.isInteger(accountId) || accountId <= 0) return undefined;
+  const group = normalizeTokenGroup(input.tokenGroup, input.tokenName) || 'default';
+  const resolvedRatio = input.groupRatio !== undefined
+    ? (Number.isFinite(Number(input.groupRatio)) && Number(input.groupRatio) > 0 ? Number(input.groupRatio) : null)
+    : (await resolveAccountTokenGroupRatio(accountId, [group, input.tokenName, input.tokenGroup]))?.ratio ?? null;
+  const preferences = await loadAccountTokenGroupPreferences(accountId);
+  return resolveGroupPreferenceEnabled(preferences, accountId, group, resolvedRatio);
+}
+
+async function resolveAccountTokenGroupRatio(
+  accountId: number,
+  candidates: Array<string | null | undefined>,
+): Promise<GroupRatioMappingEntry | undefined> {
+  const ratioByAccountAndGroup = await loadStoredGroupRatioMappings(accountId);
+  return resolveGroupRatioMapping(ratioByAccountAndGroup, accountId, candidates);
+}
+
+export async function upsertAccountTokenGroupEnabledPreference(input: {
+  accountId: number;
+  tokenGroup?: string | null;
+  tokenName?: string | null;
+  groupRatio?: number | null;
+  enabled: boolean;
+}) {
+  const accountId = Number(input.accountId);
+  if (!Number.isInteger(accountId) || accountId <= 0) return null;
+
+  const group = normalizeTokenGroup(input.tokenGroup, input.tokenName) || 'default';
+  const resolvedRatio = input.groupRatio !== undefined
+    ? (Number.isFinite(Number(input.groupRatio)) && Number(input.groupRatio) > 0 ? Number(input.groupRatio) : null)
+    : (await resolveAccountTokenGroupRatio(accountId, [group, input.tokenName, input.tokenGroup]))?.ratio ?? null;
+  const ratioKey = normalizeAccountTokenGroupRatioKey(resolvedRatio);
+  const now = new Date().toISOString();
+
+  const existing = await db.select()
+    .from(schema.accountTokenGroupPreferences)
+    .where(and(
+      eq(schema.accountTokenGroupPreferences.accountId, accountId),
+      eq(schema.accountTokenGroupPreferences.tokenGroup, group),
+      eq(schema.accountTokenGroupPreferences.groupRatioKey, ratioKey),
+    ))
+    .get();
+
+  if (existing) {
+    await db.update(schema.accountTokenGroupPreferences)
+      .set({ groupRatio: resolvedRatio, enabled: input.enabled, updatedAt: now })
+      .where(eq(schema.accountTokenGroupPreferences.id, existing.id))
+      .run();
+    return { id: existing.id, accountId, tokenGroup: group, groupRatio: resolvedRatio, groupRatioKey: ratioKey, enabled: input.enabled };
+  }
+
+  const inserted = await db.insert(schema.accountTokenGroupPreferences)
+    .values({
+      accountId,
+      tokenGroup: group,
+      groupRatio: resolvedRatio,
+      groupRatioKey: ratioKey,
+      enabled: input.enabled,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .run();
+  return { id: getInsertedRowId(inserted), accountId, tokenGroup: group, groupRatio: resolvedRatio, groupRatioKey: ratioKey, enabled: input.enabled };
 }
 
 async function loadAccountGroupNameAliases(accountId: number): Promise<Map<string, string>> {
@@ -354,7 +519,7 @@ export async function ensureDefaultTokenForAccount(
 
 export async function setDefaultToken(tokenId: number): Promise<boolean> {
   const target = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, tokenId)).get();
-  if (!target || !isUsableAccountToken(target)) return false;
+  if (!target || !isReadyAccountToken(target)) return false;
 
   const now = new Date().toISOString();
   await db.update(schema.accountTokens)
@@ -412,14 +577,21 @@ export async function syncTokensFromUpstream(accountId: number, upstreamTokens: 
   let maskedPending = 0;
   const pendingTokenIds: number[] = [];
   const groupNameAliases = await loadAccountGroupNameAliases(accountId);
+  const ratioByAccountAndGroup = await loadStoredGroupRatioMappings(accountId);
+  const groupEnabledPreferences = await loadAccountTokenGroupPreferences(accountId);
   let index = existing.length + 1;
 
   for (const upstream of upstreamTokens) {
     const tokenValue = normalizeTokenValue(upstream.key);
     if (!tokenValue) continue;
     const tokenName = normalizeTokenName(upstream.name, index);
-    const enabled = upstream.enabled ?? true;
     const tokenGroup = normalizeTokenGroup(upstream.tokenGroup, tokenName);
+    const groupRatio = resolveGroupRatioMapping(ratioByAccountAndGroup, accountId, [
+      tokenGroup,
+      tokenName,
+      upstream.tokenGroup,
+    ])?.ratio ?? null;
+    const preferenceEnabled = resolveGroupPreferenceEnabled(groupEnabledPreferences, accountId, tokenGroup, groupRatio);
     const nextValueStatus = isMaskedTokenValue(tokenValue)
       ? ACCOUNT_TOKEN_VALUE_STATUS_MASKED_PENDING
       : ACCOUNT_TOKEN_VALUE_STATUS_READY;
@@ -429,6 +601,7 @@ export async function syncTokensFromUpstream(accountId: number, upstreamTokens: 
       && resolveAccountTokenValueStatus(row) === ACCOUNT_TOKEN_VALUE_STATUS_READY
     ));
     if (byToken) {
+      const enabled = resolveSyncedAccountTokenEnabled(preferenceEnabled, byToken);
       await db.update(schema.accountTokens)
         .set({
           name: tokenName,
@@ -460,6 +633,7 @@ export async function syncTokensFromUpstream(accountId: number, upstreamTokens: 
       ? matchingPendingByClearValue[0]
       : null;
     if (pendingClearMatch) {
+      const enabled = resolveSyncedAccountTokenEnabled(preferenceEnabled, pendingClearMatch);
       await db.update(schema.accountTokens)
         .set({
           name: tokenName,
@@ -497,6 +671,7 @@ export async function syncTokensFromUpstream(accountId: number, upstreamTokens: 
       ? matchingReadyByMaskedValue[0]
       : null;
     if (readyMaskedMatch) {
+      const enabled = resolveSyncedAccountTokenEnabled(preferenceEnabled, readyMaskedMatch);
       const staleMaskedPlaceholders = existing.filter((row) => (
         row.id !== readyMaskedMatch.id
         && resolveAccountTokenValueStatus(row) === ACCOUNT_TOKEN_VALUE_STATUS_MASKED_PENDING
@@ -548,6 +723,7 @@ export async function syncTokensFromUpstream(accountId: number, upstreamTokens: 
     ));
 
     if (matchingPlaceholder) {
+      const enabled = resolveSyncedAccountTokenEnabled(preferenceEnabled, matchingPlaceholder);
       const nextEnabled = nextValueStatus === ACCOUNT_TOKEN_VALUE_STATUS_READY ? enabled : false;
       await db.update(schema.accountTokens)
         .set({
@@ -586,7 +762,9 @@ export async function syncTokensFromUpstream(accountId: number, upstreamTokens: 
         tokenGroup,
         valueStatus: nextValueStatus,
         source: 'sync',
-        enabled: nextValueStatus === ACCOUNT_TOKEN_VALUE_STATUS_READY ? enabled : false,
+        enabled: nextValueStatus === ACCOUNT_TOKEN_VALUE_STATUS_READY
+          ? resolveSyncedAccountTokenEnabled(preferenceEnabled)
+          : false,
         isDefault: false,
         createdAt: now,
         updatedAt: now,
@@ -628,40 +806,34 @@ export async function listTokensWithRelations(accountId?: number) {
     ? await base.where(eq(schema.accountTokens.accountId, accountId)).all()
     : await base.all();
 
-  const pricingRows = await db.select({
-    accountId: schema.tokenGroupPricing.accountId,
-    group: schema.tokenGroupPricing.group,
-    groupName: schema.tokenGroupPricing.groupName,
-    ratio: schema.tokenGroupPricing.ratio,
-    pricingAvailable: schema.tokenGroupPricing.pricingAvailable,
-  })
-    .from(schema.tokenGroupPricing)
-    .all();
-  const ratioByAccountAndGroup = new Map<string, GroupRatioMappingEntry>();
-  for (const row of pricingRows) {
-    if (!isStoredPricingAvailable(row.pricingAvailable)) continue;
-    const group = normalizeTokenGroup(row.group, null);
-    const groupName = normalizeTokenGroup(row.groupName, null);
-    const ratio = Number(row.ratio);
-    if (!row.accountId || !group || !Number.isFinite(ratio) || ratio <= 0) continue;
-    const displayGroup = groupName || group;
-    setGroupRatioMapping(ratioByAccountAndGroup, row.accountId, group, ratio, displayGroup);
-    if (groupName) setGroupRatioMapping(ratioByAccountAndGroup, row.accountId, groupName, ratio, displayGroup);
-  }
+  const ratioByAccountAndGroup = await loadStoredGroupRatioMappings(accountId);
+  const groupEnabledPreferences = await loadAccountTokenGroupPreferences(accountId);
 
-  const tokenModelRows = await db.select({
-    tokenId: schema.tokenModelAvailability.tokenId,
-    modelName: schema.tokenModelAvailability.modelName,
-    available: schema.tokenModelAvailability.available,
-    latencyMs: schema.tokenModelAvailability.latencyMs,
-    checkedAt: schema.tokenModelAvailability.checkedAt,
-  })
-    .from(schema.tokenModelAvailability)
-    .all();
+  const tokenIds = rows.map((row) => row.account_tokens.id);
+  const tokenModelRows = tokenIds.length > 0
+    ? await db.select({
+      tokenId: schema.tokenModelAvailability.tokenId,
+      modelName: schema.tokenModelAvailability.modelName,
+      available: schema.tokenModelAvailability.available,
+      routeEnabled: schema.tokenModelAvailability.routeEnabled,
+      message: schema.tokenModelAvailability.message,
+      httpStatus: schema.tokenModelAvailability.httpStatus,
+      responseText: schema.tokenModelAvailability.responseText,
+      latencyMs: schema.tokenModelAvailability.latencyMs,
+      checkedAt: schema.tokenModelAvailability.checkedAt,
+    })
+      .from(schema.tokenModelAvailability)
+      .where(inArray(schema.tokenModelAvailability.tokenId, tokenIds))
+      .all()
+    : [];
   const modelsByTokenId = new Map<number, string[]>();
+  const modelRouteStatesByTokenId = new Map<number, Record<string, boolean>>();
   const modelAvailabilityByTokenId = new Map<number, Array<{
     modelName: string;
     available: boolean | null;
+    message: string | null;
+    httpStatus: number | null;
+    responseText: string | null;
     latencyMs: number | null;
     checkedAt: string | null;
   }>>();
@@ -669,14 +841,19 @@ export async function listTokensWithRelations(accountId?: number) {
   for (const row of tokenModelRows) {
     const modelName = (row.modelName || '').trim();
     if (!modelName) continue;
-    const availabilityRows = modelAvailabilityByTokenId.get(row.tokenId) || [];
-    availabilityRows.push({
-      modelName,
-      available: row.available,
-      latencyMs: row.latencyMs,
-      checkedAt: row.checkedAt,
-    });
-    modelAvailabilityByTokenId.set(row.tokenId, availabilityRows);
+    if (hasManualTokenModelTestRecord(row)) {
+      const availabilityRows = modelAvailabilityByTokenId.get(row.tokenId) || [];
+      availabilityRows.push({
+        modelName,
+        available: isSuccessfulManualTokenModelTest(row),
+        message: row.message,
+        httpStatus: row.httpStatus,
+        responseText: row.responseText,
+        latencyMs: row.latencyMs,
+        checkedAt: row.checkedAt,
+      });
+      modelAvailabilityByTokenId.set(row.tokenId, availabilityRows);
+    }
 
     const seen = seenModelKeysByTokenId.get(row.tokenId) || new Set<string>();
     const key = modelName.toLowerCase();
@@ -686,50 +863,15 @@ export async function listTokensWithRelations(accountId?: number) {
     const models = modelsByTokenId.get(row.tokenId) || [];
     models.push(modelName);
     modelsByTokenId.set(row.tokenId, models);
+    const routeStates = modelRouteStatesByTokenId.get(row.tokenId) || {};
+    routeStates[modelName] = row.routeEnabled === true;
+    modelRouteStatesByTokenId.set(row.tokenId, routeStates);
   }
   for (const models of modelsByTokenId.values()) {
     models.sort((left, right) => left.localeCompare(right));
   }
   for (const rows of modelAvailabilityByTokenId.values()) {
     rows.sort((left, right) => left.modelName.localeCompare(right.modelName));
-  }
-
-  const catalogByAccountId = new Map<number, Awaited<ReturnType<typeof fetchModelPricingCatalog>>>();
-  const mergeCatalogRatiosForAccount = async (
-    account: typeof schema.accounts.$inferSelect,
-    site: typeof schema.sites.$inferSelect,
-  ) => {
-    if (catalogByAccountId.has(account.id)) return;
-    let catalog: Awaited<ReturnType<typeof fetchModelPricingCatalog>> = null;
-    try {
-      catalog = await fetchModelPricingCatalog({
-        site: {
-          id: site.id,
-          url: site.url,
-          platform: site.platform,
-          apiKey: site.apiKey,
-        },
-        account: {
-          id: account.id,
-          accessToken: account.accessToken,
-          apiToken: account.apiToken,
-        },
-        modelName: '',
-      });
-    } catch {
-      catalog = null;
-    }
-    catalogByAccountId.set(account.id, catalog);
-    for (const [group, ratioValue] of Object.entries(catalog?.groupRatio || {})) {
-      const ratio = Number(ratioValue);
-      if (!group || !Number.isFinite(ratio) || ratio <= 0) continue;
-      setGroupRatioMapping(ratioByAccountAndGroup, account.id, group, ratio, group);
-    }
-  };
-
-  for (const row of rows) {
-    if (isApiKeyConnection(row.accounts)) continue;
-    await mergeCatalogRatiosForAccount(row.accounts, row.sites);
   }
 
   return rows
@@ -743,7 +885,9 @@ export async function listTokensWithRelations(accountId?: number) {
       row.account_tokens.tokenGroup,
     ]);
     const groupRatio = groupRatioEntry?.ratio;
+    const enabledPreference = groupEnabledPreferences.get(buildAccountTokenGroupPreferenceKey(row.accounts.id, group, groupRatio));
     const modelNames = modelsByTokenId.get(row.account_tokens.id) || [];
+    const modelRouteStates = modelRouteStatesByTokenId.get(row.account_tokens.id) || {};
     const modelAvailability = modelAvailabilityByTokenId.get(row.account_tokens.id) || [];
     return {
       ...tokenMeta,
@@ -753,9 +897,30 @@ export async function listTokensWithRelations(accountId?: number) {
       groupRatioAvailable: groupRatio !== undefined,
       tokenGroupRatio: groupRatio ?? null,
       tokenGroupRatioGroup: groupRatioEntry?.group ?? null,
+      enabledPreference: enabledPreference
+        ? {
+          enabled: enabledPreference.enabled,
+          source: 'manual',
+          group: enabledPreference.group,
+          groupRatio: enabledPreference.ratio,
+        }
+        : null,
       modelNames,
+      modelRouteStates,
       modelCount: modelNames.length,
       modelAvailability,
+      modelSyncedAt: row.account_tokens.modelSyncedAt ?? null,
+      autoDisabledAt: row.account_tokens.autoDisabledAt ?? null,
+      autoDisabledReason: row.account_tokens.autoDisabledReason ?? null,
+      autoDisabledPreviousEnabled: row.account_tokens.autoDisabledPreviousEnabled ?? null,
+      healthCheckEnabled: row.account_tokens.healthCheckEnabled === true,
+      healthCheckIntervalMinutes: row.account_tokens.healthCheckIntervalMinutes ?? 60,
+      healthCheckModel: row.account_tokens.healthCheckModel ?? '',
+      healthCheckLastRunAt: row.account_tokens.healthCheckLastRunAt ?? null,
+      healthCheckNextRunAt: row.account_tokens.healthCheckNextRunAt ?? null,
+      healthCheckLastAvailable: row.account_tokens.healthCheckLastAvailable ?? null,
+      healthCheckLastMessage: row.account_tokens.healthCheckLastMessage ?? null,
+      healthCheckLastLatencyMs: row.account_tokens.healthCheckLastLatencyMs ?? null,
       account: {
         id: row.accounts.id,
         username: row.accounts.username,

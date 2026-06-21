@@ -12,7 +12,9 @@ const getApiTokenMock = vi.fn();
 const createApiTokenMock = vi.fn();
 const getUserGroupsMock = vi.fn();
 const deleteApiTokenMock = vi.fn();
+const getModelsMock = vi.fn();
 const fetchModelPricingCatalogMock = vi.fn();
+const testAccountTokenModelAvailabilityMock = vi.fn();
 
 type AccountTokenServiceModule = typeof import('../../services/accountTokenService.js');
 type BackgroundTaskServiceModule = typeof import('../../services/backgroundTaskService.js');
@@ -24,6 +26,7 @@ vi.mock('../../services/platforms/index.js', () => ({
     createApiToken: (...args: unknown[]) => createApiTokenMock(...args),
     getUserGroups: (...args: unknown[]) => getUserGroupsMock(...args),
     deleteApiToken: (...args: unknown[]) => deleteApiTokenMock(...args),
+    getModels: (...args: unknown[]) => getModelsMock(...args),
   }),
 }));
 
@@ -32,6 +35,14 @@ vi.mock('../../services/modelPricingService.js', async () => {
   return {
     ...actual,
     fetchModelPricingCatalog: (...args: unknown[]) => fetchModelPricingCatalogMock(...args),
+  };
+});
+
+vi.mock('../../services/accountTokenAvailabilityTestService.js', async () => {
+  const actual = await vi.importActual<typeof import('../../services/accountTokenAvailabilityTestService.js')>('../../services/accountTokenAvailabilityTestService.js');
+  return {
+    ...actual,
+    testAccountTokenModelAvailability: (...args: unknown[]) => testAccountTokenModelAvailabilityMock(...args),
   };
 });
 
@@ -102,12 +113,30 @@ describe('account tokens sync routes with site status', () => {
     createApiTokenMock.mockReset();
     getUserGroupsMock.mockReset();
     deleteApiTokenMock.mockReset();
+    getModelsMock.mockReset();
+    getModelsMock.mockResolvedValue(['gpt-5.5']);
     fetchModelPricingCatalogMock.mockReset();
     fetchModelPricingCatalogMock.mockResolvedValue(null);
+    testAccountTokenModelAvailabilityMock.mockReset();
+    testAccountTokenModelAvailabilityMock.mockImplementation(async (options: { model: string; tokenIds: number[] }) => ({
+      model: options.model,
+      total: options.tokenIds.length,
+      results: options.tokenIds.map((tokenId) => ({
+        tokenId,
+        model: options.model,
+        available: true,
+        message: '请求成功',
+        responseText: '我是测试模型',
+        httpStatus: 200,
+        latencyMs: 12,
+        checkedAt: '2026-06-21T00:00:00.000Z',
+      })),
+    }));
     resetBackgroundTasks();
     seedId = 0;
 
     await db.delete(schema.events).run();
+    await db.delete(schema.accountTokenGroupPreferences).run();
     await db.delete(schema.accountTokens).run();
     await db.delete(schema.routeChannels).run();
     await db.delete(schema.tokenRoutes).run();
@@ -170,6 +199,53 @@ describe('account tokens sync routes with site status', () => {
       .where(eq(schema.accountTokens.accountId, account.id))
       .all();
     expect(tokenRows.length).toBe(0);
+  });
+
+  it('clears local account tokens when upstream returns an empty token list', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    const staleToken = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'default',
+      token: 'sk-local-default-only',
+      source: 'legacy',
+      enabled: true,
+      isDefault: true,
+      tokenGroup: 'default',
+      valueStatus: 'ready' as any,
+    }).returning().get();
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.5',
+      enabled: true,
+    }).returning().get();
+    await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: account.id,
+      tokenId: staleToken.id,
+      enabled: true,
+    }).run();
+    getApiTokensMock.mockResolvedValue([]);
+    getApiTokenMock.mockResolvedValue('sk-account-level-fallback');
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/account-tokens/sync/${account.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      synced: true,
+      status: 'synced',
+      reason: 'no_upstream_tokens',
+      deleted: 1,
+    });
+
+    const tokenRows = await db.select()
+      .from(schema.accountTokens)
+      .where(eq(schema.accountTokens.accountId, account.id))
+      .all();
+    expect(tokenRows).toHaveLength(0);
+    expect(await db.select().from(schema.routeChannels).all()).toHaveLength(0);
   });
 
   it('stores masked upstream token values as masked_pending placeholders', async () => {
@@ -380,6 +456,201 @@ describe('account tokens sync routes with site status', () => {
     ]);
   });
 
+  it('keeps stored account group ratios without fetching the public pricing catalog', async () => {
+    const { site, account } = await seedAccount({ siteStatus: 'active' });
+    await db.insert(schema.tokenGroupPricing).values({
+      siteId: site.id,
+      accountId: account.id,
+      sourceKey: `account:${account.id}`,
+      group: '生图专用分组',
+      ratio: 0.9,
+      source: 'upstream',
+      pricingAvailable: true,
+    }).run();
+    await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: '生图专用分组',
+      token: 'sk-image-token-1234',
+      source: 'sync',
+      enabled: true,
+      isDefault: true,
+      tokenGroup: '生图专用分组',
+      valueStatus: 'ready' as any,
+    }).run();
+
+    fetchModelPricingCatalogMock.mockResolvedValue({
+      models: [],
+      groupRatio: {
+        '生图专用分组': 1,
+        default: 1,
+      },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/account-tokens',
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([
+      expect.objectContaining({
+        name: '生图专用分组',
+        groupRatio: 0.9,
+        groupRatioAvailable: true,
+        tokenGroupRatioGroup: '生图专用分组',
+      }),
+    ]);
+    expect(fetchModelPricingCatalogMock).not.toHaveBeenCalled();
+  });
+
+  it('deletes local tokens that are no longer present upstream and removes their route channels', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    const staleToken = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'stale',
+      token: 'sk-stale-token',
+      source: 'sync',
+      enabled: true,
+      isDefault: false,
+      tokenGroup: 'stale',
+      valueStatus: 'ready' as any,
+    }).returning().get();
+    await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'kept',
+      token: 'sk-kept-token',
+      source: 'sync',
+      enabled: true,
+      isDefault: true,
+      tokenGroup: 'kept',
+      valueStatus: 'ready' as any,
+    }).run();
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.5',
+      enabled: true,
+    }).returning().get();
+    await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: account.id,
+      tokenId: staleToken.id,
+      enabled: true,
+    }).run();
+
+    getApiTokensMock.mockResolvedValue([
+      { name: 'kept', key: 'sk-kept-token', enabled: true, tokenGroup: 'kept' },
+    ]);
+    getApiTokenMock.mockResolvedValue(null);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/account-tokens/sync/${account.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      synced: true,
+      status: 'synced',
+      deleted: 1,
+    });
+
+    const tokenRows = await db.select()
+      .from(schema.accountTokens)
+      .where(eq(schema.accountTokens.accountId, account.id))
+      .all();
+    expect(tokenRows.map((row) => row.name)).toEqual(['kept']);
+    const routeChannels = await db.select().from(schema.routeChannels).all();
+    expect(routeChannels.some((row) => row.tokenId === staleToken.id)).toBe(false);
+  });
+
+  it('keeps manual group enabled preferences across upstream sync and removes disabled route channels', async () => {
+    const { site, account } = await seedAccount({ siteStatus: 'active' });
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'pro-token',
+      token: 'sk-pro-token',
+      source: 'sync',
+      enabled: true,
+      isDefault: true,
+      tokenGroup: 'pro',
+      valueStatus: 'ready' as any,
+    }).returning().get();
+    await db.insert(schema.tokenGroupPricing).values({
+      siteId: site.id,
+      accountId: account.id,
+      sourceKey: `account:${account.id}`,
+      group: 'pro',
+      groupName: 'pro',
+      ratio: 0.05,
+      source: 'upstream',
+      pricingAvailable: true,
+    }).run();
+    await db.insert(schema.accountTokenGroupPreferences).values({
+      accountId: account.id,
+      tokenGroup: 'pro',
+      groupRatio: 0.05,
+      groupRatioKey: '0.05',
+      enabled: false,
+    }).run();
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.5',
+      enabled: true,
+    }).returning().get();
+    await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: account.id,
+      tokenId: token.id,
+      enabled: true,
+    }).run();
+
+    getApiTokensMock.mockResolvedValue([
+      { name: 'pro-token', key: 'sk-pro-token', enabled: true, tokenGroup: 'pro' },
+    ]);
+    getApiTokenMock.mockResolvedValue(null);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/account-tokens/sync/${account.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      synced: true,
+      status: 'synced',
+    });
+
+    const tokenRows = await db.select()
+      .from(schema.accountTokens)
+      .where(eq(schema.accountTokens.accountId, account.id))
+      .all();
+    expect(tokenRows).toHaveLength(1);
+    expect(tokenRows[0]).toMatchObject({
+      name: 'pro-token',
+      enabled: false,
+      tokenGroup: 'pro',
+    });
+    expect(await db.select().from(schema.routeChannels).all()).toHaveLength(0);
+
+    const listResponse = await app.inject({
+      method: 'GET',
+      url: '/api/account-tokens',
+    });
+    expect(listResponse.statusCode).toBe(200);
+    expect(listResponse.json()).toEqual([
+      expect.objectContaining({
+        name: 'pro-token',
+        enabled: false,
+        groupRatio: 0.05,
+        enabledPreference: expect.objectContaining({
+          enabled: false,
+          source: 'manual',
+          groupRatio: 0.05,
+        }),
+      }),
+    ]);
+  });
+
   it('removes matching masked_pending placeholders after reusing a ready token', async () => {
     const { account } = await seedAccount({ siteStatus: 'active' });
     const fullToken = 'sk-real-token-1234';
@@ -497,15 +768,8 @@ describe('account tokens sync routes with site status', () => {
       .from(schema.accountTokens)
       .where(eq(schema.accountTokens.accountId, account.id))
       .all();
-    expect(tokenRows).toHaveLength(2);
-    expect(tokenRows.find((row) => row.token === firstFullToken)).toMatchObject({
-      name: 'first-token',
-      token: firstFullToken,
-      source: 'manual',
-      enabled: true,
-      isDefault: true,
-      tokenGroup: 'default',
-    });
+    expect(tokenRows).toHaveLength(1);
+    expect(tokenRows.find((row) => row.token === firstFullToken)).toBeUndefined();
     const maskedRow = tokenRows.find((row) => row.name === 'second-token');
     expect(maskedRow).toMatchObject({
       token: sharedMaskedToken,
@@ -644,12 +908,32 @@ describe('account tokens sync routes with site status', () => {
     expect(response.json()).toEqual([]);
   });
 
-  it('loads token group ratios from the account pricing catalog', async () => {
+  it('loads token group ratios from stored account pricing only', async () => {
     const { site, account } = await seedAccount({ siteStatus: 'active' });
     await db.update(schema.sites)
       .set({ platform: 'sub2api' })
       .where(eq(schema.sites.id, site.id))
       .run();
+    await db.insert(schema.tokenGroupPricing).values([
+      {
+        siteId: site.id,
+        accountId: account.id,
+        sourceKey: `account:${account.id}`,
+        group: '生图（1k）',
+        ratio: 0.12,
+        source: 'upstream',
+        pricingAvailable: true,
+      },
+      {
+        siteId: site.id,
+        accountId: account.id,
+        sourceKey: `account:${account.id}`,
+        group: '生图（2k4k）',
+        ratio: 0.25,
+        source: 'upstream',
+        pricingAvailable: true,
+      },
+    ]).run();
 
     await db.insert(schema.accountTokens).values([
       {
@@ -702,17 +986,7 @@ describe('account tokens sync routes with site status', () => {
         tokenGroupRatioGroup: '生图（2k4k）',
       }),
     ]);
-    expect(fetchModelPricingCatalogMock).toHaveBeenCalledTimes(1);
-    expect(fetchModelPricingCatalogMock).toHaveBeenCalledWith(expect.objectContaining({
-      account: expect.objectContaining({
-        id: account.id,
-        accessToken: account.accessToken,
-      }),
-      site: expect.objectContaining({
-        id: site.id,
-        platform: 'sub2api',
-      }),
-    }));
+    expect(fetchModelPricingCatalogMock).not.toHaveBeenCalled();
   });
 
   it('sync-all skips disabled-site accounts and syncs active-site accounts', async () => {
@@ -764,11 +1038,16 @@ describe('account tokens sync routes with site status', () => {
       synced: true,
     });
 
-    const syncedDefaultToken = await db.select()
+    const syncedTokens = await db.select()
       .from(schema.accountTokens)
-      .where(and(eq(schema.accountTokens.accountId, active.account.id), eq(schema.accountTokens.isDefault, true)))
-      .get();
-    expect(syncedDefaultToken?.token).toBe('sk-synced-token');
+      .where(eq(schema.accountTokens.accountId, active.account.id))
+      .all();
+    expect(syncedTokens).toHaveLength(1);
+    expect(syncedTokens[0]).toMatchObject({
+      token: 'sk-synced-token',
+      enabled: false,
+      isDefault: false,
+    });
   });
 
   it('rejects non-boolean wait when syncing all account tokens', async () => {
@@ -1179,9 +1458,61 @@ describe('account tokens sync routes with site status', () => {
     expect(tokenRows[0]).toMatchObject({
       name: 'masked-only',
       token: 'sk-real-token-1234',
-      enabled: true,
+      enabled: false,
     });
     expect((tokenRows[0] as any).valueStatus).toBe('ready');
+  });
+
+  it('applies manual enabled group preferences when upstream sync returns a new ready token', async () => {
+    const { site, account } = await seedAccount({ siteStatus: 'active' });
+    await db.insert(schema.tokenGroupPricing).values({
+      siteId: site.id,
+      accountId: account.id,
+      sourceKey: `account:${account.id}`,
+      group: 'pro',
+      groupName: 'pro',
+      ratio: 0.5,
+      source: 'upstream',
+      pricingAvailable: true,
+    }).run();
+    await db.insert(schema.accountTokenGroupPreferences).values({
+      accountId: account.id,
+      tokenGroup: 'pro',
+      groupRatio: 0.5,
+      groupRatioKey: '0.5',
+      enabled: true,
+    }).run();
+
+    getApiTokensMock.mockResolvedValue([
+      { name: 'pro', key: 'sk-new-pro-token', enabled: false, tokenGroup: 'pro' },
+    ]);
+    getApiTokenMock.mockResolvedValue(null);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/account-tokens/sync/${account.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      synced: true,
+      status: 'synced',
+      created: 1,
+    });
+
+    const tokenRows = await db.select()
+      .from(schema.accountTokens)
+      .where(eq(schema.accountTokens.accountId, account.id))
+      .all();
+    expect(tokenRows).toHaveLength(1);
+    expect(tokenRows[0]).toMatchObject({
+      name: 'pro',
+      token: 'sk-new-pro-token',
+      enabled: true,
+      isDefault: true,
+      tokenGroup: 'pro',
+    });
   });
 
   it('does not allow setting a masked_pending placeholder as default', async () => {
@@ -1206,6 +1537,83 @@ describe('account tokens sync routes with site status', () => {
       success: false,
       message: expect.stringContaining('待补全令牌'),
     });
+  });
+
+  it('returns account token default states after setting a token as default', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'old-default',
+      token: 'sk-old-default',
+      source: 'manual',
+      enabled: true,
+      isDefault: true,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+    const nextDefault = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'next-default',
+      token: 'sk-next-default',
+      source: 'manual',
+      enabled: true,
+      isDefault: false,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/account-tokens/${nextDefault.id}/default`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as {
+      success: boolean;
+      token: { id: number; isDefault: boolean } | null;
+      accountTokens: Array<{ id: number; isDefault: boolean }>;
+    };
+    expect(body.success).toBe(true);
+    expect(body.token).toMatchObject({ id: nextDefault.id, isDefault: true });
+    expect(body.accountTokens.filter((token) => token.isDefault).map((token) => token.id)).toEqual([nextDefault.id]);
+  });
+
+  it('enables a ready token when setting it as default', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'old-default',
+      token: 'sk-old-default',
+      source: 'manual',
+      enabled: true,
+      isDefault: true,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+    const disabledReady = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'disabled-ready',
+      token: 'sk-disabled-ready',
+      source: 'manual',
+      enabled: false,
+      isDefault: false,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/account-tokens/${disabledReady.id}/default`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as {
+      success: boolean;
+      token: { id: number; isDefault: boolean; enabled: boolean } | null;
+      accountTokens: Array<{ id: number; isDefault: boolean; enabled: boolean }>;
+    };
+    expect(body.success).toBe(true);
+    expect(body.token).toMatchObject({ id: disabledReady.id, isDefault: true, enabled: true });
+    expect(body.accountTokens.filter((token) => token.isDefault).map((token) => token.id)).toEqual([disabledReady.id]);
+
+    const accountRow = await db.select().from(schema.accounts).where(eq(schema.accounts.id, account.id)).get();
+    expect(accountRow?.apiToken).toBe('sk-disabled-ready');
   });
 
   it('promotes a masked_pending placeholder to ready when a full token is saved', async () => {
@@ -1345,6 +1753,331 @@ describe('account tokens sync routes with site status', () => {
         message: expect.stringContaining('原站点未删除'),
         relatedType: 'account_token',
       }),
+    ]));
+  });
+
+  it('auto-disables tokens when model discovery is empty and restores previous state when models return', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'model-empty-token',
+      token: 'sk-real-token',
+      source: 'manual',
+      enabled: true,
+      isDefault: true,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+
+    getModelsMock.mockResolvedValueOnce([]);
+    const emptyResponse = await app.inject({
+      method: 'GET',
+      url: `/api/account-tokens/${token.id}/models`,
+    });
+
+    expect(emptyResponse.statusCode).toBe(200);
+    const autoDisabled = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, token.id)).get();
+    expect(autoDisabled).toMatchObject({
+      enabled: false,
+      autoDisabledReason: '模型拉取为空',
+      autoDisabledPreviousEnabled: true,
+    });
+    expect(autoDisabled?.autoDisabledAt).toBeTruthy();
+    expect(autoDisabled?.modelSyncedAt).toBeTruthy();
+
+    getModelsMock.mockResolvedValueOnce(['gpt-5.5']);
+    const restoredResponse = await app.inject({
+      method: 'GET',
+      url: `/api/account-tokens/${token.id}/models`,
+    });
+
+    expect(restoredResponse.statusCode).toBe(200);
+    const restored = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, token.id)).get();
+    expect(restored).toMatchObject({
+      enabled: true,
+      autoDisabledAt: null,
+      autoDisabledReason: null,
+      autoDisabledPreviousEnabled: null,
+    });
+    const modelRows = await db.select().from(schema.tokenModelAvailability)
+      .where(eq(schema.tokenModelAvailability.tokenId, token.id))
+      .all();
+    expect(modelRows.map((row) => row.modelName)).toEqual(['gpt-5.5']);
+  });
+
+  it('returns persisted route-enabled model state after toggling a token model', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'route-toggle-token',
+      token: 'sk-route-toggle',
+      source: 'manual',
+      enabled: true,
+      isDefault: true,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+
+    await db.insert(schema.tokenModelAvailability).values({
+      tokenId: token.id,
+      modelName: 'gpt-5.5',
+      available: true,
+      routeEnabled: false,
+    }).run();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/account-tokens/${token.id}/models/route-enabled`,
+      payload: {
+        modelName: 'gpt-5.5',
+        routeEnabled: true,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as {
+      routeEnabled: boolean;
+      models: Array<{ name: string; routeEnabled: boolean }>;
+      modelNames: string[];
+    };
+    expect(body.routeEnabled).toBe(true);
+    expect(body.models).toEqual([{ name: 'gpt-5.5', routeEnabled: true }]);
+    expect(body.modelNames).toEqual(['gpt-5.5']);
+
+    const row = await db.select().from(schema.tokenModelAvailability)
+      .where(eq(schema.tokenModelAvailability.tokenId, token.id))
+      .get();
+    expect(row?.routeEnabled).toBe(true);
+  });
+
+  it('keeps failed token test result unavailable even when discovery marks the model available', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'failed-test-token',
+      token: 'sk-failed-test',
+      source: 'manual',
+      enabled: true,
+      isDefault: true,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+
+    await db.insert(schema.tokenModelAvailability).values({
+      tokenId: token.id,
+      modelName: 'gpt-5.5',
+      available: true,
+      message: '请求失败：HTTP 401',
+      httpStatus: 401,
+      responseText: null,
+      checkedAt: '2026-06-20T00:00:00.000Z',
+    }).run();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/account-tokens',
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as Array<any>;
+    const returned = body.find((row) => row.id === token.id);
+    expect(returned?.modelAvailability).toEqual([
+      expect.objectContaining({
+        modelName: 'gpt-5.5',
+        available: false,
+        httpStatus: 401,
+        message: '请求失败：HTTP 401',
+      }),
+    ]);
+  });
+
+  it('does not rebuild routes or change token enabled state after model availability test', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'manual-disabled',
+      token: 'sk-manual-disabled',
+      source: 'manual',
+      enabled: false,
+      isDefault: false,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+
+    await db.insert(schema.tokenModelAvailability).values({
+      tokenId: token.id,
+      modelName: 'gpt-5.5',
+      available: true,
+      routeEnabled: true,
+      message: '请求成功',
+      checkedAt: '2026-06-20T00:00:00.000Z',
+    }).run();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/account-tokens/models/test',
+      payload: {
+        model: 'gpt-5.5',
+        tokenIds: [token.id],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).not.toHaveProperty('routeRebuild');
+
+    const latestToken = await db.select()
+      .from(schema.accountTokens)
+      .where(eq(schema.accountTokens.id, token.id))
+      .get();
+    expect(latestToken?.enabled).toBe(false);
+
+    const availability = await db.select()
+      .from(schema.tokenModelAvailability)
+      .where(and(
+        eq(schema.tokenModelAvailability.tokenId, token.id),
+        eq(schema.tokenModelAvailability.modelName, 'gpt-5.5'),
+      ))
+      .get();
+    expect(availability?.routeEnabled).toBe(true);
+    expect(await db.select().from(schema.routeChannels).all()).toHaveLength(0);
+  });
+
+  it('preserves route-enabled model state when saving skipped image-only test result', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'image-only',
+      token: 'sk-image-only',
+      source: 'manual',
+      enabled: true,
+      isDefault: true,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+
+    await db.insert(schema.tokenModelAvailability).values({
+      tokenId: token.id,
+      modelName: 'gpt-image-2',
+      available: true,
+      routeEnabled: true,
+      message: '已点亮',
+      checkedAt: '2026-06-20T00:00:00.000Z',
+    }).run();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/account-tokens/models/test-skipped',
+      payload: {
+        results: [{
+          tokenId: token.id,
+          model: 'gpt-image-2',
+          message: '图片模型跳过文本测活',
+          checkedAt: '2026-06-21T00:00:00.000Z',
+        }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).not.toHaveProperty('routeRebuild');
+
+    const availability = await db.select()
+      .from(schema.tokenModelAvailability)
+      .where(and(
+        eq(schema.tokenModelAvailability.tokenId, token.id),
+        eq(schema.tokenModelAvailability.modelName, 'gpt-image-2'),
+      ))
+      .get();
+    expect(availability?.available).toBe(false);
+    expect(availability?.routeEnabled).toBe(true);
+    expect(await db.select().from(schema.routeChannels).all()).toHaveLength(0);
+  });
+
+  it('runs health checks for multiple configured models and enables successful models for routing', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'multi-health-check',
+      token: 'sk-multi-health-check',
+      source: 'manual',
+      enabled: false,
+      isDefault: false,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+
+    const configResponse = await app.inject({
+      method: 'PUT',
+      url: `/api/account-tokens/${token.id}/health-check`,
+      payload: {
+        enabled: true,
+        models: ['gpt-5.5', 'gpt-5.4', 'gpt-5.5'],
+        intervalMinutes: 30,
+      },
+    });
+
+    expect(configResponse.statusCode).toBe(200);
+    expect(configResponse.json().token.healthCheckModel).toBe('gpt-5.5, gpt-5.4');
+
+    await db.insert(schema.tokenModelAvailability).values([
+      {
+        tokenId: token.id,
+        modelName: 'gpt-5.5',
+        available: false,
+        routeEnabled: false,
+        message: '待测活',
+        checkedAt: '2026-06-20T00:00:00.000Z',
+      },
+      {
+        tokenId: token.id,
+        modelName: 'gpt-5.4',
+        available: false,
+        routeEnabled: false,
+        message: '待测活',
+        checkedAt: '2026-06-20T00:00:00.000Z',
+      },
+    ]).run();
+
+    testAccountTokenModelAvailabilityMock.mockImplementation(async (options: { model: string; tokenIds: number[] }) => ({
+      model: options.model,
+      total: options.tokenIds.length,
+      results: options.tokenIds.map((tokenId) => ({
+        tokenId,
+        model: options.model,
+        available: options.model === 'gpt-5.5',
+        message: options.model === 'gpt-5.5' ? '请求成功' : '请求失败',
+        responseText: options.model === 'gpt-5.5' ? '我是测试模型' : null,
+        httpStatus: options.model === 'gpt-5.5' ? 200 : 500,
+        latencyMs: 10,
+        checkedAt: '2026-06-21T00:00:00.000Z',
+      })),
+    }));
+
+    const runResponse = await app.inject({
+      method: 'POST',
+      url: `/api/account-tokens/${token.id}/health-check/run`,
+    });
+
+    expect(runResponse.statusCode).toBe(200);
+    const body = runResponse.json();
+    expect(body.result).toMatchObject({
+      available: true,
+      message: '成功 1/2：gpt-5.5',
+    });
+    expect(body.results).toEqual([
+      expect.objectContaining({ model: 'gpt-5.5', available: true }),
+      expect.objectContaining({ model: 'gpt-5.4', available: false }),
+    ]);
+    expect(testAccountTokenModelAvailabilityMock).toHaveBeenCalledTimes(2);
+
+    const latestToken = await db.select()
+      .from(schema.accountTokens)
+      .where(eq(schema.accountTokens.id, token.id))
+      .get();
+    expect(latestToken?.enabled).toBe(false);
+    expect(latestToken?.healthCheckLastAvailable).toBe(true);
+    expect(latestToken?.healthCheckLastMessage).toBe('成功 1/2：gpt-5.5');
+
+    const availability = await db.select()
+      .from(schema.tokenModelAvailability)
+      .where(eq(schema.tokenModelAvailability.tokenId, token.id))
+      .all();
+    expect(availability).toEqual(expect.arrayContaining([
+      expect.objectContaining({ modelName: 'gpt-5.5', routeEnabled: true }),
+      expect.objectContaining({ modelName: 'gpt-5.4', available: false, routeEnabled: false }),
     ]));
   });
 });

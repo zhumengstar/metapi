@@ -31,7 +31,6 @@ async function listRefreshableTokenIds(): Promise<number[]> {
     .innerJoin(schema.accounts, eq(schema.accountTokens.accountId, schema.accounts.id))
     .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
     .where(and(
-      eq(schema.accountTokens.enabled, true),
       eq(schema.accountTokens.valueStatus, ACCOUNT_TOKEN_VALUE_STATUS_READY),
       eq(schema.accounts.status, 'active'),
     ))
@@ -79,6 +78,14 @@ function queueAccountTokenModelRefreshTask() {
       title: '自动刷新账号令牌模型列表',
       dedupeKey: 'account-token-model-refresh-hourly',
       notifyOnFailure: false,
+      successMessage: (currentTask) => {
+        const result = currentTask.result as Awaited<ReturnType<typeof executeAccountTokenModelRefreshPass>> | null;
+        if (!result) return '自动刷新账号令牌模型列表已完成';
+        const failureSummary = result.failures.length > 0
+          ? `\n失败明细：${result.failures.map((item) => `#${item.tokenId} ${item.message}`).join('；')}`
+          : '';
+        return `自动刷新账号令牌模型列表完成：总数 ${result.total}，刷新 ${result.refreshed}，失败 ${result.failed}${failureSummary}`;
+      },
     },
     async () => {
       const startedAt = Date.now();
@@ -98,6 +105,9 @@ export function startAccountTokenModelRefreshScheduler(intervalMs = ACCOUNT_TOKE
     queueAccountTokenModelRefreshTask();
   }, safeIntervalMs);
   tokenModelRefreshTimer.unref?.();
+  setTimeout(() => {
+    queueAccountTokenModelRefreshTask();
+  }, 5_000).unref?.();
   console.log(`[Scheduler] Account token model refresh interval: ${Math.round(safeIntervalMs / 60000)}m`);
   return {
     enabled: true,
