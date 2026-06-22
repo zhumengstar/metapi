@@ -572,6 +572,106 @@ describe('account tokens sync routes with site status', () => {
     expect(fetchModelPricingCatalogMock).not.toHaveBeenCalled();
   });
 
+  it('matches stored group ratios when the token group adds an unambiguous suffix', async () => {
+    const { site, account } = await seedAccount({ siteStatus: 'active' });
+    await db.insert(schema.tokenGroupPricing).values([
+      {
+        siteId: site.id,
+        accountId: account.id,
+        sourceKey: `account:${account.id}`,
+        group: 'AWS',
+        ratio: 3,
+        source: 'upstream',
+        pricingAvailable: true,
+      },
+      {
+        siteId: site.id,
+        accountId: account.id,
+        sourceKey: `account:${account.id}`,
+        group: 'AWS-Platform',
+        ratio: 2,
+        source: 'upstream',
+        pricingAvailable: true,
+      },
+    ]).run();
+    await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'AWS-Platform-夜间',
+      token: 'sk-aws-platform-night',
+      source: 'sync',
+      enabled: true,
+      isDefault: true,
+      tokenGroup: 'AWS-Platform-夜间',
+      valueStatus: 'ready' as any,
+    }).run();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/account-tokens',
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([
+      expect.objectContaining({
+        name: 'AWS-Platform-夜间',
+        groupRatio: 2,
+        groupRatioAvailable: true,
+        tokenGroupRatioGroup: 'AWS-Platform',
+      }),
+    ]);
+  });
+
+  it('does not guess stored group ratios when the longest suffix match is ambiguous', async () => {
+    const { site, account } = await seedAccount({ siteStatus: 'active' });
+    await db.insert(schema.tokenGroupPricing).values([
+      {
+        siteId: site.id,
+        accountId: account.id,
+        sourceKey: `account:${account.id}`,
+        group: 'Plus',
+        groupName: 'Plus',
+        ratio: 0.1,
+        source: 'upstream',
+        pricingAvailable: true,
+      },
+      {
+        siteId: site.id,
+        accountId: account.id,
+        sourceKey: `account:${account.id}`,
+        group: 'plus',
+        groupName: 'plus',
+        ratio: 0.2,
+        source: 'upstream',
+        pricingAvailable: true,
+      },
+    ]).run();
+    await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'Plus夜间',
+      token: 'sk-plus-night',
+      source: 'sync',
+      enabled: true,
+      isDefault: true,
+      tokenGroup: 'Plus夜间',
+      valueStatus: 'ready' as any,
+    }).run();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/account-tokens',
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([
+      expect.objectContaining({
+        name: 'Plus夜间',
+        groupRatio: null,
+        groupRatioAvailable: false,
+        tokenGroupRatioGroup: null,
+      }),
+    ]);
+  });
+
   it('deletes local tokens that are no longer present upstream and removes their route channels', async () => {
     const { account } = await seedAccount({ siteStatus: 'active' });
     const staleToken = await db.insert(schema.accountTokens).values({
@@ -1383,6 +1483,62 @@ describe('account tokens sync routes with site status', () => {
       groups: ['default', 'vip'],
     });
     expect(getUserGroupsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not synthesize a default group when upstream groups are empty', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    getUserGroupsMock.mockResolvedValue([]);
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/account-tokens/groups/${account.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      groups: [],
+    });
+    expect(getUserGroupsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps token group empty when an upstream default-named token has no explicit group', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    getApiTokensMock.mockResolvedValue([
+      { name: 'default', key: 'sk-upstream-default-without-group', enabled: true },
+    ]);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/account-tokens/sync/${account.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      synced: true,
+      created: 1,
+      updated: 0,
+    });
+
+    const tokenRows = await db.select()
+      .from(schema.accountTokens)
+      .where(eq(schema.accountTokens.accountId, account.id))
+      .all();
+    expect(tokenRows).toHaveLength(1);
+    expect(tokenRows[0]).toMatchObject({
+      name: 'default',
+      source: 'sync',
+      tokenGroup: null,
+    });
+
+    const listResponse = await app.inject({
+      method: 'GET',
+      url: '/api/account-tokens',
+    });
+    expect(listResponse.statusCode).toBe(200);
+    const listed = listResponse.json() as Array<{ id: number; tokenGroup?: string | null }>;
+    expect(listed.find((item) => item.id === tokenRows[0].id)?.tokenGroup).toBeNull();
   });
 
   it('deletes upstream token before removing local token', async () => {

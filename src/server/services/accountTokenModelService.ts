@@ -21,6 +21,8 @@ export type AccountTokenModelsResult = {
   tokenId: number;
   refreshed: boolean;
   source: 'cache' | 'upstream';
+  modelDiscoveryStatus: 'cache' | 'ok' | 'empty';
+  modelDiscoveryMessage: string | null;
   models: Array<{ name: string; routeEnabled: boolean }>;
   modelNames: string[];
   modelCount: number;
@@ -121,11 +123,14 @@ function buildResult(
   checkedAt: string | null,
   source: 'cache' | 'upstream',
   refreshed: boolean,
+  discovery?: { status?: AccountTokenModelsResult['modelDiscoveryStatus']; message?: string | null },
 ): AccountTokenModelsResult {
   return {
     tokenId: row.account_tokens.id,
     refreshed,
     source,
+    modelDiscoveryStatus: discovery?.status || (source === 'cache' ? 'cache' : 'ok'),
+    modelDiscoveryMessage: discovery?.message || null,
     models,
     modelNames: models.map((model) => model.name),
     modelCount: models.length,
@@ -211,5 +216,7 @@ export async function getAccountTokenModels(
   }
 
   const refreshedCache = await loadCachedAccountTokenModels(tokenId);
-  return buildResult(row, refreshedCache.models, checkedAt, 'upstream', true);
+  return buildResult(row, refreshedCache.models, checkedAt, 'upstream', true, modelNames.length > 0
+    ? { status: 'ok', message: null }
+    : { status: 'empty', message: '上游模型列表为空，已自动禁用该令牌并移除路由通道' });
 }

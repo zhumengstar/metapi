@@ -2,6 +2,7 @@
 import { db, schema } from '../db/index.js';
 import { getInsertedRowId } from '../db/insertHelpers.js';
 import { getCredentialModeFromExtraConfig } from './accountExtraConfig.js';
+import { normalizeTokenGroupLookupKey } from './tokenGroupNames.js';
 import {
   hasManualTokenModelTestRecord,
   isSuccessfulManualTokenModelTest,
@@ -139,35 +140,21 @@ export function isUsableAccountToken(token: AccountTokenRow | null | undefined):
   return token.enabled === true && isReadyAccountToken(token);
 }
 
-function normalizeTokenGroup(value: string | null | undefined, tokenName?: string | null): string | null {
+function normalizeTokenGroup(value: string | null | undefined): string | null {
   const explicit = (value || '').trim();
   if (explicit.length > 0) return explicit;
-
-  const name = (tokenName || '').trim();
-  if (!name) return null;
-  const normalized = name.toLowerCase();
-  if (normalized === 'default' || normalized === '默认' || /^default($|[-_\s])/.test(normalized)) {
-    return 'default';
-  }
-  if (/^token-\d+$/.test(normalized)) return null;
-  return name;
+  return null;
 }
 
 function normalizePricingLookupKey(value: string | null | undefined): string | null {
-  const trimmed = (value || '').trim();
-  if (!trimmed) return null;
-  return trimmed
-    .replace(/[（(]/g, '-')
-    .replace(/[）)]/g, '')
-    .replace(/[–—_/\s]+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '')
-    .toLowerCase();
+  const normalized = normalizeTokenGroupLookupKey(value);
+  return normalized || null;
 }
 
 type GroupRatioMappingEntry = {
   ratio: number;
   group: string | null;
+  ambiguous?: boolean;
 };
 
 type AccountTokenGroupPreferenceEntry = {
@@ -186,7 +173,7 @@ function setGroupRatioMapping(
   options: { preserveExisting?: boolean } = {},
 ) {
   const entry = { ratio, group };
-  const exact = normalizeTokenGroup(value, null);
+  const exact = normalizeTokenGroup(value);
   if (exact) {
     const key = `${accountId}:${exact}`;
     if (!options.preserveExisting || !map.has(key)) map.set(key, entry);
@@ -194,7 +181,12 @@ function setGroupRatioMapping(
   const lookup = normalizePricingLookupKey(value);
   if (lookup) {
     const key = `${accountId}:lookup:${lookup}`;
-    if (!options.preserveExisting || !map.has(key)) map.set(key, entry);
+    const existing = map.get(key);
+    if (existing && (existing.ratio !== entry.ratio || existing.group !== entry.group)) {
+      map.set(key, { ...existing, ambiguous: true });
+    } else if (!options.preserveExisting || !existing) {
+      map.set(key, entry);
+    }
   }
 }
 
@@ -203,8 +195,9 @@ function resolveGroupRatioMapping(
   accountId: number,
   candidates: Array<string | null | undefined>,
 ): GroupRatioMappingEntry | undefined {
+  const lookupCandidates: string[] = [];
   for (const candidate of candidates) {
-    const exact = normalizeTokenGroup(candidate, null);
+    const exact = normalizeTokenGroup(candidate);
     if (exact) {
       const value = map.get(`${accountId}:${exact}`);
       if (value !== undefined) return value;
@@ -212,7 +205,35 @@ function resolveGroupRatioMapping(
     const lookup = normalizePricingLookupKey(candidate);
     if (lookup) {
       const value = map.get(`${accountId}:lookup:${lookup}`);
-      if (value !== undefined) return value;
+      if (value !== undefined && !value.ambiguous) return value;
+      if (!lookupCandidates.includes(lookup)) lookupCandidates.push(lookup);
+    }
+  }
+
+  const lookupPrefix = `${accountId}:lookup:`;
+  for (const lookup of lookupCandidates) {
+    let longestPrefixLength = 0;
+    const longestMatches: GroupRatioMappingEntry[] = [];
+    for (const [key, value] of map.entries()) {
+      if (!key.startsWith(lookupPrefix)) continue;
+      const storedLookup = key.slice(lookupPrefix.length);
+      if (storedLookup.length < 4 || lookup.length <= storedLookup.length) continue;
+      if (!lookup.startsWith(storedLookup)) continue;
+      if (value.ambiguous) continue;
+      if (storedLookup.length > longestPrefixLength) {
+        longestPrefixLength = storedLookup.length;
+        longestMatches.length = 0;
+      }
+      if (storedLookup.length === longestPrefixLength) {
+        longestMatches.push(value);
+      }
+    }
+    const uniqueMatches = new Map<string, GroupRatioMappingEntry>();
+    for (const match of longestMatches) {
+      uniqueMatches.set(`${match.group || ''}:${match.ratio}`, match);
+    }
+    if (uniqueMatches.size === 1) {
+      return Array.from(uniqueMatches.values())[0];
     }
   }
   return undefined;
@@ -229,7 +250,7 @@ export function normalizeAccountTokenGroupRatioKey(ratio: number | null | undefi
 }
 
 function buildAccountTokenGroupPreferenceKey(accountId: number, group: string | null | undefined, ratio: number | null | undefined): string {
-  return `${accountId}:${normalizeTokenGroup(group, null) || 'default'}:${normalizeAccountTokenGroupRatioKey(ratio)}`;
+  return `${accountId}:${normalizeTokenGroup(group) || 'default'}:${normalizeAccountTokenGroupRatioKey(ratio)}`;
 }
 
 async function loadStoredGroupRatioMappings(accountId?: number): Promise<Map<string, GroupRatioMappingEntry>> {
@@ -247,8 +268,8 @@ async function loadStoredGroupRatioMappings(accountId?: number): Promise<Map<str
   const ratioByAccountAndGroup = new Map<string, GroupRatioMappingEntry>();
   for (const row of rows) {
     if (!isStoredPricingAvailable(row.pricingAvailable)) continue;
-    const group = normalizeTokenGroup(row.group, null);
-    const groupName = normalizeTokenGroup(row.groupName, null);
+    const group = normalizeTokenGroup(row.group);
+    const groupName = normalizeTokenGroup(row.groupName);
     const ratio = Number(row.ratio);
     if (!row.accountId || !group || !Number.isFinite(ratio) || ratio <= 0) continue;
     const displayGroup = groupName || group;
@@ -266,7 +287,7 @@ async function loadAccountTokenGroupPreferences(accountId?: number): Promise<Map
 
   const preferences = new Map<string, AccountTokenGroupPreferenceEntry>();
   for (const row of rows) {
-    const group = normalizeTokenGroup(row.tokenGroup, null) || 'default';
+    const group = normalizeTokenGroup(row.tokenGroup) || 'default';
     const ratio = Number(row.groupRatio);
     const normalizedRatio = Number.isFinite(ratio) && ratio > 0 ? ratio : null;
     const ratioKey = row.groupRatioKey || normalizeAccountTokenGroupRatioKey(normalizedRatio);
@@ -306,7 +327,7 @@ export async function resolveAccountTokenManualEnabledPreference(input: {
 }): Promise<boolean | undefined> {
   const accountId = Number(input.accountId);
   if (!Number.isInteger(accountId) || accountId <= 0) return undefined;
-  const group = normalizeTokenGroup(input.tokenGroup, input.tokenName) || 'default';
+  const group = normalizeTokenGroup(input.tokenGroup) || 'default';
   const resolvedRatio = input.groupRatio !== undefined
     ? (Number.isFinite(Number(input.groupRatio)) && Number(input.groupRatio) > 0 ? Number(input.groupRatio) : null)
     : (await resolveAccountTokenGroupRatio(accountId, [group, input.tokenName, input.tokenGroup]))?.ratio ?? null;
@@ -332,7 +353,7 @@ export async function upsertAccountTokenGroupEnabledPreference(input: {
   const accountId = Number(input.accountId);
   if (!Number.isInteger(accountId) || accountId <= 0) return null;
 
-  const group = normalizeTokenGroup(input.tokenGroup, input.tokenName) || 'default';
+  const group = normalizeTokenGroup(input.tokenGroup) || 'default';
   const resolvedRatio = input.groupRatio !== undefined
     ? (Number.isFinite(Number(input.groupRatio)) && Number(input.groupRatio) > 0 ? Number(input.groupRatio) : null)
     : (await resolveAccountTokenGroupRatio(accountId, [group, input.tokenName, input.tokenGroup]))?.ratio ?? null;
@@ -380,8 +401,8 @@ async function loadAccountGroupNameAliases(accountId: number): Promise<Map<strin
     .all();
   const aliases = new Map<string, string>();
   for (const row of rows) {
-    const group = normalizeTokenGroup(row.group, null);
-    const groupName = normalizeTokenGroup(row.groupName, null);
+    const group = normalizeTokenGroup(row.group);
+    const groupName = normalizeTokenGroup(row.groupName);
     if (!group || !groupName || group === groupName) continue;
     aliases.set(group, groupName);
   }
@@ -395,8 +416,8 @@ function sameTokenGroupWithAliases(
   rightGroup: string | null | undefined,
   rightName: string | null | undefined,
 ): boolean {
-  const left = normalizeTokenGroup(leftGroup, leftName);
-  const right = normalizeTokenGroup(rightGroup, rightName);
+  const left = normalizeTokenGroup(leftGroup);
+  const right = normalizeTokenGroup(rightGroup);
   if (left === right) return true;
   return !!left && !!right && (aliases.get(left) === right || aliases.get(right) === left);
 }
@@ -413,8 +434,8 @@ function sameTokenNameWithAliases(
   if (left === right) return true;
   if (!left || !right) return false;
 
-  const leftGroupName = normalizeTokenGroup(leftGroup, leftName);
-  const rightGroupName = normalizeTokenGroup(rightGroup, rightName);
+  const leftGroupName = normalizeTokenGroup(leftGroup);
+  const rightGroupName = normalizeTokenGroup(rightGroup);
   return aliases.get(left) === right
     || aliases.get(right) === left
     || (!!leftGroupName && aliases.get(leftGroupName) === right)
@@ -427,7 +448,7 @@ function sameTokenGroup(
   rightGroup: string | null | undefined,
   rightName: string | null | undefined,
 ): boolean {
-  return normalizeTokenGroup(leftGroup, leftName) === normalizeTokenGroup(rightGroup, rightName);
+  return normalizeTokenGroup(leftGroup) === normalizeTokenGroup(rightGroup);
 }
 
 async function updateAccountApiToken(accountId: number, tokenValue: string | null) {
@@ -464,7 +485,7 @@ export async function ensureDefaultTokenForAccount(
   const normalizedToken = normalizeTokenValue(tokenValue);
   if (!normalizedToken) return null;
   if (isMaskedTokenValue(normalizedToken)) return null;
-  const tokenGroup = normalizeTokenGroup(options?.tokenGroup, options?.name) || 'default';
+  const tokenGroup = normalizeTokenGroup(options?.tokenGroup);
 
   const now = new Date().toISOString();
   const tokens = await db.select()
@@ -585,7 +606,7 @@ export async function syncTokensFromUpstream(accountId: number, upstreamTokens: 
     const tokenValue = normalizeTokenValue(upstream.key);
     if (!tokenValue) continue;
     const tokenName = normalizeTokenName(upstream.name, index);
-    const tokenGroup = normalizeTokenGroup(upstream.tokenGroup, tokenName);
+    const tokenGroup = normalizeTokenGroup(upstream.tokenGroup);
     const groupRatio = resolveGroupRatioMapping(ratioByAccountAndGroup, accountId, [
       tokenGroup,
       tokenName,
@@ -881,7 +902,7 @@ export async function listTokensWithRelations(accountId?: number) {
     .filter((row) => !isApiKeyConnection(row.accounts))
     .map((row) => {
     const { token, ...tokenMeta } = row.account_tokens;
-    const group = normalizeTokenGroup(row.account_tokens.tokenGroup, row.account_tokens.name) || 'default';
+    const group = normalizeTokenGroup(row.account_tokens.tokenGroup);
     const groupRatioEntry = resolveGroupRatioMapping(ratioByAccountAndGroup, row.accounts.id, [
       group,
       row.account_tokens.name,

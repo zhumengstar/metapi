@@ -99,18 +99,13 @@ function isSiteDisabled(status?: string | null): boolean {
 
 function normalizeGroup(value: unknown): string {
   const trimmed = String(value || '').trim();
-  return trimmed || 'default';
+  return trimmed;
 }
 
-function normalizeTokenGroup(value: unknown, tokenName?: string | null): string {
+function normalizeTokenGroup(value: unknown): string {
   const explicit = String(value || '').trim();
   if (explicit) return explicit;
-  const name = String(tokenName || '').trim();
-  if (!name) return 'default';
-  const normalized = name.toLowerCase();
-  if (normalized === 'default' || normalized === '默认' || /^default($|[-_\s])/.test(normalized)) return 'default';
-  if (/^token-\d+$/.test(normalized)) return 'default';
-  return name;
+  return '';
 }
 
 function uniqueGroups(groups: unknown[]): string[] {
@@ -118,20 +113,8 @@ function uniqueGroups(groups: unknown[]): string[] {
   return Array.from(new Set(normalized)).sort((a, b) => a.localeCompare(b));
 }
 
-function supportsImplicitDefaultGroup(platform?: string | null): boolean {
-  return String(platform || '').toLowerCase() !== 'sub2api';
-}
-
-function defaultGroupsForPlatform(platform?: string | null): string[] {
-  return supportsImplicitDefaultGroup(platform) ? ['default'] : [];
-}
-
-function defaultGroupDetailsForPlatform(platform?: string | null): GroupDetail[] {
-  return supportsImplicitDefaultGroup(platform) ? [{ group: 'default' }] : [];
-}
-
 function filterGroupsForPlatform(groups: string[], platform?: string | null): string[] {
-  if (supportsImplicitDefaultGroup(platform)) return groups;
+  if (String(platform || '').toLowerCase() !== 'sub2api') return groups;
   return groups.filter((group) => group !== 'default');
 }
 
@@ -157,8 +140,8 @@ async function fetchAccountGroups(row: AccountWithSite, refresh: boolean): Promi
 }> {
   const localGroups = uniqueGroups(row.localTokenGroups || []);
   const localDetails = localGroups.map((group) => ({ group }));
-  const fallbackGroups = localGroups.length > 0 ? localGroups : defaultGroupsForPlatform(row.sites.platform);
-  const fallbackDetails = localDetails.length > 0 ? localDetails : defaultGroupDetailsForPlatform(row.sites.platform);
+  const fallbackGroups = localGroups;
+  const fallbackDetails = localDetails;
 
   if (!refresh) {
     return {
@@ -192,8 +175,8 @@ async function fetchAccountGroups(row: AccountWithSite, refresh: boolean): Promi
     const details = normalizeGroupDetails(upstreamDetails);
     const groups = uniqueGroups(details.map((item) => item.group));
     return {
-      groups: groups.length > 0 ? groups : defaultGroupsForPlatform(row.sites.platform),
-      details: details.length > 0 ? details : defaultGroupDetailsForPlatform(row.sites.platform),
+      groups,
+      details,
       source: 'upstream',
     };
   } catch (error: any) {
@@ -751,7 +734,7 @@ async function loadTokenGroupsContext() {
       id: row.account_tokens.id,
       name: row.account_tokens.name,
       tokenMasked: maskToken(row.account_tokens.token, row.sites.platform),
-      group: normalizeTokenGroup(row.account_tokens.tokenGroup, row.account_tokens.name),
+      group: normalizeTokenGroup(row.account_tokens.tokenGroup),
       modelNames: tokenModelNamesByTokenId.get(row.account_tokens.id) || [],
       enabled: row.account_tokens.enabled === true,
       isDefault: row.account_tokens.isDefault === true,

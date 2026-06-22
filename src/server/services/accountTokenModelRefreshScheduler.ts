@@ -45,6 +45,7 @@ async function listRefreshableTokenIds(): Promise<number[]> {
 async function executeAccountTokenModelRefreshPass() {
   const tokenIds = await listRefreshableTokenIds();
   let refreshed = 0;
+  const empty: Array<{ tokenId: number; message: string }> = [];
   const failed: Array<{ tokenId: number; message: string }> = [];
 
   for (let offset = 0; offset < tokenIds.length; offset += ACCOUNT_TOKEN_MODEL_REFRESH_CONCURRENCY) {
@@ -54,6 +55,12 @@ async function executeAccountTokenModelRefreshPass() {
       const tokenId = batch[index]!;
       if (result.status === 'fulfilled') {
         if (result.value?.refreshed) refreshed++;
+        if (result.value?.modelDiscoveryStatus === 'empty') {
+          empty.push({
+            tokenId,
+            message: result.value.modelDiscoveryMessage || '上游模型列表为空',
+          });
+        }
         return;
       }
       failed.push({
@@ -66,6 +73,8 @@ async function executeAccountTokenModelRefreshPass() {
   return {
     total: tokenIds.length,
     refreshed,
+    empty: empty.length,
+    emptyModels: empty.slice(0, 20),
     failed: failed.length,
     failures: failed.slice(0, 20),
   };
@@ -81,17 +90,20 @@ function queueAccountTokenModelRefreshTask() {
       successMessage: (currentTask) => {
         const result = currentTask.result as Awaited<ReturnType<typeof executeAccountTokenModelRefreshPass>> | null;
         if (!result) return '自动刷新账号令牌模型列表已完成';
+        const emptySummary = result.emptyModels.length > 0
+          ? `\n空模型明细：${result.emptyModels.map((item) => `#${item.tokenId} ${item.message}`).join('；')}`
+          : '';
         const failureSummary = result.failures.length > 0
           ? `\n失败明细：${result.failures.map((item) => `#${item.tokenId} ${item.message}`).join('；')}`
           : '';
-        return `自动刷新账号令牌模型列表完成：总数 ${result.total}，刷新 ${result.refreshed}，失败 ${result.failed}${failureSummary}`;
+        return `自动刷新账号令牌模型列表完成：总数 ${result.total}，刷新 ${result.refreshed}，空模型 ${result.empty}，失败 ${result.failed}${emptySummary}${failureSummary}`;
       },
     },
     async () => {
       const startedAt = Date.now();
       const result = await executeAccountTokenModelRefreshPass();
       console.log(
-        `[account-token-model-refresh] complete: total=${result.total}, refreshed=${result.refreshed}, failed=${result.failed}, durationMs=${Date.now() - startedAt}`,
+        `[account-token-model-refresh] complete: total=${result.total}, refreshed=${result.refreshed}, empty=${result.empty}, failed=${result.failed}, durationMs=${Date.now() - startedAt}`,
       );
       return result;
     },

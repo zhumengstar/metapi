@@ -1982,7 +1982,7 @@ export async function accountTokensRoutes(app: FastifyInstance) {
         () => adapter.getUserGroups(site.url, account.accessToken, platformUserId),
       );
       const normalized = Array.from(new Set((groups || []).map((item) => String(item || '').trim()).filter(Boolean)));
-      return { success: true, groups: normalized.length > 0 ? normalized : ['default'] };
+      return { success: true, groups: normalized };
     } catch (error: any) {
       return reply.code(502).send({
         success: false,

@@ -122,6 +122,7 @@ const ACCOUNT_SELECT_SEARCH_PLACEHOLDER = '筛选账号（名称 / 站点）';
 const DEFAULT_BATCH_TEST_MODEL = 'gpt-5.5';
 const IMAGE_MODEL_TEST_SKIPPED_MESSAGE = '只有图片模型，未进行聊天可用性测试';
 const TOKEN_RATIO_FILTER_STORAGE_KEY = 'metapi.tokens.maxGroupRatioFilter';
+const UNGROUPED_TOKEN_LABEL = '未分组';
 const DEFAULT_TOKEN_SORT_RULES: TokenSortRule[] = [
   { key: 'status', order: 'desc' },
   { key: 'ratio', order: 'asc' },
@@ -174,6 +175,11 @@ function formatGroupRatio(value?: number | null) {
   if (!Number.isFinite(value)) return '';
   const normalized = Number(value);
   return `${Number.isInteger(normalized) ? normalized : normalized.toFixed(3).replace(/0+$/, '').replace(/\.$/, '')}x`;
+}
+
+function formatTokenGroupLabel(value?: string | null) {
+  const group = String(value || '').trim();
+  return group || UNGROUPED_TOKEN_LABEL;
 }
 
 function readStoredTokenRatioFilter() {
@@ -404,7 +410,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
   const initialCreateForm = {
     accountId: 0,
     name: '',
-    group: 'default',
+    group: '',
     unlimitedQuota: true,
     remainQuota: '',
     expiredTime: '',
@@ -466,13 +472,13 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
   const [editForm, setEditForm] = useState({
     name: '',
     token: '',
-    group: 'default',
+    group: '',
     enabled: true,
     isDefault: false,
   });
-  const [groupOptions, setGroupOptions] = useState<string[]>(['default']);
+  const [groupOptions, setGroupOptions] = useState<string[]>([]);
   const [groupLoading, setGroupLoading] = useState(false);
-  const [editGroupOptions, setEditGroupOptions] = useState<string[]>(['default']);
+  const [editGroupOptions, setEditGroupOptions] = useState<string[]>([]);
   const [editGroupLoading, setEditGroupLoading] = useState(false);
   const rowRefs = useRef<Map<number, HTMLTableRowElement>>(new Map());
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -543,7 +549,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
   useEffect(() => {
     if (!showAdd || !form.accountId) {
       setGroupLoading(false);
-      setGroupOptions(['default']);
+      setGroupOptions([]);
       return;
     }
 
@@ -556,18 +562,18 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
           ? res.groups.map((item: any) => String(item || '').trim()).filter(Boolean)
           : [];
         const normalized = Array.from(new Set(groups));
-        const nextOptions = normalized.length > 0 ? normalized : ['default'];
+        const nextOptions = normalized;
         setGroupOptions(nextOptions);
         setForm((prev) => {
-          if (nextOptions.includes(prev.group)) return prev;
-          return { ...prev, group: nextOptions[0] };
+          if (!prev.group || nextOptions.includes(prev.group)) return prev;
+          return { ...prev, group: '' };
         });
       })
       .catch((error: any) => {
         if (cancelled) return;
-        setGroupOptions(['default']);
-        setForm((prev) => ({ ...prev, group: 'default' }));
-        toast.error(error?.message || '拉取分组失败，已回退 default');
+        setGroupOptions([]);
+        setForm((prev) => ({ ...prev, group: '' }));
+        toast.error(error?.message || '拉取分组失败');
       })
       .finally(() => {
         if (cancelled) return;
@@ -582,11 +588,11 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
   useEffect(() => {
     if (!editingToken?.id || !editingToken?.accountId) {
       setEditGroupLoading(false);
-      setEditGroupOptions(['default']);
+      setEditGroupOptions([]);
       return;
     }
 
-    const currentGroup = (editingToken?.tokenGroup || '').trim() || 'default';
+    const currentGroup = (editingToken?.tokenGroup || '').trim();
     let cancelled = false;
     setEditGroupLoading(true);
     api.getAccountTokenGroups(editingToken.accountId)
@@ -597,14 +603,14 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
           : [];
         const normalized = Array.from(new Set(groups));
         setEditGroupOptions((current) => {
-          const next = normalized.length > 0 ? normalized : ['default'];
-          if (next.includes(currentGroup)) return next;
+          const next = normalized;
+          if (!currentGroup || next.includes(currentGroup)) return next;
           return [...next, currentGroup];
         });
       })
       .catch((error: any) => {
         if (cancelled) return;
-        setEditGroupOptions((current) => (current.includes(currentGroup) ? current : [...current, currentGroup]));
+        setEditGroupOptions((current) => (!currentGroup || current.includes(currentGroup) ? current : [...current, currentGroup]));
         toast.error(error?.message || '拉取分组失败，已保留当前分组');
       })
       .finally(() => {
@@ -764,7 +770,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     setForm((prev) => ({
       ...prev,
       accountId: fallbackAccount.id,
-      group: 'default',
+      group: '',
     }));
 
     if (!preferredAccount) {
@@ -1223,7 +1229,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     setEditForm({
       name: token?.name || '',
       token: '',
-      group: (token?.tokenGroup || '').trim() || 'default',
+      group: (token?.tokenGroup || '').trim(),
       enabled: isMaskedPendingToken(token) ? true : token?.enabled !== false,
       isDefault: !!token?.isDefault,
     });
@@ -1262,7 +1268,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     setEditForm({
       name: '',
       token: '',
-      group: 'default',
+      group: '',
       enabled: true,
       isDefault: false,
     });
@@ -1279,17 +1285,20 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       const res = await api.updateAccountToken(editingToken.id, {
         name: editForm.name.trim() || editingToken.name,
         token: editForm.token.trim() || undefined,
-        group: editForm.group || 'default',
+        group: editForm.group.trim() || undefined,
         enabled: editForm.enabled,
         isDefault: editForm.isDefault,
       });
       const latest = res?.token || {};
+      const latestTokenGroup = typeof latest.tokenGroup === 'string' ? latest.tokenGroup.trim() : '';
+      const editedTokenGroup = editForm.group.trim();
+      const nextTokenGroup = latestTokenGroup || editedTokenGroup || null;
       patchTokenRow(editingToken.id, {
         name: latest.name ?? editForm.name.trim() ?? editingToken.name,
-        tokenGroup: latest.tokenGroup ?? editForm.group ?? 'default',
+        tokenGroup: nextTokenGroup,
         enabled: latest.enabled ?? editForm.enabled,
         ...buildManualEnabledPreferencePatch(
-          { ...editingToken, tokenGroup: latest.tokenGroup ?? editForm.group ?? editingToken.tokenGroup },
+          { ...editingToken, tokenGroup: nextTokenGroup ?? editingToken.tokenGroup },
           latest.enabled ?? editForm.enabled,
         ),
         isDefault: latest.isDefault ?? editForm.isDefault,
@@ -1845,7 +1854,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       await api.addAccountToken({
         accountId: form.accountId,
         name: form.name,
-        group: form.group || 'default',
+        group: form.group.trim() || undefined,
         unlimitedQuota: form.unlimitedQuota,
         remainQuota,
         expiredTime: form.expiredTime || undefined,
@@ -2653,13 +2662,13 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                 <div>
                   <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>分组</div>
                   <ModernSelect
-                    value={editForm.group || 'default'}
-                    onChange={(nextValue) => setEditForm((prev) => ({ ...prev, group: nextValue || 'default' }))}
-                    options={(editGroupOptions.length > 0 ? editGroupOptions : ['default']).map((group) => ({
+                    value={editForm.group || ''}
+                    onChange={(nextValue) => setEditForm((prev) => ({ ...prev, group: nextValue }))}
+                    options={editGroupOptions.map((group) => ({
                       value: group,
                       label: group,
                     }))}
-                    placeholder={editGroupLoading ? '分组加载中...' : '选择分组'}
+                    placeholder={editGroupLoading ? '分组加载中...' : '无分组'}
                     disabled={editGroupLoading}
                   />
                 </div>
@@ -2866,11 +2875,11 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
             <ModernSelect
               value={form.group || ''}
               onChange={(nextValue) => setForm((prev) => ({ ...prev, group: nextValue }))}
-              options={(groupOptions.length > 0 ? groupOptions : ['default']).map((group) => ({
+              options={groupOptions.map((group) => ({
                 value: group,
                 label: group,
               }))}
-              placeholder={groupLoading ? '分组加载中...' : '选择分组'}
+              placeholder={groupLoading ? '分组加载中...' : '无分组'}
               disabled={!form.accountId || groupLoading}
             />
           </div>
@@ -3010,7 +3019,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                     )}
                   >
                     <MobileField label="账号" value={token.account?.username || `account-${token.accountId}`} />
-                    <MobileField label="分组" value={token.tokenGroup || 'default'} />
+                    <MobileField label="分组" value={formatTokenGroupLabel(token.tokenGroup)} />
                     <MobileField label="倍率" value={formatGroupRatio(token.groupRatio) || '-'} />
                     <MobileField
                       label="状态"
@@ -3139,7 +3148,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                       <span className="token-account-name">{token.account?.username || `account-${token.accountId}`}</span>
                       <span className="token-account-meta">#{token.account?.id || token.accountId}</span>
                     </td>
-                    <td>{token.tokenGroup || 'default'}</td>
+                    <td>{formatTokenGroupLabel(token.tokenGroup)}</td>
                     <td>
                       <span style={{ color: token.groupRatioAvailable ? 'var(--color-primary)' : 'var(--color-text-muted)', fontWeight: token.groupRatioAvailable ? 700 : 400 }}>
                         {formatGroupRatio(token.groupRatio)}
