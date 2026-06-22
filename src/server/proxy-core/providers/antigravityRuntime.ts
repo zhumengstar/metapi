@@ -4,6 +4,7 @@ export function shouldUseAntigravityStreamAction(modelName: string): boolean {
   const normalizedModel = modelName.toLowerCase();
   return normalizedModel.includes('claude')
     || normalizedModel.includes('gemini-3-pro')
+    || normalizedModel.includes('gemini-3.1-pro')
     || normalizedModel.includes('gemini-3.1-flash-image');
 }
 

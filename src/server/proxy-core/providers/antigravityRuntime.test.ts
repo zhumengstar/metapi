@@ -15,6 +15,8 @@ describe('shouldUseAntigravityStreamAction', () => {
   it('returns true for Gemini special-model names', () => {
     expect(shouldUseAntigravityStreamAction('gemini-3-pro')).toBe(true);
     expect(shouldUseAntigravityStreamAction('gemini-3-pro-latest')).toBe(true);
+    expect(shouldUseAntigravityStreamAction('gemini-3.1-pro-high')).toBe(true);
+    expect(shouldUseAntigravityStreamAction('gemini-3.1-pro-low')).toBe(true);
     expect(shouldUseAntigravityStreamAction('gemini-3.1-flash-image')).toBe(true);
   });
 
@@ -32,6 +34,8 @@ describe('resolveAntigravityProviderAction', () => {
 
   it('routes Gemini special-model non-stream requests through streamGenerateContent', () => {
     expect(resolveAntigravityProviderAction('generateContent', false, 'gemini-3-pro-latest'))
+      .toBe('streamGenerateContent');
+    expect(resolveAntigravityProviderAction('generateContent', false, 'gemini-3.1-pro-high'))
       .toBe('streamGenerateContent');
     expect(resolveAntigravityProviderAction('generateContent', false, 'gemini-3.1-flash-image'))
       .toBe('streamGenerateContent');

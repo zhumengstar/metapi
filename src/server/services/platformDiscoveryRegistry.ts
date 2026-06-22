@@ -104,6 +104,19 @@ function extractAntigravityModelIds(payload: unknown): string[] {
   });
 }
 
+function isRoutableAntigravityModelName(modelName: string): boolean {
+  const normalizedModel = modelName.trim().toLowerCase();
+  if (!normalizedModel) return false;
+  // Antigravity discovery may include internal chat session ids. They are
+  // accepted by discovery but rejected by generateContent as model names.
+  if (/^chat_\d+$/.test(normalizedModel)) return false;
+  return true;
+}
+
+function normalizeAntigravityDiscoveredModels(models: string[]): string[] {
+  return normalizeDiscoveredModels(models).filter(isRoutableAntigravityModelName);
+}
+
 function buildAntigravityDiscoveryBaseUrls(siteUrl: string): string[] {
   const seen = new Set<string>();
   return [
@@ -256,7 +269,7 @@ export async function discoverAntigravityModelsFromCloud(input: {
         }
 
         const payload = await response.json();
-        const models = normalizeDiscoveredModels(extractAntigravityModelIds(payload));
+        const models = normalizeAntigravityDiscoveredModels(extractAntigravityModelIds(payload));
         if (models.length > 0) {
           return models;
         }
