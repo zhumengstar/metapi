@@ -77,10 +77,12 @@ describe('TokenRouter selection scoring', () => {
     mockedCatalogRoutingCost.mockReturnValue(null);
     config.proxySessionChannelConcurrencyLimit = originalProxySessionChannelConcurrencyLimit;
     config.proxySessionChannelQueueWaitMs = originalProxySessionChannelQueueWaitMs;
+    await db.delete(schema.proxyLogs).run();
     await db.delete(schema.routeChannels).run();
     await db.delete(schema.tokenRoutes).run();
     await db.delete(schema.settings).run();
     await db.delete(schema.tokenModelAvailability).run();
+    await db.delete(schema.tokenGroupPricing).run();
     await db.delete(schema.accountTokens).run();
     await db.delete(schema.accounts).run();
     await db.delete(schema.sites).run();
@@ -129,11 +131,12 @@ describe('TokenRouter selection scoring', () => {
     }).returning().get();
   }
 
-  async function createToken(accountId: number, name: string) {
+  async function createToken(accountId: number, name: string, options: { tokenGroup?: string | null } = {}) {
     const token = await db.insert(schema.accountTokens).values({
       accountId,
       name,
       token: `token-${name}-${nextId()}`,
+      tokenGroup: options.tokenGroup ?? null,
       enabled: true,
       isDefault: false,
     }).returning().get();
@@ -146,8 +149,11 @@ describe('TokenRouter selection scoring', () => {
       'gpt-5.3',
       'gpt-5.4',
       'gpt-5.4-sticky-failover',
+      'gpt-5.5-cache-scoring',
+      'gpt-5.5-group-pricing',
       'gpt-5.5-input-cost',
       'gpt-5.5-input-stats',
+      'gpt-5.5-slightly-cheaper',
       'claude-4-sonnet',
       'claude-haiku-4-5-20251001',
       'claude-opus-4-6',
@@ -624,9 +630,9 @@ describe('TokenRouter selection scoring', () => {
       priority: 0,
       weight: 10,
       enabled: true,
-      successCount: 10,
+      successCount: 1,
       failCount: 0,
-      totalCost: 0.01,
+      totalCost: 0.1,
       totalInputTokens: 1_000,
     }).returning().get();
 
@@ -639,6 +645,178 @@ describe('TokenRouter selection scoring', () => {
     expect(decision.selectedChannelId).toBe(efficientChannel.id);
     expect((efficientCandidate?.probability || 0)).toBeGreaterThan(wastefulCandidate?.probability || 0);
     expect(efficientCandidate?.reason || '').toContain('输入/M=');
+  });
+
+  it('uses token group pricing ratio for stable_first low-cost probability scoring', async () => {
+    config.routingWeights = {
+      baseWeightFactor: 1,
+      valueScoreFactor: 0,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+    };
+
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.5-group-pricing',
+      routingStrategy: 'stable_first',
+      enabled: true,
+    }).returning().get();
+
+    const observedSite = await createSite('group-pricing-observed');
+    const observedAccount = await createAccount(observedSite.id, 'group-pricing-observed-user');
+    const observedToken = await createToken(observedAccount.id, 'group-pricing-observed-token');
+    const observedChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: observedAccount.id,
+      tokenId: observedToken.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+      successCount: 10,
+      failCount: 0,
+      totalInputTokens: 93_930_218,
+      totalCost: 1,
+    }).returning().get();
+
+    const lowCostSite = await createSite('group-pricing-low');
+    const lowCostAccount = await createAccount(lowCostSite.id, 'group-pricing-low-user');
+    const lowCostToken = await createToken(lowCostAccount.id, 'group-pricing-low-token', {
+      tokenGroup: 'Plus牛逼中转0.04',
+    });
+    const lowCostChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: lowCostAccount.id,
+      tokenId: lowCostToken.id,
+      priority: 1,
+      weight: 10,
+      enabled: true,
+      successCount: 0,
+      failCount: 0,
+      totalInputTokens: 0,
+      totalCost: 0,
+    }).returning().get();
+
+    await db.insert(schema.tokenGroupPricing).values({
+      siteId: lowCostSite.id,
+      accountId: lowCostAccount.id,
+      sourceKey: `account:${lowCostAccount.id}`,
+      group: 'Plus牛逼中转0.04',
+      groupName: 'Plus牛逼中转0.04',
+      ratio: 0.04,
+      source: 'upstream',
+      pricingAvailable: true,
+      modelCount: 1,
+    }).run();
+
+    const decision = await new TokenRouter().explainSelection('gpt-5.5-group-pricing');
+    const observedCandidate = decision.candidates.find((candidate) => candidate.channelId === observedChannel.id);
+    const lowCostCandidate = decision.candidates.find((candidate) => candidate.channelId === lowCostChannel.id);
+
+    expect(observedCandidate).toBeTruthy();
+    expect(lowCostCandidate).toBeTruthy();
+    expect(decision.selectedChannelId).toBe(lowCostChannel.id);
+    expect((lowCostCandidate?.probability || 0)).toBeGreaterThan(observedCandidate?.probability || 0);
+    expect(lowCostCandidate?.reason || '').toContain('成本=分组倍率:0.04');
+    expect(lowCostCandidate?.reason || '').toContain('低成本分=');
+  });
+
+  it('uses cache hit rate as part of stable_first probability scoring', async () => {
+    config.routingWeights = {
+      baseWeightFactor: 1,
+      valueScoreFactor: 0,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+    };
+
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.5-cache-scoring',
+      routingStrategy: 'stable_first',
+      enabled: true,
+    }).returning().get();
+
+    const cachedSite = await createSite('cache-scoring-cached');
+    const cachedAccount = await createAccount(cachedSite.id, 'cache-scoring-cached-user');
+    const cachedToken = await createToken(cachedAccount.id, 'cache-scoring-cached-token');
+    const cachedChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: cachedAccount.id,
+      tokenId: cachedToken.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+      successCount: 10,
+      failCount: 0,
+      totalInputTokens: 1_000_000,
+      totalCost: 0.1,
+    }).returning().get();
+
+    const uncachedSite = await createSite('cache-scoring-uncached');
+    const uncachedAccount = await createAccount(uncachedSite.id, 'cache-scoring-uncached-user');
+    const uncachedToken = await createToken(uncachedAccount.id, 'cache-scoring-uncached-token');
+    const uncachedChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: uncachedAccount.id,
+      tokenId: uncachedToken.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+      successCount: 10,
+      failCount: 0,
+      totalInputTokens: 1_000_000,
+      totalCost: 0.1,
+    }).returning().get();
+
+    await db.insert(schema.proxyLogs).values([
+      {
+        routeId: route.id,
+        channelId: cachedChannel.id,
+        accountId: cachedAccount.id,
+        modelRequested: 'gpt-5.5-cache-scoring',
+        modelActual: 'gpt-5.5-cache-scoring',
+        status: 'success',
+        firstByteLatencyMs: 40,
+        promptTokens: 100,
+        completionTokens: 10,
+        totalTokens: 110,
+        estimatedCost: 0.01,
+        billingDetails: JSON.stringify({
+          usage: {
+            cacheReadTokens: 900,
+            billablePromptTokens: 100,
+          },
+        }),
+      },
+      {
+        routeId: route.id,
+        channelId: uncachedChannel.id,
+        accountId: uncachedAccount.id,
+        modelRequested: 'gpt-5.5-cache-scoring',
+        modelActual: 'gpt-5.5-cache-scoring',
+        status: 'success',
+        firstByteLatencyMs: 400,
+        promptTokens: 1000,
+        completionTokens: 10,
+        totalTokens: 1010,
+        estimatedCost: 0.01,
+        billingDetails: JSON.stringify({
+          usage: {
+            cacheReadTokens: 0,
+            billablePromptTokens: 1000,
+          },
+        }),
+      },
+    ]).run();
+
+    const decision = await new TokenRouter().explainSelection('gpt-5.5-cache-scoring');
+    const cachedCandidate = decision.candidates.find((candidate) => candidate.channelId === cachedChannel.id);
+    const uncachedCandidate = decision.candidates.find((candidate) => candidate.channelId === uncachedChannel.id);
+
+    expect(cachedCandidate).toBeTruthy();
+    expect(uncachedCandidate).toBeTruthy();
+    expect((cachedCandidate?.probability || 0)).toBeGreaterThan(uncachedCandidate?.probability || 0);
+    expect(cachedCandidate?.reason || '').toContain('缓存命中=90.0%');
+    expect(cachedCandidate?.reason || '').toContain('首字延迟=40');
   });
 
   it('uses runtime-configured fallback unit cost when observed and configured costs are missing', async () => {
@@ -1692,7 +1870,188 @@ describe('TokenRouter selection scoring', () => {
     expect(decision.summary.join(' ')).toContain('稳定成功 50 次再重新评估低价');
   });
 
-  it('stable_first switches after five consecutive failures and reevaluates low cost after fifty successes', async () => {
+  it('stable_first immediately switches sticky traffic to a lower-cost channel', async () => {
+    config.routingWeights = {
+      baseWeightFactor: 1,
+      valueScoreFactor: 0,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+    };
+
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.5-input-cost',
+      routingStrategy: 'stable_first',
+      enabled: true,
+    }).returning().get();
+
+    const oldSite = await createSite('sticky-old-cost');
+    const oldAccount = await createAccount(oldSite.id, 'sticky-old-user');
+    const oldToken = await createToken(oldAccount.id, 'sticky-old-token', { tokenGroup: 'old-cost-1x' });
+    const oldChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: oldAccount.id,
+      tokenId: oldToken.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+      successCount: 20,
+      failCount: 0,
+      totalInputTokens: 1_000_000,
+      totalCost: 2,
+    }).returning().get();
+
+    const lowCostSite = await createSite('sticky-low-cost');
+    const lowCostAccount = await createAccount(lowCostSite.id, 'sticky-low-user');
+    const lowCostToken = await createToken(lowCostAccount.id, 'sticky-low-token', { tokenGroup: 'low-cost-0.25x' });
+    const lowCostChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: lowCostAccount.id,
+      tokenId: lowCostToken.id,
+      priority: 1,
+      weight: 10,
+      enabled: true,
+      successCount: 10,
+      failCount: 0,
+      totalInputTokens: 1_000_000,
+      totalCost: 0.5,
+    }).returning().get();
+
+    await db.insert(schema.tokenGroupPricing).values([
+      {
+        siteId: oldSite.id,
+        accountId: oldAccount.id,
+        sourceKey: `account:${oldAccount.id}`,
+        group: 'old-cost-1x',
+        groupName: 'old-cost-1x',
+        ratio: 1,
+        source: 'upstream',
+        pricingAvailable: true,
+        modelCount: 1,
+      },
+      {
+        siteId: lowCostSite.id,
+        accountId: lowCostAccount.id,
+        sourceKey: `account:${lowCostAccount.id}`,
+        group: 'low-cost-0.25x',
+        groupName: 'low-cost-0.25x',
+        ratio: 0.25,
+        source: 'upstream',
+        pricingAvailable: true,
+        modelCount: 1,
+      },
+    ]).run();
+
+    tokenRouterTestUtils.rememberStableFirstStickyChannelForKey(
+      `${route.id}:gpt-5.5-input-cost`,
+      oldChannel.id,
+    );
+
+    const router = new TokenRouter();
+    const selected = await router.selectChannel('gpt-5.5-input-cost');
+    const decision = await router.explainSelection('gpt-5.5-input-cost');
+
+    const stickyState = tokenRouterTestUtils.getStableFirstStickyChannelForKey(`${route.id}:gpt-5.5-input-cost`);
+    expect(selected?.channel.id).toBe(lowCostChannel.id);
+    expect(decision.selectedChannelId).toBe(lowCostChannel.id);
+    expect(stickyState).toMatchObject({
+      channelId: lowCostChannel.id,
+      mode: 'low_cost_trial',
+      successThreshold: 100,
+    });
+    expect(decision.summary.join(' ')).toContain('优先试跑 100 次');
+  });
+
+  it('stable_first tries a slightly lower-cost channel even before sticky reevaluation', async () => {
+    config.routingWeights = {
+      baseWeightFactor: 1,
+      valueScoreFactor: 0,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+    };
+
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.5-slightly-cheaper',
+      routingStrategy: 'stable_first',
+      enabled: true,
+    }).returning().get();
+
+    const oldSite = await createSite('sticky-slight-old-cost');
+    const oldAccount = await createAccount(oldSite.id, 'sticky-slight-old-user');
+    const oldToken = await createToken(oldAccount.id, 'sticky-slight-old-token', { tokenGroup: 'old-cost-1x' });
+    const oldChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: oldAccount.id,
+      tokenId: oldToken.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+      successCount: 20,
+      failCount: 0,
+      totalInputTokens: 1_000_000,
+      totalCost: 1,
+    }).returning().get();
+
+    const lowCostSite = await createSite('sticky-slight-low-cost');
+    const lowCostAccount = await createAccount(lowCostSite.id, 'sticky-slight-low-user');
+    const lowCostToken = await createToken(lowCostAccount.id, 'sticky-slight-low-token', { tokenGroup: 'low-cost-0.995x' });
+    const lowCostChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: lowCostAccount.id,
+      tokenId: lowCostToken.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+      successCount: 20,
+      failCount: 0,
+      totalInputTokens: 1_000_000,
+      totalCost: 0.995,
+    }).returning().get();
+
+    await db.insert(schema.tokenGroupPricing).values([
+      {
+        siteId: oldSite.id,
+        accountId: oldAccount.id,
+        sourceKey: `account:${oldAccount.id}`,
+        group: 'old-cost-1x',
+        groupName: 'old-cost-1x',
+        ratio: 1,
+        source: 'upstream',
+        pricingAvailable: true,
+        modelCount: 1,
+      },
+      {
+        siteId: lowCostSite.id,
+        accountId: lowCostAccount.id,
+        sourceKey: `account:${lowCostAccount.id}`,
+        group: 'low-cost-0.995x',
+        groupName: 'low-cost-0.995x',
+        ratio: 0.995,
+        source: 'upstream',
+        pricingAvailable: true,
+        modelCount: 1,
+      },
+    ]).run();
+
+    tokenRouterTestUtils.rememberStableFirstStickyChannelForKey(
+      `${route.id}:gpt-5.5-slightly-cheaper`,
+      oldChannel.id,
+    );
+
+    const router = new TokenRouter();
+    const selected = await router.selectChannel('gpt-5.5-slightly-cheaper');
+    const stickyState = tokenRouterTestUtils.getStableFirstStickyChannelForKey(`${route.id}:gpt-5.5-slightly-cheaper`);
+
+    expect(selected?.channel.id).toBe(lowCostChannel.id);
+    expect(stickyState).toMatchObject({
+      channelId: lowCostChannel.id,
+      mode: 'low_cost_trial',
+      successThreshold: 100,
+    });
+  });
+
+  it('stable_first switches after five consecutive failures and immediately returns to recovered lower cost', async () => {
     config.routingWeights = {
       baseWeightFactor: 1,
       valueScoreFactor: 0,
@@ -1709,7 +2068,7 @@ describe('TokenRouter selection scoring', () => {
 
     const cheapSite = await createSite('sticky-cheap');
     const cheapAccount = await createAccount(cheapSite.id, 'sticky-user-cheap');
-    const cheapToken = await createToken(cheapAccount.id, 'sticky-token-cheap');
+    const cheapToken = await createToken(cheapAccount.id, 'sticky-token-cheap', { tokenGroup: 'cheap-0.25x' });
     const cheapChannel = await db.insert(schema.routeChannels).values({
       routeId: route.id,
       accountId: cheapAccount.id,
@@ -1722,7 +2081,7 @@ describe('TokenRouter selection scoring', () => {
 
     const fallbackSite = await createSite('sticky-fallback');
     const fallbackAccount = await createAccount(fallbackSite.id, 'sticky-user-fallback');
-    const fallbackToken = await createToken(fallbackAccount.id, 'sticky-token-fallback');
+    const fallbackToken = await createToken(fallbackAccount.id, 'sticky-token-fallback', { tokenGroup: 'fallback-1x' });
     const fallbackChannel = await db.insert(schema.routeChannels).values({
       routeId: route.id,
       accountId: fallbackAccount.id,
@@ -1732,11 +2091,30 @@ describe('TokenRouter selection scoring', () => {
       enabled: true,
     }).returning().get();
 
-    mockedCatalogRoutingCost.mockImplementation(({ accountId }) => {
-      if (accountId === cheapAccount.id) return 0.25;
-      if (accountId === fallbackAccount.id) return 1;
-      return null;
-    });
+    await db.insert(schema.tokenGroupPricing).values([
+      {
+        siteId: cheapSite.id,
+        accountId: cheapAccount.id,
+        sourceKey: `account:${cheapAccount.id}`,
+        group: 'cheap-0.25x',
+        groupName: 'cheap-0.25x',
+        ratio: 0.25,
+        source: 'upstream',
+        pricingAvailable: true,
+        modelCount: 1,
+      },
+      {
+        siteId: fallbackSite.id,
+        accountId: fallbackAccount.id,
+        sourceKey: `account:${fallbackAccount.id}`,
+        group: 'fallback-1x',
+        groupName: 'fallback-1x',
+        ratio: 1,
+        source: 'upstream',
+        pricingAvailable: true,
+        modelCount: 1,
+      },
+    ]).run();
 
     const router = new TokenRouter();
     expect((await router.selectChannel('gpt-5.4-sticky-failover'))?.channel.id).toBe(cheapChannel.id);
@@ -1758,18 +2136,18 @@ describe('TokenRouter selection scoring', () => {
     expect((await router.selectChannel('gpt-5.4-sticky-failover'))?.channel.id).toBe(fallbackChannel.id);
 
     await router.recordProbeSuccess(cheapChannel.id, 320, 'gpt-5.4-sticky-failover');
-    expect((await router.selectChannel('gpt-5.4-sticky-failover'))?.channel.id).toBe(fallbackChannel.id);
+    expect((await router.selectChannel('gpt-5.4-sticky-failover'))?.channel.id).toBe(cheapChannel.id);
 
     for (let index = 0; index < 49; index += 1) {
       await router.recordSuccess(fallbackChannel.id, 300, 1, 'gpt-5.4-sticky-failover');
     }
-    expect((await router.selectChannel('gpt-5.4-sticky-failover'))?.channel.id).toBe(fallbackChannel.id);
+    expect((await router.selectChannel('gpt-5.4-sticky-failover'))?.channel.id).toBe(cheapChannel.id);
 
     await router.recordSuccess(fallbackChannel.id, 300, 1, 'gpt-5.4-sticky-failover');
     const decision = await router.explainSelection('gpt-5.4-sticky-failover');
 
     expect(decision.selectedChannelId).toBe(cheapChannel.id);
-    expect(decision.summary.join(' ')).toContain('稳定成功 50 次再重新评估低价');
+    expect(decision.summary.join(' ')).toContain('优先试跑 100 次');
   });
 
   it('caps the stable_first rotation cache size', () => {

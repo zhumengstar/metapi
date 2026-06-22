@@ -38,6 +38,23 @@ function toStringList(value: unknown): string[] {
   return [];
 }
 
+function normalizeRoutingWeightsForRuntime(
+  routingWeights: Partial<typeof config.routingWeights>,
+): Partial<typeof config.routingWeights> {
+  const usesLegacyDefaultWeights =
+    routingWeights.costWeight === 0.4
+    && routingWeights.balanceWeight === 0.3
+    && routingWeights.usageWeight === 0.3;
+  if (!usesLegacyDefaultWeights) return routingWeights;
+
+  return {
+    ...routingWeights,
+    costWeight: 0.7,
+    balanceWeight: 0.15,
+    usageWeight: 0.15,
+  };
+}
+
 export function applyRuntimeSettings(settingsMap: Map<string, string>) {
   const authToken = parseSettingFromMap<string>(settingsMap, 'auth_token');
   if (typeof authToken === 'string' && authToken) config.authToken = authToken;
@@ -201,9 +218,10 @@ export function applyRuntimeSettings(settingsMap: Map<string, string>) {
 
   const routingWeights = parseSettingFromMap<Partial<typeof config.routingWeights>>(settingsMap, 'routing_weights');
   if (routingWeights && typeof routingWeights === 'object') {
+    const normalizedRoutingWeights = normalizeRoutingWeightsForRuntime(routingWeights);
     config.routingWeights = {
       ...config.routingWeights,
-      ...routingWeights,
+      ...normalizedRoutingWeights,
     };
   }
 

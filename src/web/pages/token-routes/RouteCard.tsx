@@ -643,10 +643,17 @@ function RouteCardInner({
     (routeDecision?.candidates || []).map((c) => [c.channelId, c]),
   );
 
-  const priorityBuckets = buildPriorityBuckets(channels || []);
-  const priorityRailSections = buildPriorityRailSections(channels || []);
   const [activeDragChannelId, setActiveDragChannelId] = useState<number | null>(null);
   const [activeDragRowWidth, setActiveDragRowWidth] = useState<number | null>(null);
+  const shouldSortStableFirstBucketsByProbability = route.routingStrategy === 'stable_first' && activeDragChannelId == null;
+  const probabilityByChannelId = new Map<number, number>(
+    (routeDecision?.candidates || []).map((candidate) => [candidate.channelId, Number(candidate.probability || 0)]),
+  );
+  const priorityBuckets = buildPriorityBuckets(channels || [], {
+    probabilityByChannelId,
+    sortWithinBucketByProbability: shouldSortStableFirstBucketsByProbability,
+  });
+  const priorityRailSections = buildPriorityRailSections(channels || []);
   const useDragOverlay = compact && detailPanel;
 
   const clearDragState = () => {

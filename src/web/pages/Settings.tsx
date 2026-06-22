@@ -273,9 +273,9 @@ function parsePayloadRulesFromDrafts(
 const defaultWeights: RoutingWeights = {
   baseWeightFactor: 0.5,
   valueScoreFactor: 0.5,
-  costWeight: 0.4,
-  balanceWeight: 0.3,
-  usageWeight: 0.3,
+  costWeight: 0.7,
+  balanceWeight: 0.15,
+  usageWeight: 0.15,
 };
 
 function getDialectDefaults(dialect: DbDialect) {

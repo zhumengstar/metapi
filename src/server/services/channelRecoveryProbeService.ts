@@ -6,6 +6,7 @@ import { proxyChannelCoordinator } from './proxyChannelCoordinator.js';
 import { probeRuntimeModel } from './runtimeModelProbe.js';
 import { tokenRouter } from './tokenRouter.js';
 import { isExactTokenRouteModelPattern } from '../../shared/tokenRoutePatterns.js';
+import { enableSuccessfulHealthCheckModelsForRouting } from './accountTokenHealthCheckService.js';
 
 type RecoveryProbeSource = 'cooldown' | 'active';
 
@@ -23,7 +24,7 @@ const CHANNEL_RECOVERY_PROBE_TIMEOUT_MS = 12_000;
 // Keep recovery probes conservative so they do not look like bulk health checks to upstream providers.
 const CHANNEL_RECOVERY_PROBE_CONCURRENCY = 1;
 const CHANNEL_RECOVERY_MAX_BATCH = 4;
-const CHANNEL_RECOVERY_COOLDOWN_RECHECK_MS = 30_000;
+const CHANNEL_RECOVERY_COOLDOWN_RECHECK_MS = 10 * 60_000;
 const CHANNEL_RECOVERY_ACTIVE_RECHECK_MS = 5 * 60_000;
 
 let recoveryProbeSchedulerTimer: ReturnType<typeof setInterval> | null = null;
@@ -216,10 +217,58 @@ async function runRecoveryProbeCandidate(candidate: RecoveryProbeCandidate, nowM
       tokenValue: candidate.tokenValue,
       timeoutMs: CHANNEL_RECOVERY_PROBE_TIMEOUT_MS,
     });
-    if (result.status === 'supported') {
-      await tokenRouter.recordProbeSuccess(
-        candidate.channelId,
-        result.latencyMs ?? 0,
+	    if (result.status === 'supported') {
+	      const checkedAt = new Date().toISOString();
+	      if (candidate.channelId > 0) {
+	        const channel = await db.select()
+	          .from(schema.routeChannels)
+	          .where(eq(schema.routeChannels.id, candidate.channelId))
+	          .get();
+	        if (channel?.tokenId) {
+	          await enableSuccessfulHealthCheckModelsForRouting([{
+	            tokenId: channel.tokenId,
+	            model: candidate.modelName,
+	            available: true,
+	            message: '请求成功',
+	            httpStatus: 200,
+	            responseText: '后台复检成功',
+	            latencyMs: result.latencyMs ?? null,
+	            checkedAt,
+	          }], { autoEnableRoute: true });
+	          await db.update(schema.accountTokens)
+	            .set({
+	              healthCheckLastRunAt: checkedAt,
+	              healthCheckNextRunAt: new Date(Date.parse(checkedAt) + 10 * 60_000).toISOString(),
+	              healthCheckLastAvailable: true,
+	              healthCheckLastMessage: '后台复检成功',
+	              healthCheckLastLatencyMs: result.latencyMs ?? null,
+	              updatedAt: checkedAt,
+	            })
+	            .where(eq(schema.accountTokens.id, channel.tokenId))
+	            .run();
+	        } else {
+	          await db.insert(schema.modelAvailability)
+	            .values({
+	              accountId: candidate.account.id,
+	              modelName: candidate.modelName,
+	              available: true,
+	              latencyMs: result.latencyMs ?? null,
+	              checkedAt,
+	            })
+	            .onConflictDoUpdate({
+	              target: [schema.modelAvailability.accountId, schema.modelAvailability.modelName],
+	              set: {
+	                available: true,
+	                latencyMs: result.latencyMs ?? null,
+	                checkedAt,
+	              },
+	            })
+	            .run();
+	        }
+	      }
+	      await tokenRouter.recordProbeSuccess(
+	        candidate.channelId,
+	        result.latencyMs ?? 0,
         candidate.modelName,
       );
     }

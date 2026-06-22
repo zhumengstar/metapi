@@ -375,8 +375,8 @@ export function SortableChannelRow({
 
   const renderDecisionFormula = (compactFormula: boolean) => {
     if (!decisionReasonText && decisionBreakdownRows.length === 0) return null;
-    const visibleRows = decisionBreakdownRows.slice(0, compactFormula ? 4 : 6);
-    const hiddenCount = Math.max(0, decisionBreakdownRows.length - visibleRows.length);
+    const visibleRows = decisionBreakdownRows;
+    const hiddenCount = 0;
     const strategyLabel = decisionBreakdown?.strategy === 'stable_first'
       ? '稳定优先'
       : (decisionBreakdown?.strategy === 'round_robin' ? '轮询' : '权重计算');
@@ -471,11 +471,17 @@ export function SortableChannelRow({
                 textOverflow: 'ellipsis',
                 whiteSpace: 'nowrap',
               };
+              const formulaCell: CSSProperties = {
+                ...cellBase,
+                whiteSpace: 'normal',
+                overflowWrap: 'anywhere',
+                lineHeight: 1.45,
+              };
               return (
                 <div key={rowKey} style={{ display: 'contents' }}>
                   <span style={{ ...cellBase, color: rowColor, fontWeight: 700 }}>{row.metric}</span>
                   <span style={cellBase}>{row.value}</span>
-                  <span style={cellBase}>{row.formula}</span>
+                  <span style={formulaCell}>{row.formula}</span>
                   <span style={{ ...cellBase, color: rowColor, fontVariantNumeric: 'tabular-nums' }}>{row.weight}</span>
                   <span style={{ ...cellBase, fontVariantNumeric: 'tabular-nums' }}>{row.contribution}</span>
                 </div>

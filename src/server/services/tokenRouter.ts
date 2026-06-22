@@ -1,4 +1,4 @@
-﻿import { and, eq, inArray, isNull } from 'drizzle-orm';
+﻿import { and, desc, eq, inArray, isNull } from 'drizzle-orm';
 import { db, schema } from '../db/index.js';
 import { upsertSetting } from '../db/upsertSetting.js';
 import {
@@ -17,6 +17,10 @@ import { type DownstreamRoutingPolicy, EMPTY_DOWNSTREAM_ROUTING_POLICY } from '.
 import { isUsableAccountToken } from './accountTokenService.js';
 import { isSuccessfulManualTokenModelTest } from './tokenModelAvailabilityStatus.js';
 import { isImageGenerationModel } from './modelType.js';
+import {
+  readBillingUsageToken,
+  resolveBillablePromptTokensForCacheStats,
+} from './billingUsageCacheStats.js';
 import { getOauthInfoFromAccount } from './oauth/oauthAccount.js';
 import { parseCodexQuotaResetHint } from './oauth/quota.js';
 import {
@@ -47,6 +51,8 @@ interface RouteMatch {
     account: typeof schema.accounts.$inferSelect;
     site: typeof schema.sites.$inferSelect;
     token: typeof schema.accountTokens.$inferSelect | null;
+    tokenGroupPricingRatio: number | null;
+    cacheStats: RouteChannelCacheStats;
     tokenModelAvailability: typeof schema.tokenModelAvailability.$inferSelect | null;
     routeUnit: OAuthRouteUnitSummary | null;
     routeUnitMembers: Array<{
@@ -59,6 +65,22 @@ interface RouteMatch {
 }
 
 type RouteChannelCandidate = RouteMatch['channels'][number];
+
+type RouteChannelCacheStats = {
+  promptTokens: number;
+  cacheReadTokens: number;
+  sampleCount: number;
+  firstByteLatencyTotalMs: number;
+  firstByteLatencySampleCount: number;
+};
+
+const EMPTY_ROUTE_CHANNEL_CACHE_STATS: RouteChannelCacheStats = {
+  promptTokens: 0,
+  cacheReadTokens: 0,
+  sampleCount: 0,
+  firstByteLatencyTotalMs: 0,
+  firstByteLatencySampleCount: 0,
+};
 
 interface SelectedChannel {
   channel: typeof schema.routeChannels.$inferSelect;
@@ -103,7 +125,15 @@ const MAX_FAILURE_BACKOFF_SEC = 30 * 24 * 60 * 60;
 const MIN_EFFECTIVE_UNIT_COST = 1e-6;
 const ROUND_ROBIN_FAILURE_THRESHOLD = 3;
 const STABLE_FIRST_FAILURE_THRESHOLD = 5;
+const CHANNEL_MODEL_AVAILABILITY_FAILURE_THRESHOLD = 3;
 const STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD = 50;
+const STABLE_FIRST_LOW_COST_TRIAL_SUCCESS_THRESHOLD = 100;
+const STABLE_FIRST_LOW_COST_SWITCH_RATIO = 1;
+const STABLE_FIRST_COST_WEIGHT = 0.6;
+const STABLE_FIRST_SUCCESS_WEIGHT = 0.15;
+const STABLE_FIRST_INPUT_COST_WEIGHT = 0.1;
+const STABLE_FIRST_CACHE_HIT_WEIGHT = 0.05;
+const STABLE_FIRST_FIRST_BYTE_WEIGHT = 0.1;
 const ROUND_ROBIN_COOLDOWN_LEVELS_SEC = [0, 10 * 60, 60 * 60, 24 * 60 * 60] as const;
 const STAGED_FAILURE_COOLDOWN_STRATEGIES = new Set<RouteRoutingStrategy>(['round_robin', 'stable_first']);
 const STABLE_FIRST_SITE_SCORE_RATIO = 0.92;
@@ -238,6 +268,10 @@ function formatDecisionPercent(value: number, digits = 1): string {
   return `${(value * 100).toFixed(digits)}%`;
 }
 
+function formatDecisionCalculationValue(value: number, digits = 4): string {
+  return formatDecisionNumber(value, digits);
+}
+
 function buildWeightedScoreBreakdown(params: {
   mode: WeightedSelectionMode;
   probability: number;
@@ -369,6 +403,18 @@ function buildStableFirstScoreBreakdown(params: {
   unitCost: number;
   costSourceText: string;
   inputCostText: string;
+  costScore: number;
+  inputCostScore: number;
+  cacheHitRate: number | null;
+  cacheHitScore: number;
+  firstByteLatencyMs: number | null;
+  firstByteLatencyScore: number;
+  weightedScore: number;
+  minSelectionCost: number;
+  selectionCost: number;
+  minInputCost: number;
+  inputCost: number;
+  siteSplitMultiplier: number;
   recentSuccessRate: number;
   recentSampleCount: number;
   recentConfidence: number;
@@ -381,39 +427,66 @@ function buildStableFirstScoreBreakdown(params: {
   consecutiveFailText: string;
   stickyProgressText: string;
 }): RouteDecisionScoreBreakdown {
-  const siteSplit = 1 / Math.max(1, params.siteChannels);
-  const costScore = 1 / Math.max(params.unitCost, MIN_EFFECTIVE_UNIT_COST);
-  const successMultiplier = Math.max(0.05, params.stableFirstSuccessRate);
+  const siteSplit = resolveStableFirstSiteSplitMultiplier(params.siteChannels);
+  const successScore = Math.max(0.05, params.stableFirstSuccessRate);
   const rows: RouteDecisionScoreBreakdownRow[] = [
     {
-      metric: '低价成本',
+      metric: '低成本',
       value: `${params.costSourceText}:${formatDecisionNumber(params.unitCost, 6)}`,
-      formula: `1 / ${formatDecisionNumber(params.unitCost, 6)}`,
-      weight: '成本优先',
-      contribution: formatDecisionNumber(costScore),
+      formula: `${formatDecisionCalculationValue(params.minSelectionCost, 6)} / ${formatDecisionCalculationValue(params.selectionCost, 6)} = ${formatDecisionCalculationValue(params.costScore, 4)}`,
+      weight: formatDecisionPercent(STABLE_FIRST_COST_WEIGHT, 0),
+      contribution: formatDecisionNumber(params.costScore, 4),
       tone: params.costSourceText === '默认' ? 'warning' : 'positive',
     },
     {
-      metric: '输入/M',
-      value: params.inputCostText,
-      formula: '优先使用每 M 输入实际成本，没有则用综合成本',
-      weight: '排序主键',
-      contribution: params.inputCostText,
+      metric: '请求成功率',
+      value: formatDecisionPercent(params.stableFirstSuccessRate),
+      formula: `${formatDecisionPercent(params.recentSuccessRate)} x ${formatDecisionCalculationValue(params.recentConfidence, 3)} + ${params.historicalSuccessRateText} x ${formatDecisionCalculationValue(1 - params.recentConfidence, 3)} = ${formatDecisionPercent(params.stableFirstSuccessRate)}`,
+      weight: formatDecisionPercent(STABLE_FIRST_SUCCESS_WEIGHT, 0),
+      contribution: formatDecisionNumber(successScore, 4),
+      tone: successScore >= 0.9 ? 'positive' : 'warning',
     },
     {
-      metric: '综合成功率',
-      value: formatDecisionPercent(params.stableFirstSuccessRate),
-      formula: '近期成功率按样本置信度融合历史成功率',
-      weight: `${formatDecisionNumber(successMultiplier, 3)}x`,
-      contribution: `近期 ${formatDecisionPercent(params.recentSuccessRate)} / 历史 ${params.historicalSuccessRateText}`,
-      tone: successMultiplier >= 0.9 ? 'positive' : 'warning',
+      metric: '输入/M 成本',
+      value: params.inputCostText,
+      formula: `${formatDecisionCalculationValue(params.minInputCost, 6)} / ${formatDecisionCalculationValue(params.inputCost, 6)} = ${formatDecisionCalculationValue(params.inputCostScore, 4)}`,
+      weight: formatDecisionPercent(STABLE_FIRST_INPUT_COST_WEIGHT, 0),
+      contribution: formatDecisionNumber(params.inputCostScore, 4),
+    },
+    {
+      metric: '缓存命中率',
+      value: params.cacheHitRate == null ? '无样本' : formatDecisionPercent(params.cacheHitRate),
+      formula: params.cacheHitRate == null
+        ? '无样本，按 0.5 中性值'
+        : `缓存token / (缓存token + 输入token) = ${formatDecisionCalculationValue(params.cacheHitScore, 4)}`,
+      weight: formatDecisionPercent(STABLE_FIRST_CACHE_HIT_WEIGHT, 0),
+      contribution: formatDecisionNumber(params.cacheHitScore, 4),
+      tone: params.cacheHitRate == null ? 'muted' : (params.cacheHitRate > 0 ? 'positive' : 'warning'),
+    },
+    {
+      metric: '主评分',
+      value: formatDecisionNumber(params.weightedScore, 4),
+      formula: `${formatDecisionCalculationValue(params.costScore, 4)}*60% + ${formatDecisionCalculationValue(successScore, 4)}*15% + ${formatDecisionCalculationValue(params.inputCostScore, 4)}*10% + ${formatDecisionCalculationValue(params.cacheHitScore, 4)}*5% + ${formatDecisionCalculationValue(params.firstByteLatencyScore, 4)}*10% = ${formatDecisionCalculationValue(params.weightedScore, 4)}`,
+      weight: '主权重',
+      contribution: formatDecisionNumber(params.weightedScore, 4),
+      tone: params.weightedScore >= 0.8 ? 'positive' : 'warning',
+    },
+    {
+      metric: '首字延迟',
+      value: params.firstByteLatencyMs == null ? '无样本' : `${formatDecisionNumber(params.firstByteLatencyMs, 0)}ms`,
+      formula: params.firstByteLatencyMs == null
+        ? '无样本，按 1.000 不惩罚'
+        : `最低首字 / 当前首字 = ${formatDecisionCalculationValue(params.firstByteLatencyScore, 4)}`,
+      weight: formatDecisionPercent(STABLE_FIRST_FIRST_BYTE_WEIGHT, 0),
+      contribution: formatDecisionNumber(params.firstByteLatencyScore, 4),
+      tone: params.firstByteLatencyMs == null ? 'muted' : (params.firstByteLatencyScore >= 0.8 ? 'positive' : 'warning'),
     },
     {
       metric: '近期样本',
       value: `${formatDecisionNumber(params.recentSampleCount, 2)} 个`,
       formula: '样本越多，近期成功率置信度越高',
       weight: `置信 ${formatDecisionNumber(params.recentConfidence, 3)}`,
-      contribution: formatDecisionNumber(params.recentConfidence, 3),
+      contribution: `近期 ${formatDecisionPercent(params.recentSuccessRate)} / 历史 ${params.historicalSuccessRateText}`,
     },
     {
       metric: '运行健康',
@@ -433,7 +506,7 @@ function buildStableFirstScoreBreakdown(params: {
     {
       metric: '失败/粘性',
       value: `失败 ${params.consecutiveFailText}`,
-      formula: '连续失败 5 次后切换；选中后稳定 50 次再重评低价',
+      formula: '连续失败 5 次后切换；普通粘性 50 次重评；更低价通道成功时优先试跑 100 次',
       weight: '稳定保护',
       contribution: `粘性 ${params.stickyProgressText}`,
       tone: params.consecutiveFailText.startsWith('0/') ? 'positive' : 'warning',
@@ -441,9 +514,17 @@ function buildStableFirstScoreBreakdown(params: {
     {
       metric: '同站点分摊',
       value: `${params.siteChannels} 个通道`,
-      formula: `贡献 / ${params.siteChannels}`,
+      formula: `1 / sqrt(${params.siteChannels}) = ${formatDecisionCalculationValue(params.siteSplitMultiplier, 4)}`,
       weight: `${formatDecisionNumber(siteSplit, 3)}x`,
       contribution: formatDecisionNumber(siteSplit, 3),
+    },
+    {
+      metric: '贡献计算',
+      value: formatDecisionNumber(params.contribution, 4),
+      formula: `${formatDecisionCalculationValue(params.weightedScore, 4)} x ${formatDecisionCalculationValue(params.runtimeMultiplier, 3)} x ${formatDecisionCalculationValue(params.runtimeLoadMultiplier, 3)} x ${formatDecisionCalculationValue(params.siteSplitMultiplier, 4)} = ${formatDecisionCalculationValue(params.contribution, 4)}`,
+      weight: '最终贡献',
+      contribution: formatDecisionNumber(params.contribution, 4),
+      tone: params.contribution > 0 ? 'positive' : 'muted',
     },
     {
       metric: '最终占比',
@@ -457,7 +538,7 @@ function buildStableFirstScoreBreakdown(params: {
 
   return {
     strategy: 'stable_first',
-    formula: '稳定优先贡献 = 1/成本 x max(5%, 综合成功率) x 运行健康 x 会话负载 / 同站点通道数；先按低价排序，失败 5 次切换，稳定 50 次后重新按低价评估',
+    formula: '主评分 = 低倍率成本*60% + 请求成功率*15% + 输入/M成本*10% + 缓存命中率*5% + 平均首字延迟*10%；贡献 = 主评分 x 运行健康 x 会话负载 / sqrt(同站点通道数)；连续失败 5 次切换，更低价通道成功时优先试跑 100 次',
     contribution: params.contribution,
     totalContribution: params.totalContribution,
     probability: params.probability,
@@ -489,6 +570,23 @@ type StableFirstPoolPlan = {
   siteStateById: Map<number, StableFirstSitePoolState>;
 };
 
+type StableFirstWeightedScore = {
+  contribution: number;
+  weightedScore: number;
+  costScore: number;
+  inputCostScore: number;
+  cacheHitRate: number | null;
+  cacheHitScore: number;
+  firstByteLatencyMs: number | null;
+  firstByteLatencyScore: number;
+  successScore: number;
+  selectionCost: number;
+  inputCost: number;
+  minSelectionCost: number;
+  minInputCost: number;
+  siteSplitMultiplier: number;
+};
+
 type StableFirstObservationProgressState = {
   requestCount: number;
   lastObservationAtMs: number | null;
@@ -498,6 +596,8 @@ type StableFirstStickyChannelState = {
   channelId: number;
   successCount: number;
   updatedAtMs: number;
+  mode?: 'normal' | 'low_cost_trial';
+  successThreshold?: number;
 };
 
 const siteRuntimeHealthStates = new Map<number, SiteRuntimeHealthState>();
@@ -533,11 +633,18 @@ function rememberStableFirstSiteSelectionForKey(rotationKey: string, siteId: num
   }
 }
 
-function rememberStableFirstStickyChannelForKey(rotationKey: string, channelId: number, nowMs = Date.now()): void {
+function rememberStableFirstStickyChannelForKey(
+  rotationKey: string,
+  channelId: number,
+  nowMs = Date.now(),
+  options: { mode?: StableFirstStickyChannelState['mode']; successThreshold?: number } = {},
+): void {
   if (!rotationKey || !Number.isFinite(channelId) || channelId <= 0) return;
   const existing = stableFirstStickyChannelByKey.get(rotationKey);
   if (existing?.channelId === channelId) {
     existing.updatedAtMs = nowMs;
+    if (options.mode) existing.mode = options.mode;
+    if (options.successThreshold) existing.successThreshold = options.successThreshold;
     if (stableFirstStickyChannelByKey.has(rotationKey)) {
       stableFirstStickyChannelByKey.delete(rotationKey);
     }
@@ -547,6 +654,8 @@ function rememberStableFirstStickyChannelForKey(rotationKey: string, channelId: 
       channelId,
       successCount: 0,
       updatedAtMs: nowMs,
+      mode: options.mode || 'normal',
+      successThreshold: options.successThreshold,
     });
   }
 
@@ -567,6 +676,15 @@ function recordStableFirstStickySuccess(channelId: number, nowMs = Date.now()): 
       updatedAtMs: nowMs,
     });
   }
+}
+
+function getStableFirstStickySuccessThreshold(state: StableFirstStickyChannelState | undefined): number {
+  if (!state) return STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD;
+  const threshold = Number(state.successThreshold);
+  if (Number.isFinite(threshold) && threshold > 0) return Math.trunc(threshold);
+  return state.mode === 'low_cost_trial'
+    ? STABLE_FIRST_LOW_COST_TRIAL_SUCCESS_THRESHOLD
+    : STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD;
 }
 
 function forgetStableFirstStickyChannel(channelId: number): void {
@@ -659,6 +777,93 @@ function usesStagedFailureCooldown(strategy: RouteRoutingStrategy): boolean {
 
 function resolveStagedFailureThreshold(strategy: RouteRoutingStrategy): number {
   return strategy === 'stable_first' ? STABLE_FIRST_FAILURE_THRESHOLD : ROUND_ROBIN_FAILURE_THRESHOLD;
+}
+
+function resolveRouteFailureModelName(input: {
+  context?: SiteRuntimeFailureContext | null;
+  channel: typeof schema.routeChannels.$inferSelect;
+  route: typeof schema.tokenRoutes.$inferSelect;
+}): string {
+  const contextModel = String(input.context?.modelName || '').trim();
+  if (contextModel) return contextModel;
+  const sourceModel = String(input.channel.sourceModel || '').trim();
+  if (sourceModel) return sourceModel;
+  const routeModelPattern = String(input.route.modelPattern || '').trim();
+  return isExactTokenRouteModelPattern(routeModelPattern) ? routeModelPattern : '';
+}
+
+async function markRouteChannelModelAvailabilityUnavailable(input: {
+  channel: typeof schema.routeChannels.$inferSelect;
+  accountId: number;
+  modelName: string;
+  message: string;
+  httpStatus?: number | null;
+  responseText?: string | null;
+  checkedAt: string;
+}) {
+  const modelName = input.modelName.trim();
+  if (!modelName) return;
+  const message = input.message.trim() || `连续 ${CHANNEL_MODEL_AVAILABILITY_FAILURE_THRESHOLD} 次请求失败`;
+  if (typeof input.channel.tokenId === 'number' && input.channel.tokenId > 0) {
+    await db.insert(schema.tokenModelAvailability)
+      .values({
+        tokenId: input.channel.tokenId,
+        modelName,
+        available: false,
+        message,
+        httpStatus: input.httpStatus ?? null,
+        responseText: input.responseText ?? null,
+        latencyMs: null,
+        healthCheckSuccessStreak: 0,
+        checkedAt: input.checkedAt,
+      })
+      .onConflictDoUpdate({
+        target: [schema.tokenModelAvailability.tokenId, schema.tokenModelAvailability.modelName],
+        set: {
+          available: false,
+          message,
+          httpStatus: input.httpStatus ?? null,
+          responseText: input.responseText ?? null,
+          latencyMs: null,
+          healthCheckSuccessStreak: 0,
+          checkedAt: input.checkedAt,
+        },
+      })
+      .run();
+    await db.update(schema.accountTokens)
+      .set({
+        healthCheckEnabled: true,
+        healthCheckIntervalMinutes: 10,
+        healthCheckModel: modelName,
+        healthCheckNextRunAt: new Date(Date.parse(input.checkedAt) + 10 * 60_000).toISOString(),
+        healthCheckLastRunAt: input.checkedAt,
+        healthCheckLastAvailable: false,
+        healthCheckLastMessage: message,
+        healthCheckLastLatencyMs: null,
+        updatedAt: input.checkedAt,
+      })
+      .where(eq(schema.accountTokens.id, input.channel.tokenId))
+      .run();
+    return;
+  }
+
+  await db.insert(schema.modelAvailability)
+    .values({
+      accountId: input.accountId,
+      modelName,
+      available: false,
+      latencyMs: null,
+      checkedAt: input.checkedAt,
+    })
+    .onConflictDoUpdate({
+      target: [schema.modelAvailability.accountId, schema.modelAvailability.modelName],
+      set: {
+        available: false,
+        latencyMs: null,
+        checkedAt: input.checkedAt,
+      },
+    })
+    .run();
 }
 
 function resolveSiteRuntimeBreakerMs(level: number): number {
@@ -1500,6 +1705,40 @@ async function loadRouteMatch(route: RouteRow, nowMs = Date.now()): Promise<Rout
     if (key) tokenModelAvailabilityByKey.set(key, row);
   }
 
+  const channelIds = channels
+    .map((row) => Number(row.route_channels.id))
+    .filter((id): id is number => Number.isFinite(id) && id > 0);
+  const cacheStatsByChannelId = await loadRouteChannelCacheStats(channelIds);
+
+  const tokenGroupNames: string[] = Array.from(new Set(channels
+    .map((row) => row.account_tokens?.tokenGroup?.trim())
+    .filter((group): group is string => !!group)));
+  const tokenGroupPricingByAccountGroup = new Map<string, number>();
+  const tokenGroupPricingBySiteGroup = new Map<string, number>();
+  if (tokenGroupNames.length > 0) {
+    const siteIds: number[] = Array.from(new Set(channels
+      .map((row) => Number(row.sites.id))
+      .filter((id): id is number => Number.isFinite(id) && id > 0)));
+    const tokenGroupPricingRows = siteIds.length > 0
+      ? await db.select().from(schema.tokenGroupPricing)
+        .where(and(
+          inArray(schema.tokenGroupPricing.siteId, siteIds),
+          inArray(schema.tokenGroupPricing.group, tokenGroupNames),
+        ))
+        .all()
+      : [];
+    for (const row of tokenGroupPricingRows) {
+      const ratio = Number(row.ratio);
+      if (!Number.isFinite(ratio) || ratio <= 0) continue;
+      const group = row.group?.trim();
+      if (!group) continue;
+      if (typeof row.accountId === 'number' && Number.isFinite(row.accountId) && row.accountId > 0) {
+        tokenGroupPricingByAccountGroup.set(`${row.accountId}:${group}`, ratio);
+      }
+      tokenGroupPricingBySiteGroup.set(`${row.siteId}:${group}`, ratio);
+    }
+  }
+
   const oauthRouteUnitIds: number[] = Array.from(new Set<number>(
     channels
       .map((row) => Number(row.route_channels.oauthRouteUnitId))
@@ -1522,6 +1761,14 @@ async function loadRouteMatch(route: RouteRow, nowMs = Date.now()): Promise<Rout
       account: row.accounts,
       site: row.sites,
       token: row.account_tokens,
+      tokenGroupPricingRatio: resolveTokenGroupPricingRatioForChannel(
+        row.account_tokens,
+        row.accounts.id,
+        row.sites.id,
+        tokenGroupPricingByAccountGroup,
+        tokenGroupPricingBySiteGroup,
+      ),
+      cacheStats: cacheStatsByChannelId.get(row.route_channels.id) || EMPTY_ROUTE_CHANNEL_CACHE_STATS,
       tokenModelAvailability: tokenModelAvailabilityByKey.get(buildTokenModelAvailabilityKey(
         channel.tokenId,
         channel.sourceModel,
@@ -1597,6 +1844,63 @@ export function invalidateTokenRouterCache(): void {
   stableFirstStickyChannelByKey.clear();
   stableFirstObservationProgressByKey.clear();
   stableFirstObservationSiteCooldownByKey.clear();
+}
+
+function parseProxyLogBillingDetails(raw: string | null | undefined): Record<string, unknown> | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function loadRouteChannelCacheStats(channelIds: number[]): Promise<Map<number, RouteChannelCacheStats>> {
+  const uniqueChannelIds = Array.from(new Set(channelIds.filter((id) => Number.isFinite(id) && id > 0)));
+  const result = new Map<number, RouteChannelCacheStats>();
+  if (uniqueChannelIds.length === 0) return result;
+
+  const rows = await db.select({
+    channelId: schema.proxyLogs.channelId,
+    promptTokens: schema.proxyLogs.promptTokens,
+    firstByteLatencyMs: schema.proxyLogs.firstByteLatencyMs,
+    billingDetails: schema.proxyLogs.billingDetails,
+  })
+    .from(schema.proxyLogs)
+    .where(and(
+      inArray(schema.proxyLogs.channelId, uniqueChannelIds),
+      eq(schema.proxyLogs.status, 'success'),
+    ))
+    .orderBy(desc(schema.proxyLogs.id))
+    .limit(Math.max(200, uniqueChannelIds.length * 60))
+    .all();
+
+  for (const row of rows) {
+    const channelId = Number(row.channelId);
+    if (!Number.isFinite(channelId) || channelId <= 0) continue;
+    const billingDetails = parseProxyLogBillingDetails(row.billingDetails);
+    const cacheReadTokens = readBillingUsageToken(billingDetails, 'cacheReadTokens') ?? 0;
+    const billablePromptTokens = resolveBillablePromptTokensForCacheStats({
+      billingDetails,
+      promptTokens: row.promptTokens,
+      cacheReadTokens,
+    }) ?? 0;
+    const current = result.get(channelId) || { ...EMPTY_ROUTE_CHANNEL_CACHE_STATS };
+    current.promptTokens += Math.max(0, billablePromptTokens);
+    current.cacheReadTokens += Math.max(0, cacheReadTokens);
+    current.sampleCount += 1;
+    const firstByteLatencyMs = Number(row.firstByteLatencyMs);
+    if (Number.isFinite(firstByteLatencyMs) && firstByteLatencyMs >= 0) {
+      current.firstByteLatencyTotalMs += firstByteLatencyMs;
+      current.firstByteLatencySampleCount += 1;
+    }
+    result.set(channelId, current);
+  }
+
+  return result;
 }
 
 function isSiteDisabled(status?: string | null): boolean {
@@ -1929,9 +2233,35 @@ function resolveInputCostPerMillionFromChannel(candidate: RouteChannelCandidate)
   return Math.max((totalCost / rechargeRatio) * 1_000_000 / totalInputTokens, MIN_EFFECTIVE_UNIT_COST);
 }
 
+function parseRatioFromTokenGroupName(tokenGroup?: string | null): number | null {
+  const text = tokenGroup?.trim();
+  if (!text) return null;
+  const matches = Array.from(text.matchAll(/(?:^|[^\d])([0-9]+(?:\.[0-9]+)?)(?:x|倍)|(?:^|[^\d])([0-9]*\.[0-9]+)(?=$|[^\d])/gi));
+  const lastMatch = matches.at(-1);
+  const raw = lastMatch?.[1] ?? lastMatch?.[2];
+  if (!raw) return null;
+  const ratio = Number(raw);
+  return Number.isFinite(ratio) && ratio > 0 ? ratio : null;
+}
+
+function resolveTokenGroupPricingRatioForChannel(
+  token: typeof schema.accountTokens.$inferSelect | null,
+  accountId: number,
+  siteId: number,
+  accountGroupRatios: Map<string, number>,
+  siteGroupRatios: Map<string, number>,
+): number | null {
+  const group = token?.tokenGroup?.trim();
+  if (!group) return null;
+  return accountGroupRatios.get(`${accountId}:${group}`)
+    ?? siteGroupRatios.get(`${siteId}:${group}`)
+    ?? parseRatioFromTokenGroupName(group);
+}
+
 function resolveEffectiveUnitCost(candidate: RouteChannelCandidate, modelName: string): CostSignal {
   const successCount = Math.max(0, candidate.channel.successCount ?? 0);
   const totalCost = Math.max(0, candidate.channel.totalCost ?? 0);
+  const groupRatio = candidate.tokenGroupPricingRatio;
   const configured = candidate.account.unitCost ?? null;
   const rechargeRatio = Math.max(0, candidate.site.rechargeRatio ?? 1) || 1;
   const inputCostPerMillion = resolveInputCostPerMillionFromChannel(candidate);
@@ -1940,6 +2270,14 @@ function resolveEffectiveUnitCost(candidate: RouteChannelCandidate, modelName: s
     return {
       unitCost: Math.max((totalCost / rechargeRatio) / successCount, MIN_EFFECTIVE_UNIT_COST),
       source: 'observed',
+      inputCostPerMillion,
+    };
+  }
+
+  if (typeof groupRatio === 'number' && Number.isFinite(groupRatio) && groupRatio > 0) {
+    return {
+      unitCost: Math.max(groupRatio, MIN_EFFECTIVE_UNIT_COST),
+      source: 'configured',
       inputCostPerMillion,
     };
   }
@@ -1970,6 +2308,49 @@ function resolveEffectiveUnitCost(candidate: RouteChannelCandidate, modelName: s
     source: 'fallback',
     inputCostPerMillion,
   };
+}
+
+function resolveStableFirstSelectionCost(
+  _cost: CostSignal | undefined,
+  candidate?: RouteChannelCandidate,
+): number {
+  const groupRatio = candidate?.tokenGroupPricingRatio
+    ?? parseRatioFromTokenGroupName(candidate?.token?.tokenGroup);
+  if (typeof groupRatio === 'number' && Number.isFinite(groupRatio) && groupRatio > 0) {
+    return Math.max(groupRatio, MIN_EFFECTIVE_UNIT_COST);
+  }
+  return 1;
+}
+
+function resolveStableFirstSelectionCostSource(
+  _cost: CostSignal | undefined,
+  candidate?: RouteChannelCandidate,
+): string {
+  const groupRatio = candidate?.tokenGroupPricingRatio
+    ?? parseRatioFromTokenGroupName(candidate?.token?.tokenGroup);
+  if (typeof groupRatio === 'number' && Number.isFinite(groupRatio) && groupRatio > 0) {
+    return '分组倍率';
+  }
+  return '无分组倍率';
+}
+
+function resolveStableFirstCacheHitRate(cacheStats: RouteChannelCacheStats): number | null {
+  const cacheReadTokens = Math.max(0, cacheStats.cacheReadTokens || 0);
+  const promptTokens = Math.max(0, cacheStats.promptTokens || 0);
+  const denominator = cacheReadTokens + promptTokens;
+  if (denominator <= 0) return null;
+  return clampNumber(cacheReadTokens / denominator, 0, 1);
+}
+
+function resolveStableFirstFirstByteLatencyMs(cacheStats: RouteChannelCacheStats): number | null {
+  const sampleCount = Math.max(0, cacheStats.firstByteLatencySampleCount || 0);
+  if (sampleCount <= 0) return null;
+  const totalMs = Math.max(0, cacheStats.firstByteLatencyTotalMs || 0);
+  return totalMs / sampleCount;
+}
+
+function resolveStableFirstSiteSplitMultiplier(siteChannels: number): number {
+  return 1 / Math.sqrt(Math.max(1, siteChannels));
 }
 
 type SiteHistoricalHealthMetrics = {
@@ -2535,7 +2916,7 @@ export class TokenRouter {
 
       const summaryParts = [`稳定优先：可用 ${available.length}`];
       summaryParts.push(`低价优先，连续失败 ${STABLE_FIRST_FAILURE_THRESHOLD} 次后切换`);
-      summaryParts.push(`切换后稳定成功 ${STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD} 次再重新评估低价`);
+      summaryParts.push(`普通切换后稳定成功 ${STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD} 次再重新评估低价，更低价通道成功时优先试跑 ${STABLE_FIRST_LOW_COST_TRIAL_SUCCESS_THRESHOLD} 次`);
       if (breakerFiltered.avoided.length > 0) {
         const breakerSummaryLabel = breakerFiltered.avoided.some((item) => item.reason.includes('模型熔断'))
           ? '运行时熔断避让'
@@ -2999,10 +3380,17 @@ export class TokenRouter {
     const route = row.token_routes;
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
-    const normalizedContext: SiteRuntimeFailureContext = typeof context === 'string'
-      ? { modelName: context }
-      : (context ?? {});
-    if (typeof ch.oauthRouteUnitId === 'number' && ch.oauthRouteUnitId > 0) {
+	    const normalizedContext: SiteRuntimeFailureContext = typeof context === 'string'
+	      ? { modelName: context }
+	      : (context ?? {});
+	    const failedModelName = resolveRouteFailureModelName({
+	      context: normalizedContext,
+	      channel: ch,
+	      route,
+	    });
+	    const failureMessage = String(normalizedContext.errorText || '').trim()
+	      || `连续 ${CHANNEL_MODEL_AVAILABILITY_FAILURE_THRESHOLD} 次请求失败`;
+	    if (typeof ch.oauthRouteUnitId === 'number' && ch.oauthRouteUnitId > 0) {
       const targetAccountId = Number.isFinite(actualAccountId) && (actualAccountId ?? 0) > 0
         ? Math.trunc(actualAccountId!)
         : account.id;
@@ -3024,9 +3412,10 @@ export class TokenRouter {
         const routeUnitStrategy = memberRow.unit.strategy === 'stick_until_unavailable'
           ? 'stick_until_unavailable'
           : 'round_robin';
-        let cooldownUntil: string | null = null;
-        let consecutiveFailCount = Math.max(0, memberRow.member.consecutiveFailCount ?? 0) + 1;
-        let cooldownLevel = Math.max(0, memberRow.member.cooldownLevel ?? 0);
+	        let cooldownUntil: string | null = null;
+	        let consecutiveFailCount = Math.max(0, memberRow.member.consecutiveFailCount ?? 0) + 1;
+	        const nextConsecutiveFailCountBeforeCooldown = consecutiveFailCount;
+	        let cooldownLevel = Math.max(0, memberRow.member.cooldownLevel ?? 0);
 
         if (shortWindowLimitCooldownUntil) {
           cooldownUntil = shortWindowLimitCooldownUntil;
@@ -3047,17 +3436,28 @@ export class TokenRouter {
           cooldownLevel = 0;
         }
 
-        await db.update(schema.oauthRouteUnitMembers).set({
-          failCount,
-          lastFailAt: nowIso,
+	        await db.update(schema.oauthRouteUnitMembers).set({
+	          failCount,
+	          lastFailAt: nowIso,
           consecutiveFailCount,
           cooldownLevel,
           cooldownUntil,
           updatedAt: nowIso,
-        }).where(eq(schema.oauthRouteUnitMembers.id, memberRow.member.id)).run();
-        recordSiteRuntimeFailure(memberRow.account.siteId, normalizedContext, nowMs);
-        invalidateRouteScopedCache(route.id);
-        return;
+	        }).where(eq(schema.oauthRouteUnitMembers.id, memberRow.member.id)).run();
+	        if (nextConsecutiveFailCountBeforeCooldown >= CHANNEL_MODEL_AVAILABILITY_FAILURE_THRESHOLD && failedModelName) {
+	          await markRouteChannelModelAvailabilityUnavailable({
+	            channel: ch,
+	            accountId: memberRow.account.id,
+	            modelName: failedModelName,
+	            message: failureMessage,
+	            httpStatus: normalizedContext.status ?? null,
+	            responseText: normalizedContext.errorText ?? null,
+	            checkedAt: nowIso,
+	          });
+	        }
+	        recordSiteRuntimeFailure(memberRow.account.siteId, normalizedContext, nowMs);
+	        invalidateRouteScopedCache(route.id);
+	        return;
       }
     }
 
@@ -3093,26 +3493,37 @@ export class TokenRouter {
       cooldownLevel = 0;
     }
 
-    await db.update(schema.routeChannels).set({
-      failCount,
-      lastFailAt: nowIso,
+	    await db.update(schema.routeChannels).set({
+	      failCount,
+	      lastFailAt: nowIso,
       consecutiveFailCount,
       cooldownLevel,
       cooldownUntil,
     }).where(inArray(schema.routeChannels.id, affectedChannelIds)).run();
 
-    for (const affectedChannelId of affectedChannelIds) {
-      patchCachedChannel(affectedChannelId, (channel) => {
+	    for (const affectedChannelId of affectedChannelIds) {
+	      patchCachedChannel(affectedChannelId, (channel) => {
         channel.failCount = failCount;
         channel.lastFailAt = nowIso;
         channel.cooldownUntil = cooldownUntil;
         channel.consecutiveFailCount = consecutiveFailCount;
         channel.cooldownLevel = cooldownLevel;
-      });
-    }
+	      });
+	    }
+	    if (Math.max(0, ch.consecutiveFailCount ?? 0) + 1 >= CHANNEL_MODEL_AVAILABILITY_FAILURE_THRESHOLD && failedModelName) {
+	      await markRouteChannelModelAvailabilityUnavailable({
+	        channel: ch,
+	        accountId: account.id,
+	        modelName: failedModelName,
+	        message: failureMessage,
+	        httpStatus: normalizedContext.status ?? null,
+	        responseText: normalizedContext.errorText ?? null,
+	        checkedAt: nowIso,
+	      });
+	    }
 
-    recordSiteRuntimeFailure(account.siteId, normalizedContext, nowMs);
-  }
+	    recordSiteRuntimeFailure(account.siteId, normalizedContext, nowMs);
+	  }
 
   /**
    * Get all available models (aggregated from all routes).
@@ -3681,6 +4092,74 @@ export class TokenRouter {
     return compareStableFirstCandidateOrder(left, right);
   }
 
+  private buildStableFirstWeightedScores(
+    candidates: RouteChannelCandidate[],
+    effectiveCosts: CostSignal[],
+    runtimeHealthDetails: SiteRuntimeHealthDetails[],
+    channelLoadSnapshots: ProxyChannelLoadSnapshot[],
+    siteChannelCounts: Map<number, number>,
+    siteHistoricalHealthMetrics: Map<number, SiteHistoricalHealthMetrics>,
+  ): StableFirstWeightedScore[] {
+    const selectionCosts = candidates.map((candidate, index) => resolveStableFirstSelectionCost(effectiveCosts[index], candidate));
+    const inputCosts = effectiveCosts.map((cost) => Math.max(
+      cost?.inputCostPerMillion || cost?.unitCost || 1,
+      MIN_EFFECTIVE_UNIT_COST,
+    ));
+    const firstByteLatencies = candidates.map((candidate) => resolveStableFirstFirstByteLatencyMs(candidate.cacheStats));
+    const minSelectionCost = Math.max(Math.min(...selectionCosts), MIN_EFFECTIVE_UNIT_COST);
+    const minInputCost = Math.max(Math.min(...inputCosts), MIN_EFFECTIVE_UNIT_COST);
+    const finiteFirstByteLatencies = firstByteLatencies
+      .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0);
+    const minFirstByteLatency = finiteFirstByteLatencies.length > 0
+      ? Math.max(Math.min(...finiteFirstByteLatencies), 1)
+      : null;
+
+    return candidates.map((candidate, index) => {
+      const siteChannels = Math.max(1, siteChannelCounts.get(candidate.site.id) || 1);
+      const runtimeMultiplier = runtimeHealthDetails[index]?.combinedMultiplier ?? 1;
+      const runtimeLoadMultiplier = resolveChannelRuntimeLoadMultiplier(channelLoadSnapshots[index]);
+      const successScore = Math.max(0.05, resolveStableFirstSuccessRate(
+        runtimeHealthDetails[index],
+        siteHistoricalHealthMetrics.get(candidate.site.id)?.successRate,
+      ));
+      const selectionCost = selectionCosts[index] ?? 1;
+      const inputCost = inputCosts[index] ?? selectionCost;
+      const costScore = clampNumber(minSelectionCost / Math.max(selectionCost, MIN_EFFECTIVE_UNIT_COST), 0, 1);
+      const inputCostScore = clampNumber(minInputCost / Math.max(inputCost, MIN_EFFECTIVE_UNIT_COST), 0, 1);
+      const cacheHitRate = resolveStableFirstCacheHitRate(candidate.cacheStats);
+      const cacheHitScore = cacheHitRate ?? 0.5;
+      const firstByteLatencyMs = firstByteLatencies[index] ?? null;
+      const firstByteLatencyScore = firstByteLatencyMs == null || minFirstByteLatency == null
+        ? 1
+        : clampNumber(minFirstByteLatency / Math.max(firstByteLatencyMs, 1), 0.2, 1);
+      const weightedScore = (
+        STABLE_FIRST_COST_WEIGHT * costScore
+        + STABLE_FIRST_SUCCESS_WEIGHT * successScore
+        + STABLE_FIRST_INPUT_COST_WEIGHT * inputCostScore
+        + STABLE_FIRST_CACHE_HIT_WEIGHT * cacheHitScore
+        + STABLE_FIRST_FIRST_BYTE_WEIGHT * firstByteLatencyScore
+      );
+      const siteSplitMultiplier = resolveStableFirstSiteSplitMultiplier(siteChannels);
+      const contribution = weightedScore * runtimeMultiplier * runtimeLoadMultiplier * siteSplitMultiplier;
+      return {
+        contribution,
+        weightedScore,
+        costScore,
+        inputCostScore,
+        cacheHitRate,
+        cacheHitScore,
+        firstByteLatencyMs,
+        firstByteLatencyScore,
+        successScore,
+        selectionCost,
+        inputCost,
+        minSelectionCost,
+        minInputCost,
+        siteSplitMultiplier,
+      };
+    });
+  }
+
   private buildStableFirstRotationKey(routeId: number, requestedModel: string): string {
     const normalizedModel = normalizeModelAlias(requestedModel)
       || normalizeRouteDisplayName(requestedModel).toLowerCase()
@@ -3877,25 +4356,23 @@ export class TokenRouter {
       siteChannelCounts.set(candidate.site.id, (siteChannelCounts.get(candidate.site.id) || 0) + 1);
     }
     const siteHistoricalHealthMetrics = buildSiteHistoricalHealthMetrics(candidates);
+    const stableFirstScores = selectionMode === 'stable_first'
+      ? this.buildStableFirstWeightedScores(
+        candidates,
+        effectiveCosts,
+        runtimeHealthDetails,
+        channelLoadSnapshots,
+        siteChannelCounts,
+        siteHistoricalHealthMetrics,
+      )
+      : [];
 
     const contributions = candidates.map((candidate, i) => {
       const siteChannels = Math.max(1, siteChannelCounts.get(candidate.site.id) || 1);
       const runtimeMultiplier = runtimeHealthDetails[i]?.combinedMultiplier ?? 1;
       const runtimeLoadMultiplier = resolveChannelRuntimeLoadMultiplier(channelLoadSnapshots[i]);
       if (selectionMode === 'stable_first') {
-        const recentSuccessRate = resolveStableFirstSuccessRate(
-          runtimeHealthDetails[i],
-          siteHistoricalHealthMetrics.get(candidate.site.id)?.successRate,
-        );
-        const unitCost = Math.max(
-          effectiveCosts[i]?.inputCostPerMillion || effectiveCosts[i]?.unitCost || 1,
-          MIN_EFFECTIVE_UNIT_COST,
-        );
-        let contribution = 1 / unitCost;
-        contribution *= Math.max(0.05, recentSuccessRate);
-        contribution *= runtimeMultiplier;
-        contribution *= runtimeLoadMultiplier;
-        return contribution / siteChannels;
+        return stableFirstScores[i]?.contribution ?? 0;
       }
 
       let contribution = baseContributions[i] / siteChannels;
@@ -3930,8 +4407,12 @@ export class TokenRouter {
     const rankedIndices = candidates.map((_, index) => index)
       .sort((leftIndex, rightIndex) => {
           if (selectionMode === 'stable_first') {
-          const leftCost = effectiveCosts[leftIndex]?.inputCostPerMillion || effectiveCosts[leftIndex]?.unitCost || 1;
-          const rightCost = effectiveCosts[rightIndex]?.inputCostPerMillion || effectiveCosts[rightIndex]?.unitCost || 1;
+          const contributionDiff = contributions[rightIndex] - contributions[leftIndex];
+          if (Math.abs(contributionDiff) > 1e-9) {
+            return contributionDiff > 0 ? 1 : -1;
+          }
+          const leftCost = resolveStableFirstSelectionCost(effectiveCosts[leftIndex], candidates[leftIndex]);
+          const rightCost = resolveStableFirstSelectionCost(effectiveCosts[rightIndex], candidates[rightIndex]);
           const costDiff = leftCost - rightCost;
           if (Math.abs(costDiff) > 1e-9) {
             return costDiff > 0 ? 1 : -1;
@@ -3991,25 +4472,40 @@ export class TokenRouter {
       const recentSuccessRateText = `${(siteRuntimeDetail.recentSuccessRate * 100).toFixed(1)}%`;
       const stableFirstSuccessRate = resolveStableFirstSuccessRate(siteRuntimeDetail, siteHistoricalHealth?.successRate);
       const stableFirstSuccessRateText = `${(stableFirstSuccessRate * 100).toFixed(1)}%`;
+      const stableFirstScore = stableFirstScores[i];
       const stickyState = stableFirstRotationKey ? stableFirstStickyChannelByKey.get(stableFirstRotationKey) : undefined;
+      const stickyThreshold = getStableFirstStickySuccessThreshold(stickyState);
+      const stickyModeText = stickyState?.mode === 'low_cost_trial' ? ' 低成本试跑' : '';
       const stickyProgressText = stickyState?.channelId === candidate.channel.id
-        ? `${Math.min(stickyState.successCount, STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD)}/${STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD}`
-        : `0/${STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD}`;
+        ? `${Math.min(stickyState.successCount, stickyThreshold)}/${stickyThreshold}${stickyModeText}`
+        : `0/${stickyThreshold}`;
 	      const consecutiveFailText = `${Math.max(0, candidate.channel.consecutiveFailCount ?? 0)}/${STABLE_FIRST_FAILURE_THRESHOLD}`;
 	      const fallbackPenalty = cost?.source === 'fallback'
 	        ? 1 / Math.max(1, cost?.unitCost || 1)
 	        : 1;
+	      const stableFirstCostSourceText = selectionMode === 'stable_first'
+	        ? resolveStableFirstSelectionCostSource(cost, candidate)
+	        : costSourceText;
 	      const scoreBreakdown = selectionMode === 'stable_first'
 	        ? buildStableFirstScoreBreakdown({
 	          probability,
 	          contribution: contributions[i],
 	          totalContribution,
-	          unitCost: Math.max(
-	            cost?.inputCostPerMillion || unitCost,
-	            MIN_EFFECTIVE_UNIT_COST,
-	          ),
-	          costSourceText,
+	          unitCost: stableFirstScore?.selectionCost ?? Math.max(cost?.inputCostPerMillion || unitCost, MIN_EFFECTIVE_UNIT_COST),
+	          costSourceText: stableFirstCostSourceText,
 	          inputCostText,
+	          costScore: stableFirstScore?.costScore ?? 0,
+	          inputCostScore: stableFirstScore?.inputCostScore ?? 0,
+	          cacheHitRate: stableFirstScore?.cacheHitRate ?? null,
+	          cacheHitScore: stableFirstScore?.cacheHitScore ?? 0.5,
+	          firstByteLatencyMs: stableFirstScore?.firstByteLatencyMs ?? null,
+	          firstByteLatencyScore: stableFirstScore?.firstByteLatencyScore ?? 1,
+	          weightedScore: stableFirstScore?.weightedScore ?? 0,
+	          minSelectionCost: stableFirstScore?.minSelectionCost ?? stableFirstScore?.selectionCost ?? 1,
+	          selectionCost: stableFirstScore?.selectionCost ?? 1,
+	          minInputCost: stableFirstScore?.minInputCost ?? stableFirstScore?.inputCost ?? 1,
+	          inputCost: stableFirstScore?.inputCost ?? 1,
+	          siteSplitMultiplier: stableFirstScore?.siteSplitMultiplier ?? resolveStableFirstSiteSplitMultiplier(siteChannels),
 	          recentSuccessRate: siteRuntimeDetail.recentSuccessRate,
 	          recentSampleCount: siteRuntimeDetail.recentSampleCount,
 	          recentConfidence: siteRuntimeDetail.recentConfidence,
@@ -4068,7 +4564,7 @@ export class TokenRouter {
 	        probability,
 	        scoreBreakdown,
 	        reason: selectionMode === 'stable_first'
-          ? `${reasonPrefix}，成本=${costSourceText}:${(cost?.unitCost || 1).toFixed(6)}，输入/M=${inputCostText}，连续失败=${consecutiveFailText}，粘性成功=${stickyProgressText}，近期成功率=${recentSuccessRateText}（样本=${siteRuntimeDetail.recentSampleCount.toFixed(2)}，置信=${siteRuntimeDetail.recentConfidence.toFixed(2)}），回退成功率=${historicalSuccessRateText}，综合近期成功率=${stableFirstSuccessRateText}，运行时健康=${runtimeHealthText}，会话负载=${runtimeLoadText}，同站点通道=${siteChannels}，评分占比≈${(probability * 100).toFixed(1)}%）`
+          ? `${reasonPrefix}，成本=${stableFirstCostSourceText}:${formatDecisionNumber(stableFirstScore?.selectionCost ?? cost?.unitCost ?? 1, 6)}，输入/M=${inputCostText}，低成本分=${formatDecisionNumber(stableFirstScore?.costScore ?? 0, 4)}，输入成本分=${formatDecisionNumber(stableFirstScore?.inputCostScore ?? 0, 4)}，缓存命中=${stableFirstScore?.cacheHitRate == null ? '无样本' : formatDecisionPercent(stableFirstScore.cacheHitRate)}，首字延迟=${stableFirstScore?.firstByteLatencyMs == null ? '无样本' : `${formatDecisionNumber(stableFirstScore.firstByteLatencyMs, 0)}ms`}，首字分=${formatDecisionNumber(stableFirstScore?.firstByteLatencyScore ?? 1, 4)}，主评分=${formatDecisionNumber(stableFirstScore?.weightedScore ?? 0, 4)}，连续失败=${consecutiveFailText}，粘性成功=${stickyProgressText}，近期成功率=${recentSuccessRateText}（样本=${siteRuntimeDetail.recentSampleCount.toFixed(2)}，置信=${siteRuntimeDetail.recentConfidence.toFixed(2)}），回退成功率=${historicalSuccessRateText}，综合近期成功率=${stableFirstSuccessRateText}，运行时健康=${runtimeHealthText}，会话负载=${runtimeLoadText}，同站点分摊=1/sqrt(${siteChannels})=${formatDecisionNumber(stableFirstScore?.siteSplitMultiplier ?? resolveStableFirstSiteSplitMultiplier(siteChannels), 4)}，评分占比≈${(probability * 100).toFixed(1)}%）`
           : (
             candidates.length === 1
               ? `${reasonPrefix}，W=${weight}，成本=${costSourceText}:${(cost?.unitCost || 1).toFixed(6)}，站点权重=${siteGlobalWeight.toFixed(2)}x下游倍率=${normalizedDownstreamSiteMultiplier.toFixed(2)}=${combinedSiteWeight.toFixed(2)}，运行时健康=${runtimeHealthText}，会话负载=${runtimeLoadText}，历史健康=${siteHistoricalMultiplier.toFixed(2)}（成功率=${historicalSuccessRateText}，均延迟=${historicalLatencyText}，样本=${siteHistoricalHealth?.totalCalls ?? 0}），同站点通道=${siteChannels}，概率≈${(probability * 100).toFixed(1)}%）`
@@ -4093,7 +4589,9 @@ export class TokenRouter {
         candidates,
         contributions,
         rankedIndices,
+        effectiveCosts,
         stableFirstRotationKey,
+        nowMs,
       ) ?? selected;
     }
 
@@ -4134,19 +4632,45 @@ export class TokenRouter {
     candidates: RouteChannelCandidate[],
     contributions: number[],
     rankedIndices: number[],
+    effectiveCosts: CostSignal[],
     stableFirstRotationKey?: string,
+    nowMs = Date.now(),
   ): RouteChannelCandidate | null {
+    const bestIndex = rankedIndices[0] ?? 0;
+    const bestCandidate = candidates[bestIndex] ?? null;
     if (stableFirstRotationKey) {
       const stickyState = stableFirstStickyChannelByKey.get(stableFirstRotationKey);
-      if (stickyState && stickyState.successCount < STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD) {
-        const stickyCandidate = candidates.find((candidate) => candidate.channel.id === stickyState.channelId);
-        if (stickyCandidate) {
+      const stickyThreshold = getStableFirstStickySuccessThreshold(stickyState);
+      if (stickyState && stickyState.successCount < stickyThreshold) {
+        const stickyIndex = candidates.findIndex((candidate) => candidate.channel.id === stickyState.channelId);
+        const stickyCandidate = stickyIndex >= 0 ? candidates[stickyIndex] : undefined;
+	        if (stickyCandidate) {
+	          const bestCost = resolveStableFirstSelectionCost(effectiveCosts[bestIndex], bestCandidate);
+	          const stickyCost = resolveStableFirstSelectionCost(effectiveCosts[stickyIndex], stickyCandidate);
+	          const bestContribution = contributions[bestIndex] ?? 0;
+	          if (
+	            bestCandidate
+	            && bestCandidate.channel.id !== stickyCandidate.channel.id
+	            && bestCost < stickyCost * STABLE_FIRST_LOW_COST_SWITCH_RATIO
+	            && bestContribution > 0
+	          ) {
+            rememberStableFirstStickyChannelForKey(
+              stableFirstRotationKey,
+              bestCandidate.channel.id,
+              nowMs,
+              {
+                mode: 'low_cost_trial',
+                successThreshold: STABLE_FIRST_LOW_COST_TRIAL_SUCCESS_THRESHOLD,
+              },
+            );
+            return bestCandidate;
+          }
           return stickyCandidate;
         }
       }
     }
 
-    return candidates[rankedIndices[0] ?? 0] ?? null;
+    return bestCandidate;
   }
 }
 
@@ -4156,5 +4680,7 @@ export const __tokenRouterTestUtils = {
   resolveMappedModel,
   getStableFirstRotationCacheSize: () => stableFirstLastSelectedSiteByKey.size,
   rememberStableFirstSiteSelectionForKey,
+  rememberStableFirstStickyChannelForKey,
+  getStableFirstStickyChannelForKey: (rotationKey: string) => stableFirstStickyChannelByKey.get(rotationKey),
 };
 

@@ -164,9 +164,9 @@ export function buildConfig(env: NodeJS.ProcessEnv) {
     routingWeights: {
       baseWeightFactor: parseNumber(env.BASE_WEIGHT_FACTOR, 0.5),
       valueScoreFactor: parseNumber(env.VALUE_SCORE_FACTOR, 0.5),
-      costWeight: parseNumber(env.COST_WEIGHT, 0.4),
-      balanceWeight: parseNumber(env.BALANCE_WEIGHT, 0.3),
-      usageWeight: parseNumber(env.USAGE_WEIGHT, 0.3),
+      costWeight: parseNumber(env.COST_WEIGHT, 0.7),
+      balanceWeight: parseNumber(env.BALANCE_WEIGHT, 0.15),
+      usageWeight: parseNumber(env.USAGE_WEIGHT, 0.15),
     },
   };
 }

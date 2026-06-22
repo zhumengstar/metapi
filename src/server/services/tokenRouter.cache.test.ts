@@ -40,6 +40,8 @@ describe('TokenRouter runtime cache', () => {
   });
 
   beforeEach(async () => {
+    await db.delete(schema.tokenModelAvailability).run();
+    await db.delete(schema.modelAvailability).run();
     await db.delete(schema.routeChannels).run();
     await db.delete(schema.tokenRoutes).run();
     await db.delete(schema.settings).run();
@@ -89,14 +91,22 @@ describe('TokenRouter runtime cache', () => {
       enabled: true,
     }).returning().get();
 
-    await db.insert(schema.routeChannels).values({
-      routeId: route.id,
-      accountId: account.id,
+	    await db.insert(schema.routeChannels).values({
+	      routeId: route.id,
+	      accountId: account.id,
       tokenId: token.id,
       priority: 0,
       weight: 10,
-      enabled: true,
-    }).run();
+	      enabled: true,
+	    }).run();
+	    await db.insert(schema.tokenModelAvailability).values({
+	      tokenId: token.id,
+	      modelName: 'gpt-4o-mini',
+	      available: true,
+	      message: '请求成功',
+	      httpStatus: 200,
+	      checkedAt: new Date().toISOString(),
+	    }).run();
 
     const router = new TokenRouter();
     expect(await router.selectChannel('gpt-4o-mini')).toBeTruthy();
@@ -729,11 +739,19 @@ describe('TokenRouter runtime cache', () => {
       enabled: true,
     }).returning().get();
 
-    const channels = await db.insert(schema.routeChannels).values([
-      { routeId: route.id, accountId: account.id, tokenId: token.id, priority: 0, weight: 10, enabled: true },
-      { routeId: route.id, accountId: account.id, tokenId: token.id, priority: 3, weight: 10, enabled: true },
-      { routeId: route.id, accountId: account.id, tokenId: token.id, priority: 9, weight: 10, enabled: true },
-    ]).returning().all();
+	    const channels = await db.insert(schema.routeChannels).values([
+	      { routeId: route.id, accountId: account.id, tokenId: token.id, priority: 0, weight: 10, enabled: true },
+	      { routeId: route.id, accountId: account.id, tokenId: token.id, priority: 3, weight: 10, enabled: true },
+	      { routeId: route.id, accountId: account.id, tokenId: token.id, priority: 9, weight: 10, enabled: true },
+	    ]).returning().all();
+	    await db.insert(schema.tokenModelAvailability).values({
+	      tokenId: token.id,
+	      modelName: 'gpt-4o-mini',
+	      available: true,
+	      message: '请求成功',
+	      httpStatus: 200,
+	      checkedAt: new Date().toISOString(),
+	    }).run();
 
     const router = new TokenRouter();
 
@@ -910,6 +928,73 @@ describe('TokenRouter runtime cache', () => {
     expect(current?.cooldownLevel).toBe(1);
     expect(cooldownMs).toBeGreaterThanOrEqual(9 * 60 * 1000);
     expect(cooldownMs).toBeLessThanOrEqual(11 * 60 * 1000);
+  });
+
+  it('marks the token model unavailable after three selected channel failures', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'failure-availability-site',
+      url: 'https://failure-availability-site.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'failure-availability-user',
+      accessToken: 'failure-availability-access-token',
+      apiToken: 'failure-availability-api-token',
+      status: 'active',
+    }).returning().get();
+
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'failure-availability-token',
+      token: 'sk-failure-availability-token',
+      enabled: true,
+      isDefault: true,
+      healthCheckEnabled: false,
+    }).returning().get();
+
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5-failure-availability',
+      routingStrategy: 'stable_first',
+      enabled: true,
+    }).returning().get();
+
+    const channel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: account.id,
+      tokenId: token.id,
+      sourceModel: 'gpt-5-failure-availability',
+      enabled: true,
+    }).returning().get();
+
+    const router = new TokenRouter();
+    for (let index = 0; index < 3; index += 1) {
+      await router.recordFailure(channel.id, {
+        modelName: 'gpt-5-failure-availability',
+        status: 502,
+        errorText: 'upstream failed',
+      });
+    }
+
+    const availability = await db.select().from(schema.tokenModelAvailability)
+      .where(eq(schema.tokenModelAvailability.tokenId, token.id))
+      .get();
+    expect(availability).toMatchObject({
+      modelName: 'gpt-5-failure-availability',
+      available: false,
+      httpStatus: 502,
+      message: 'upstream failed',
+    });
+
+    const refreshedToken = await db.select().from(schema.accountTokens)
+      .where(eq(schema.accountTokens.id, token.id))
+      .get();
+    expect(refreshedToken?.healthCheckEnabled).toBe(true);
+    expect(refreshedToken?.healthCheckIntervalMinutes).toBe(10);
+    expect(refreshedToken?.healthCheckModel).toBe('gpt-5-failure-availability');
+    expect(Date.parse(String(refreshedToken?.healthCheckNextRunAt || ''))).toBeGreaterThan(Date.now());
   });
 
   it('caps weighted cooldowns before Date overflow for heavily failed channels', async () => {

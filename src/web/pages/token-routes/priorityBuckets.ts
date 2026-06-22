@@ -21,6 +21,11 @@ type PriorityBucketEditorSeparatorItem = {
 
 export type PriorityBucketEditorItem = PriorityBucketEditorChannelItem | PriorityBucketEditorSeparatorItem;
 
+export type BuildPriorityBucketsOptions = {
+  probabilityByChannelId?: Map<number, number>;
+  sortWithinBucketByProbability?: boolean;
+};
+
 export function createPriorityBucketSeparatorId(index: number): string {
   return `${PRIORITY_BUCKET_SEPARATOR_PREFIX}${index}`;
 }
@@ -29,7 +34,10 @@ export function isPriorityBucketSeparatorId(value: unknown): value is string {
   return typeof value === 'string' && value.startsWith(PRIORITY_BUCKET_SEPARATOR_PREFIX);
 }
 
-export function buildPriorityBuckets(channels: RouteChannel[]): PriorityBucket[] {
+export function buildPriorityBuckets(
+  channels: RouteChannel[],
+  options: BuildPriorityBucketsOptions = {},
+): PriorityBucket[] {
   const grouped = new Map<number, RouteChannel[]>();
   for (const channel of normalizeChannels(channels || [])) {
     const priority = channel.priority ?? 0;
@@ -38,7 +46,14 @@ export function buildPriorityBuckets(channels: RouteChannel[]): PriorityBucket[]
   }
   return Array.from(grouped.entries()).map(([priority, bucketChannels]) => ({
     priority,
-    channels: bucketChannels,
+    channels: options.sortWithinBucketByProbability
+      ? [...bucketChannels].sort((left, right) => {
+        const probabilityDiff = (options.probabilityByChannelId?.get(right.id) ?? 0)
+          - (options.probabilityByChannelId?.get(left.id) ?? 0);
+        if (Math.abs(probabilityDiff) > 1e-9) return probabilityDiff > 0 ? 1 : -1;
+        return (left.id ?? 0) - (right.id ?? 0);
+      })
+      : bucketChannels,
   }));
 }
 

@@ -67,6 +67,8 @@ describe('channelRecoveryProbeService', () => {
     invalidateTokenRouterCache();
     resetSiteRuntimeHealthState();
 
+    await db.delete(schema.tokenModelAvailability).run();
+    await db.delete(schema.modelAvailability).run();
     await db.delete(schema.routeChannels).run();
     await db.delete(schema.tokenRoutes).run();
     await db.delete(schema.settings).run();
@@ -144,6 +146,25 @@ describe('channelRecoveryProbeService', () => {
     expect(refreshed?.lastFailAt).toBeNull();
     expect(refreshed?.consecutiveFailCount).toBe(0);
     expect(refreshed?.cooldownLevel).toBe(0);
+
+    const availability = await db.select().from(schema.tokenModelAvailability)
+      .where(eq(schema.tokenModelAvailability.tokenId, token.id))
+      .get();
+    expect(availability).toMatchObject({
+      modelName: 'gpt-5.4',
+      available: true,
+      message: '请求成功',
+      httpStatus: 200,
+      responseText: '后台复检成功',
+      latencyMs: 320,
+    });
+
+    const refreshedToken = await db.select().from(schema.accountTokens)
+      .where(eq(schema.accountTokens.id, token.id))
+      .get();
+    expect(refreshedToken?.healthCheckLastAvailable).toBe(true);
+    expect(refreshedToken?.healthCheckLastMessage).toBe('后台复检成功');
+    expect(refreshedToken?.healthCheckLastLatencyMs).toBe(320);
   });
 
   it('also probes active leased channels in the background', async () => {

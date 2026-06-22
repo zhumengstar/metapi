@@ -12,9 +12,9 @@ export const ROUTING_PROFILE_PRESETS: Record<Exclude<RoutingProfilePresetId, 'cu
   balanced: {
     baseWeightFactor: 0.5,
     valueScoreFactor: 0.5,
-    costWeight: 0.4,
-    balanceWeight: 0.3,
-    usageWeight: 0.3,
+    costWeight: 0.7,
+    balanceWeight: 0.15,
+    usageWeight: 0.15,
   },
   stable: {
     baseWeightFactor: 0.7,
@@ -26,9 +26,9 @@ export const ROUTING_PROFILE_PRESETS: Record<Exclude<RoutingProfilePresetId, 'cu
   cost: {
     baseWeightFactor: 0.35,
     valueScoreFactor: 0.65,
-    costWeight: 0.75,
-    balanceWeight: 0.15,
-    usageWeight: 0.1,
+    costWeight: 0.85,
+    balanceWeight: 0.1,
+    usageWeight: 0.05,
   },
 };
 
