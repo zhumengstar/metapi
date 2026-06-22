@@ -32,6 +32,10 @@ const oauthConnectionProxyUpdatePayloadSchema = z.object({
   useSystemProxy: z.boolean().optional(),
 }).passthrough();
 
+const oauthConnectionStatusUpdatePayloadSchema = z.object({
+  status: z.enum(['active', 'disabled']),
+}).passthrough();
+
 const oauthQuotaBatchRefreshPayloadSchema = z.object({
   accountIds: z.array(z.number().int().positive()).optional(),
 }).passthrough();
@@ -86,6 +90,7 @@ export type AuthChangePayload = z.output<typeof authChangePayloadSchema>;
 export type MonitorConfigPayload = z.output<typeof monitorConfigPayloadSchema>;
 export type OauthConnectionRebindPayload = z.output<typeof oauthConnectionRebindPayloadSchema>;
 export type OauthConnectionProxyUpdatePayload = z.output<typeof oauthConnectionProxyUpdatePayloadSchema>;
+export type OauthConnectionStatusUpdatePayload = z.output<typeof oauthConnectionStatusUpdatePayloadSchema>;
 export type OauthImportPayload = z.output<typeof oauthImportPayloadSchema>;
 export type OauthManualCallbackPayload = z.output<typeof oauthManualCallbackPayloadSchema>;
 export type OauthQuotaBatchRefreshPayload = z.output<typeof oauthQuotaBatchRefreshPayloadSchema>;
@@ -126,6 +131,9 @@ function formatSupportRoutePayloadError(error: z.ZodError): string {
   }
   if (firstPath === 'useSystemProxy') {
     return 'Invalid useSystemProxy. Expected boolean.';
+  }
+  if (firstPath === 'status') {
+    return 'Invalid status. Expected active/disabled.';
   }
   if (firstPath === 'accountIds') {
     return 'Invalid accountIds. Expected positive number array.';
@@ -235,6 +243,11 @@ export function parseOauthConnectionRebindPayload(input: unknown):
 export function parseOauthConnectionProxyUpdatePayload(input: unknown):
 { success: true; data: OauthConnectionProxyUpdatePayload } | { success: false; error: string } {
   return parseSupportRoutePayload(oauthConnectionProxyUpdatePayloadSchema, input);
+}
+
+export function parseOauthConnectionStatusUpdatePayload(input: unknown):
+{ success: true; data: OauthConnectionStatusUpdatePayload } | { success: false; error: string } {
+  return parseSupportRoutePayload(oauthConnectionStatusUpdatePayloadSchema, input);
 }
 
 export function parseOauthQuotaBatchRefreshPayload(input: unknown):

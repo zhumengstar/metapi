@@ -920,11 +920,13 @@ export async function listOauthConnections(options: {
     const oauth = getOauthInfoFromAccount(row.accounts);
     if (!oauth) return [];
     const models = modelMap.get(row.accounts.id) || [];
-    const status = (
-      oauth.modelDiscoveryStatus === 'abnormal'
-      || row.accounts.status !== 'active'
-      || row.sites.status !== 'active'
-    ) ? 'abnormal' : 'healthy';
+    const status = row.accounts.status === 'disabled'
+      ? 'disabled'
+      : (
+        oauth.modelDiscoveryStatus === 'abnormal'
+        || row.accounts.status !== 'active'
+        || row.sites.status !== 'active'
+      ) ? 'abnormal' : 'healthy';
     const routeUnit = routeParticipationByAccount.get(row.accounts.id) || null;
     const routeParticipation = routeUnit
       ? {
@@ -984,6 +986,31 @@ export async function deleteOauthConnection(accountId: number) {
   await db.delete(schema.accounts).where(eq(schema.accounts.id, accountId)).run();
   await routeRefreshWorkflow.rebuildRoutesOnly();
   return { success: true };
+}
+
+export async function updateOauthConnectionStatus(input: {
+  accountId: number;
+  status: 'active' | 'disabled';
+}) {
+  const account = await db.select().from(schema.accounts)
+    .where(eq(schema.accounts.id, input.accountId))
+    .get();
+  if (!account) {
+    throw new Error('oauth account not found');
+  }
+  const normalizedOauth = getOauthInfoFromAccount(account);
+  if (!normalizedOauth) {
+    throw new Error('account is not managed by oauth');
+  }
+
+  const nowIso = new Date().toISOString();
+  await db.update(schema.accounts).set({
+    status: input.status,
+    updatedAt: nowIso,
+  }).where(eq(schema.accounts.id, input.accountId)).run();
+  await routeRefreshWorkflow.rebuildRoutesOnly();
+
+  return { success: true, status: input.status };
 }
 
 export async function refreshOauthConnectionQuota(accountId: number) {

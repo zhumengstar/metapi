@@ -16,7 +16,9 @@ import {
   startOauthRebindFlow,
   submitOauthManualCallback,
   updateOauthConnectionProxySettings,
+  updateOauthConnectionStatus,
 } from '../../services/oauth/service.js';
+import { invalidateTokenRouterCache } from '../../services/tokenRouter.js';
 import {
   createOauthRouteUnit,
   deleteOauthRouteUnit,
@@ -26,6 +28,7 @@ import { parseSiteProxyUrlInput } from '../../services/siteProxy.js';
 import {
   parseOauthConnectionRebindPayload,
   parseOauthConnectionProxyUpdatePayload,
+  parseOauthConnectionStatusUpdatePayload,
   parseOauthImportPayload,
   parseOauthManualCallbackPayload,
   parseOauthQuotaBatchRefreshPayload,
@@ -354,6 +357,37 @@ export async function oauthRoutes(app: FastifyInstance) {
           return reply.code(404).send({ message });
         }
         request.log.error({ err: error }, 'oauth proxy update failed');
+        return reply.code(500).send({ message });
+      }
+    },
+  );
+
+  app.patch<{ Params: { accountId: string }; Body: unknown }>(
+    '/api/oauth/connections/:accountId/status',
+    { preHandler: [limitOauthConnectionMutate] },
+    async (request, reply) => {
+      const parsedBody = parseOauthConnectionStatusUpdatePayload(request.body);
+      if (!parsedBody.success) {
+        return reply.code(400).send({ message: parsedBody.error });
+      }
+
+      const accountId = parsePositiveInteger(request.params.accountId);
+      if (accountId === null) {
+        return reply.code(400).send({ message: 'invalid account id' });
+      }
+      try {
+        const result = await updateOauthConnectionStatus({
+          accountId,
+          status: parsedBody.data.status,
+        });
+        invalidateTokenRouterCache();
+        return result;
+      } catch (error: any) {
+        const message = error?.message || 'oauth account not found';
+        if (message === 'oauth account not found' || message === 'account is not managed by oauth') {
+          return reply.code(404).send({ message });
+        }
+        request.log.error({ err: error }, 'oauth status update failed');
         return reply.code(500).send({ message });
       }
     },

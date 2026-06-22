@@ -350,7 +350,14 @@ function resolveConnectionEmailLabel(connection: OAuthConnectionInfo): string {
 }
 
 function resolveConnectionStatusLabel(status?: string): string {
+  if (status === 'disabled') return '禁用';
   return status === 'abnormal' ? '异常' : '正常';
+}
+
+function resolveConnectionStatusBadgeClass(status?: string): string {
+  if (status === 'disabled') return 'badge-muted';
+  if (status === 'abnormal') return 'badge-warning';
+  return 'badge-success';
 }
 
 function resolveQuotaStatusLabel(status?: OAuthQuotaInfo['status']): string {
@@ -1339,6 +1346,21 @@ export default function OAuthManagement() {
     }
   };
 
+  const handleToggleStatus = async (connection: OAuthConnectionInfo) => {
+    const nextStatus = connection.status === 'disabled' ? 'active' : 'disabled';
+    const actionKey = `status:${connection.accountId}`;
+    setActionLoadingKey(actionKey);
+    try {
+      await api.updateOAuthConnectionStatus(connection.accountId, { status: nextStatus });
+      setSessionSuccess(nextStatus === 'disabled' ? 'OAuth 连接已禁用' : 'OAuth 连接已启用');
+      await loadConnections();
+    } catch (error: any) {
+      setSessionError(error?.message || '更新 OAuth 连接状态失败');
+    } finally {
+      setActionLoadingKey('');
+    }
+  };
+
   const handleRefreshQuota = async (accountId: number) => {
     const actionKey = `quota:${accountId}`;
     setActionLoadingKey(actionKey);
@@ -1709,6 +1731,7 @@ export default function OAuthManagement() {
                   { value: '', label: '全部状态' },
                   { value: 'healthy', label: '正常' },
                   { value: 'abnormal', label: '异常' },
+                  { value: 'disabled', label: '禁用' },
                 ]}
                 placeholder="全部状态"
               />
@@ -1802,6 +1825,7 @@ export default function OAuthManagement() {
           { value: '', label: '全部状态' },
           { value: 'healthy', label: '正常' },
           { value: 'abnormal', label: '异常' },
+          { value: 'disabled', label: '禁用' },
         ]}
         placeholder="全部状态"
       />
@@ -1885,7 +1909,7 @@ export default function OAuthManagement() {
                       <span className={`badge oauth-badge ${connection.provider === 'codex' ? 'badge-info' : 'badge-primary'}`}>
                         {connection.provider}
                       </span>
-                      <span className={`badge oauth-badge ${connection.status === 'abnormal' ? 'badge-warning' : 'badge-success'}`}>
+                      <span className={`badge oauth-badge ${resolveConnectionStatusBadgeClass(connection.status)}`}>
                         {resolveConnectionStatusLabel(connection.status)}
                       </span>
                     </div>
@@ -2003,6 +2027,16 @@ export default function OAuthManagement() {
                     onClick={() => openRebindDrawer(connection)}
                   >
                     重新授权
+                  </button>
+                  <button
+                    type="button"
+                    className={connection.status === 'disabled' ? 'btn btn-link btn-link-primary' : 'btn btn-link btn-link-warning'}
+                    onClick={() => void handleToggleStatus(connection)}
+                    disabled={actionLoadingKey === `status:${connection.accountId}`}
+                  >
+                    {actionLoadingKey === `status:${connection.accountId}`
+                      ? '更新中...'
+                      : connection.status === 'disabled' ? '启用' : '禁用'}
                   </button>
                   <button
                     type="button"
@@ -2124,6 +2158,16 @@ export default function OAuthManagement() {
               </button>
               <button type="button" className="btn btn-link btn-link-info" onClick={() => openRebindDrawer(connection)}>
                 重新授权
+              </button>
+              <button
+                type="button"
+                className={connection.status === 'disabled' ? 'btn btn-link btn-link-primary' : 'btn btn-link btn-link-warning'}
+                onClick={() => void handleToggleStatus(connection)}
+                disabled={actionLoadingKey === `status:${connection.accountId}`}
+              >
+                {actionLoadingKey === `status:${connection.accountId}`
+                  ? '更新中...'
+                  : connection.status === 'disabled' ? '启用' : '禁用'}
               </button>
               <button type="button" className="btn btn-link btn-link-danger" onClick={() => handleDelete(connection.accountId)}>
                 删除连接

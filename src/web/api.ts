@@ -749,7 +749,7 @@ export type OAuthConnectionInfo = {
   projectId?: string | null;
   modelCount: number;
   modelsPreview: string[];
-  status: "healthy" | "abnormal";
+  status: "healthy" | "abnormal" | "disabled";
   quota?: OAuthQuotaInfo | null;
   routeChannelCount?: number;
   lastModelSyncAt?: string | null;
@@ -1307,6 +1307,14 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(data || {}),
     }) as Promise<{ success: true }>,
+  updateOAuthConnectionStatus: (
+    accountId: number,
+    data: { status: "active" | "disabled" },
+  ) =>
+    request(`/api/oauth/connections/${accountId}/status`, {
+      method: "PATCH",
+      body: JSON.stringify(data || {}),
+    }) as Promise<{ success: true; status: "active" | "disabled" }>,
   rebindOAuthConnection: (
     accountId: number,
     data?: { proxyUrl?: string | null; useSystemProxy?: boolean },
