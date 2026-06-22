@@ -18,6 +18,7 @@ const testAccountTokenModelAvailabilityMock = vi.fn();
 
 type AccountTokenServiceModule = typeof import('../../services/accountTokenService.js');
 type BackgroundTaskServiceModule = typeof import('../../services/backgroundTaskService.js');
+type HealthCheckServiceModule = typeof import('../../services/accountTokenHealthCheckService.js');
 
 vi.mock('../../services/platforms/index.js', () => ({
   getAdapter: () => ({
@@ -55,6 +56,7 @@ describe('account tokens sync routes with site status', () => {
   let maskToken: AccountTokenServiceModule['maskToken'];
   let getBackgroundTask: BackgroundTaskServiceModule['getBackgroundTask'];
   let resetBackgroundTasks: BackgroundTaskServiceModule['__resetBackgroundTasksForTests'];
+  let runDueAccountTokenHealthChecks: HealthCheckServiceModule['runDueAccountTokenHealthChecks'];
   let dataDir = '';
   let previousDataDir: string | undefined;
   let seedId = 0;
@@ -63,6 +65,67 @@ describe('account tokens sync routes with site status', () => {
     seedId += 1;
     return seedId;
   };
+
+  async function waitForRouteChannel(input: { model: string; accountId: number; tokenId: number }) {
+    const deadline = Date.now() + 4_000;
+    let route: typeof schema.tokenRoutes.$inferSelect | undefined;
+    while (Date.now() < deadline) {
+      route = await db.select()
+        .from(schema.tokenRoutes)
+        .where(eq(schema.tokenRoutes.modelPattern, input.model))
+        .get();
+      if (route) {
+        const channel = await db.select()
+          .from(schema.routeChannels)
+          .where(and(
+            eq(schema.routeChannels.routeId, route.id),
+            eq(schema.routeChannels.accountId, input.accountId),
+            eq(schema.routeChannels.tokenId, input.tokenId),
+          ))
+          .get();
+        if (channel) return { route, channel };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return { route, channel: undefined };
+  }
+
+  async function persistMockedModelTestResults(results: Array<{
+    tokenId: number;
+    model: string;
+    available: boolean;
+    message: string;
+    responseText?: string | null;
+    httpStatus?: number | null;
+    latencyMs?: number | null;
+    checkedAt?: string;
+  }>) {
+    for (const result of results) {
+      await db.insert(schema.tokenModelAvailability)
+        .values({
+          tokenId: result.tokenId,
+          modelName: result.model,
+          available: result.available,
+          message: result.message,
+          responseText: result.responseText ?? null,
+          httpStatus: result.httpStatus ?? null,
+          latencyMs: result.latencyMs ?? null,
+          checkedAt: result.checkedAt || '2026-06-21T00:00:00.000Z',
+        })
+        .onConflictDoUpdate({
+          target: [schema.tokenModelAvailability.tokenId, schema.tokenModelAvailability.modelName],
+          set: {
+            available: result.available,
+            message: result.message,
+            responseText: result.responseText ?? null,
+            httpStatus: result.httpStatus ?? null,
+            latencyMs: result.latencyMs ?? null,
+            checkedAt: result.checkedAt || '2026-06-21T00:00:00.000Z',
+          },
+        })
+        .run();
+    }
+  }
 
   const seedAccount = async (input: { siteStatus?: 'active' | 'disabled'; accountStatus?: string; accessToken?: string | null }) => {
     const id = nextSeed();
@@ -96,12 +159,14 @@ describe('account tokens sync routes with site status', () => {
     const dbModule = await import('../../db/index.js');
     const accountTokenServiceModule = await import('../../services/accountTokenService.js');
     const backgroundTaskServiceModule = await import('../../services/backgroundTaskService.js');
+    const healthCheckServiceModule = await import('../../services/accountTokenHealthCheckService.js');
     const routesModule = await import('./accountTokens.js');
     db = dbModule.db;
     schema = dbModule.schema;
     maskToken = accountTokenServiceModule.maskToken;
     getBackgroundTask = backgroundTaskServiceModule.getBackgroundTask;
     resetBackgroundTasks = backgroundTaskServiceModule.__resetBackgroundTasksForTests;
+    runDueAccountTokenHealthChecks = healthCheckServiceModule.runDueAccountTokenHealthChecks;
 
     app = Fastify();
     await app.register(routesModule.accountTokensRoutes);
@@ -121,7 +186,8 @@ describe('account tokens sync routes with site status', () => {
     testAccountTokenModelAvailabilityMock.mockImplementation(async (options: { model: string; tokenIds: number[] }) => ({
       model: options.model,
       total: options.tokenIds.length,
-      results: options.tokenIds.map((tokenId) => ({
+      results: await (async () => {
+        const results = options.tokenIds.map((tokenId) => ({
         tokenId,
         model: options.model,
         available: true,
@@ -130,7 +196,10 @@ describe('account tokens sync routes with site status', () => {
         httpStatus: 200,
         latencyMs: 12,
         checkedAt: '2026-06-21T00:00:00.000Z',
-      })),
+        }));
+        await persistMockedModelTestResults(results);
+        return results;
+      })(),
     }));
     resetBackgroundTasks();
     seedId = 0;
@@ -1839,7 +1908,9 @@ describe('account tokens sync routes with site status', () => {
       modelNames: string[];
     };
     expect(body.routeEnabled).toBe(true);
-    expect(body.models).toEqual([{ name: 'gpt-5.5', routeEnabled: true }]);
+    expect(body.models).toEqual([
+      expect.objectContaining({ name: 'gpt-5.5', routeEnabled: true }),
+    ]);
     expect(body.modelNames).toEqual(['gpt-5.5']);
 
     const row = await db.select().from(schema.tokenModelAvailability)
@@ -1888,7 +1959,7 @@ describe('account tokens sync routes with site status', () => {
     ]);
   });
 
-  it('does not rebuild routes or change token enabled state after model availability test', async () => {
+  it('keeps manual model availability test from changing token enabled state', async () => {
     const { account } = await seedAccount({ siteStatus: 'active' });
     const token = await db.insert(schema.accountTokens).values({
       accountId: account.id,
@@ -1920,6 +1991,7 @@ describe('account tokens sync routes with site status', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).not.toHaveProperty('routeRebuild');
+    expect(response.json()).not.toHaveProperty('routeEnabledModels');
 
     const latestToken = await db.select()
       .from(schema.accountTokens)
@@ -1936,6 +2008,147 @@ describe('account tokens sync routes with site status', () => {
       .get();
     expect(availability?.routeEnabled).toBe(true);
     expect(await db.select().from(schema.routeChannels).all()).toHaveLength(0);
+  });
+
+  it('does not add an enabled successful token model to routing after manual availability test', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'manual-route-enabled',
+      token: 'sk-manual-route-enabled',
+      source: 'manual',
+      enabled: true,
+      isDefault: false,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/account-tokens/models/test',
+      payload: {
+        model: 'gpt-5.5',
+        tokenIds: [token.id],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).not.toHaveProperty('routeRebuild');
+    expect(response.json()).not.toHaveProperty('routeEnabledModels');
+
+    const availability = await db.select()
+      .from(schema.tokenModelAvailability)
+      .where(and(
+        eq(schema.tokenModelAvailability.tokenId, token.id),
+        eq(schema.tokenModelAvailability.modelName, 'gpt-5.5'),
+      ))
+      .get();
+    expect(availability).toMatchObject({
+      available: true,
+      routeEnabled: false,
+      httpStatus: 200,
+      message: '请求成功',
+    });
+
+    expect(await db.select().from(schema.routeChannels).all()).toHaveLength(0);
+  });
+
+  it('queues manual model availability tests as background tasks when requested', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'manual-route-enabled-async',
+      token: 'sk-manual-route-enabled-async',
+      source: 'manual',
+      enabled: true,
+      isDefault: false,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/account-tokens/models/test',
+      payload: {
+        model: 'gpt-5.5',
+        tokenIds: [token.id],
+        async: true,
+      },
+    });
+
+    expect(response.statusCode).toBe(202);
+    const body = response.json() as { queued: boolean; jobId: string; taskId: string };
+    expect(body.queued).toBe(true);
+    expect(body.jobId).toBeTruthy();
+    expect(body.taskId).toBe(body.jobId);
+
+    const task = await waitForBackgroundTaskToReachTerminalState(getBackgroundTask, body.jobId);
+    expect(task?.status).toBe('succeeded');
+    expect(task?.result).not.toHaveProperty('routeRebuild');
+    expect(task?.result).not.toHaveProperty('routeEnabledModels');
+
+    const availability = await db.select()
+      .from(schema.tokenModelAvailability)
+      .where(and(
+        eq(schema.tokenModelAvailability.tokenId, token.id),
+        eq(schema.tokenModelAvailability.modelName, 'gpt-5.5'),
+      ))
+      .get();
+    expect(availability).toMatchObject({
+      available: true,
+      routeEnabled: false,
+    });
+  });
+
+  it('updates health check metadata after manual model availability test', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'manual-health-check',
+      token: 'sk-manual-health-check',
+      source: 'manual',
+      enabled: true,
+      isDefault: true,
+      valueStatus: 'ready' as any,
+      healthCheckEnabled: true,
+      healthCheckIntervalMinutes: 30,
+      healthCheckModel: '',
+      healthCheckNextRunAt: '2026-06-20T00:00:00.000Z',
+    }).returning().get();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/account-tokens/models/test',
+      payload: {
+        model: 'gpt-5.5',
+        tokenIds: [token.id],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.healthCheckTokens).toEqual([
+      expect.objectContaining({
+        id: token.id,
+        healthCheckModel: 'gpt-5.5',
+        healthCheckLastRunAt: '2026-06-21T00:00:00.000Z',
+        healthCheckLastAvailable: true,
+        healthCheckLastMessage: '成功 1/1：gpt-5.5',
+        healthCheckLastLatencyMs: 12,
+        healthCheckNextRunAt: '2026-06-21T00:30:00.000Z',
+      }),
+    ]);
+
+    const latestToken = await db.select()
+      .from(schema.accountTokens)
+      .where(eq(schema.accountTokens.id, token.id))
+      .get();
+    expect(latestToken).toMatchObject({
+      healthCheckModel: 'gpt-5.5',
+      healthCheckLastRunAt: '2026-06-21T00:00:00.000Z',
+      healthCheckLastAvailable: true,
+      healthCheckLastMessage: '成功 1/1：gpt-5.5',
+      healthCheckLastLatencyMs: 12,
+      healthCheckNextRunAt: '2026-06-21T00:30:00.000Z',
+    });
   });
 
   it('preserves route-enabled model state when saving skipped image-only test result', async () => {
@@ -1973,7 +2186,18 @@ describe('account tokens sync routes with site status', () => {
     });
 
     expect(response.statusCode).toBe(200);
-    expect(response.json()).not.toHaveProperty('routeRebuild');
+    const body = response.json();
+    expect(body).not.toHaveProperty('routeRebuild');
+    expect(body.healthCheckTokens).toEqual([
+      expect.objectContaining({
+        id: token.id,
+        healthCheckModel: 'gpt-image-2',
+        healthCheckLastRunAt: '2026-06-21T00:00:00.000Z',
+        healthCheckLastAvailable: false,
+        healthCheckLastMessage: '全部失败：gpt-image-2: 图片模型跳过文本测活',
+        healthCheckLastLatencyMs: null,
+      }),
+    ]);
 
     const availability = await db.select()
       .from(schema.tokenModelAvailability)
@@ -1985,9 +2209,16 @@ describe('account tokens sync routes with site status', () => {
     expect(availability?.available).toBe(false);
     expect(availability?.routeEnabled).toBe(true);
     expect(await db.select().from(schema.routeChannels).all()).toHaveLength(0);
+
+    const latestToken = await db.select()
+      .from(schema.accountTokens)
+      .where(eq(schema.accountTokens.id, token.id))
+      .get();
+    expect(latestToken?.healthCheckLastAvailable).toBe(false);
+    expect(latestToken?.healthCheckLastMessage).toBe('全部失败：gpt-image-2: 图片模型跳过文本测活');
   });
 
-  it('runs health checks for multiple configured models and enables successful models for routing', async () => {
+  it('runs manual health checks for multiple configured models without enabling successful models for routing', async () => {
     const { account } = await seedAccount({ siteStatus: 'active' });
     const token = await db.insert(schema.accountTokens).values({
       accountId: account.id,
@@ -2031,10 +2262,8 @@ describe('account tokens sync routes with site status', () => {
       },
     ]).run();
 
-    testAccountTokenModelAvailabilityMock.mockImplementation(async (options: { model: string; tokenIds: number[] }) => ({
-      model: options.model,
-      total: options.tokenIds.length,
-      results: options.tokenIds.map((tokenId) => ({
+    testAccountTokenModelAvailabilityMock.mockImplementation(async (options: { model: string; tokenIds: number[] }) => {
+      const results = options.tokenIds.map((tokenId) => ({
         tokenId,
         model: options.model,
         available: options.model === 'gpt-5.5',
@@ -2043,8 +2272,14 @@ describe('account tokens sync routes with site status', () => {
         httpStatus: options.model === 'gpt-5.5' ? 200 : 500,
         latencyMs: 10,
         checkedAt: '2026-06-21T00:00:00.000Z',
-      })),
-    }));
+      }));
+      await persistMockedModelTestResults(results);
+      return {
+        model: options.model,
+        total: options.tokenIds.length,
+        results,
+      };
+    });
 
     const runResponse = await app.inject({
       method: 'POST',
@@ -2076,8 +2311,248 @@ describe('account tokens sync routes with site status', () => {
       .where(eq(schema.tokenModelAvailability.tokenId, token.id))
       .all();
     expect(availability).toEqual(expect.arrayContaining([
-      expect.objectContaining({ modelName: 'gpt-5.5', routeEnabled: true }),
+      expect.objectContaining({ modelName: 'gpt-5.5', routeEnabled: false }),
       expect.objectContaining({ modelName: 'gpt-5.4', available: false, routeEnabled: false }),
     ]));
+    expect(await db.select().from(schema.routeChannels).all()).toHaveLength(0);
+  });
+
+  it('auto-enables successful models for routing after repeated scheduled health check success', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active', accessToken: null });
+    await db.update(schema.accounts)
+      .set({ extraConfig: mergeAccountExtraConfig(null, { credentialMode: 'session' }) })
+      .where(eq(schema.accounts.id, account.id))
+      .run();
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'scheduled-health-check',
+      token: 'sk-scheduled-health-check',
+      source: 'manual',
+      enabled: true,
+      isDefault: false,
+      valueStatus: 'ready' as any,
+      healthCheckEnabled: true,
+      healthCheckIntervalMinutes: 30,
+      healthCheckModel: 'gpt-5.5, gpt-5.4',
+      healthCheckNextRunAt: '2026-06-20T00:00:00.000Z',
+    }).returning().get();
+
+    await db.insert(schema.tokenModelAvailability).values([
+      {
+        tokenId: token.id,
+        modelName: 'gpt-5.5',
+        available: false,
+        routeEnabled: false,
+        message: '待测活',
+        checkedAt: '2026-06-20T00:00:00.000Z',
+      },
+      {
+        tokenId: token.id,
+        modelName: 'gpt-5.4',
+        available: false,
+        routeEnabled: false,
+        message: '待测活',
+        checkedAt: '2026-06-20T00:00:00.000Z',
+      },
+    ]).run();
+
+    testAccountTokenModelAvailabilityMock.mockImplementation(async (options: { model: string; tokenIds: number[] }) => {
+      const results = options.tokenIds.map((tokenId) => ({
+        tokenId,
+        model: options.model,
+        available: options.model === 'gpt-5.5',
+        message: options.model === 'gpt-5.5' ? '请求成功' : '请求失败',
+        responseText: options.model === 'gpt-5.5' ? '我是测试模型' : null,
+        httpStatus: options.model === 'gpt-5.5' ? 200 : 500,
+        latencyMs: 10,
+        checkedAt: '2026-06-21T00:00:00.000Z',
+      }));
+      await persistMockedModelTestResults(results);
+      return {
+        model: options.model,
+        total: options.tokenIds.length,
+        results,
+      };
+    });
+
+    const scheduled = await runDueAccountTokenHealthChecks();
+
+    expect(scheduled.skipped).toBe(false);
+    expect(scheduled.total).toBe(1);
+    expect(scheduled.results[0]?.routeRebuilt).toBe(false);
+
+    let availability = await db.select()
+      .from(schema.tokenModelAvailability)
+      .where(eq(schema.tokenModelAvailability.tokenId, token.id))
+      .all();
+    expect(availability).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        modelName: 'gpt-5.5',
+        available: true,
+        routeEnabled: false,
+        healthCheckSuccessStreak: 1,
+      }),
+      expect.objectContaining({ modelName: 'gpt-5.4', available: false, routeEnabled: false }),
+    ]));
+
+    for (let index = 0; index < 2; index += 1) {
+      await db.update(schema.accountTokens)
+        .set({ healthCheckNextRunAt: '2026-06-20T00:00:00.000Z' })
+        .where(eq(schema.accountTokens.id, token.id))
+        .run();
+      await runDueAccountTokenHealthChecks();
+    }
+
+    availability = await db.select()
+      .from(schema.tokenModelAvailability)
+      .where(eq(schema.tokenModelAvailability.tokenId, token.id))
+      .all();
+    expect(availability).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        modelName: 'gpt-5.5',
+        available: true,
+        routeEnabled: true,
+        routeEnabledSource: 'health_check',
+        healthCheckSuccessStreak: 3,
+        routeManualDisabledAt: null,
+      }),
+      expect.objectContaining({
+        modelName: 'gpt-5.4',
+        available: false,
+        routeEnabled: false,
+        healthCheckSuccessStreak: 0,
+      }),
+    ]));
+
+    const { channel } = await waitForRouteChannel({
+      model: 'gpt-5.5',
+      accountId: account.id,
+      tokenId: token.id,
+    });
+    expect(channel).toMatchObject({
+      enabled: true,
+    });
+  });
+
+  it('does not auto-enable scheduled health check models after manual route disable', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active', accessToken: null });
+    await db.update(schema.accounts)
+      .set({ extraConfig: mergeAccountExtraConfig(null, { credentialMode: 'session' }) })
+      .where(eq(schema.accounts.id, account.id))
+      .run();
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'manual-disabled-health-check',
+      token: 'sk-manual-disabled-health-check',
+      source: 'manual',
+      enabled: true,
+      isDefault: false,
+      valueStatus: 'ready' as any,
+      healthCheckEnabled: true,
+      healthCheckIntervalMinutes: 30,
+      healthCheckModel: 'gpt-5.5',
+      healthCheckNextRunAt: '2026-06-20T00:00:00.000Z',
+    }).returning().get();
+
+    await db.insert(schema.tokenModelAvailability).values({
+      tokenId: token.id,
+      modelName: 'gpt-5.5',
+      available: true,
+      routeEnabled: true,
+      routeEnabledSource: 'health_check',
+      healthCheckSuccessStreak: 3,
+      message: '请求成功',
+      checkedAt: '2026-06-20T00:00:00.000Z',
+    }).run();
+
+    const disableResponse = await app.inject({
+      method: 'POST',
+      url: `/api/account-tokens/${token.id}/models/route-enabled`,
+      payload: {
+        modelName: 'gpt-5.5',
+        routeEnabled: false,
+      },
+    });
+    expect(disableResponse.statusCode).toBe(200);
+
+    testAccountTokenModelAvailabilityMock.mockImplementation(async (options: { model: string; tokenIds: number[] }) => {
+      const results = options.tokenIds.map((tokenId) => ({
+        tokenId,
+        model: options.model,
+        available: true,
+        message: '请求成功',
+        responseText: '我是测试模型',
+        httpStatus: 200,
+        latencyMs: 10,
+        checkedAt: '2026-06-21T00:00:00.000Z',
+      }));
+      await persistMockedModelTestResults(results);
+      return {
+        model: options.model,
+        total: options.tokenIds.length,
+        results,
+      };
+    });
+
+    for (let index = 0; index < 3; index += 1) {
+      await db.update(schema.accountTokens)
+        .set({ healthCheckNextRunAt: '2026-06-20T00:00:00.000Z' })
+        .where(eq(schema.accountTokens.id, token.id))
+        .run();
+      await runDueAccountTokenHealthChecks();
+    }
+
+    const availability = await db.select()
+      .from(schema.tokenModelAvailability)
+      .where(and(
+        eq(schema.tokenModelAvailability.tokenId, token.id),
+        eq(schema.tokenModelAvailability.modelName, 'gpt-5.5'),
+      ))
+      .get();
+    expect(availability).toMatchObject({
+      available: true,
+      routeEnabled: false,
+      routeEnabledSource: 'manual',
+    });
+    expect(availability?.routeManualDisabledAt).toBeTruthy();
+    expect(availability?.healthCheckSuccessStreak).toBeGreaterThanOrEqual(3);
+  });
+
+  it('queues immediate token health checks as background tasks when requested', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'health-check-async',
+      token: 'sk-health-check-async',
+      source: 'manual',
+      enabled: true,
+      isDefault: false,
+      valueStatus: 'ready' as any,
+      healthCheckEnabled: true,
+      healthCheckIntervalMinutes: 30,
+      healthCheckModel: 'gpt-5.5',
+      healthCheckNextRunAt: '2026-06-20T00:00:00.000Z',
+    }).returning().get();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/account-tokens/${token.id}/health-check/run`,
+      payload: { async: true },
+    });
+
+    expect(response.statusCode).toBe(202);
+    const body = response.json() as { queued: boolean; jobId: string; taskId: string };
+    expect(body.queued).toBe(true);
+    expect(body.taskId).toBe(body.jobId);
+
+    const task = await waitForBackgroundTaskToReachTerminalState(getBackgroundTask, body.jobId);
+    expect(task?.status).toBe('succeeded');
+    expect(task?.result).toMatchObject({
+      success: true,
+      result: expect.objectContaining({
+        available: true,
+        model: 'gpt-5.5',
+      }),
+    });
   });
 });

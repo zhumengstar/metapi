@@ -76,6 +76,9 @@ const BOOTSTRAP_OWNED_LEGACY_COLUMNS = [
   'account_tokens.health_check_last_latency_ms',
   'token_model_availability.message',
   'token_model_availability.route_enabled',
+  'token_model_availability.route_enabled_source',
+  'token_model_availability.health_check_success_streak',
+  'token_model_availability.route_manual_disabled_at',
   'token_model_availability.http_status',
   'token_model_availability.response_text',
 ];

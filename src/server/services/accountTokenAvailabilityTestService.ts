@@ -6,6 +6,8 @@ import { isReadyAccountToken } from './accountTokenService.js';
 import { normalizePlatformBaseUrl } from './platforms/standardApiProvider.js';
 import { withAccountProxyOverride, withSiteProxyRequestInit } from './siteProxy.js';
 import { isImageGenerationModel } from './modelType.js';
+import { scheduleRoutesOnlyRebuild } from './routeRefreshWorkflow.js';
+import { invalidateTokenRouterCache } from './tokenRouter.js';
 
 const TOKEN_MODEL_TEST_TIMEOUT_MS = 60_000;
 const TOKEN_MODEL_TEST_CONCURRENCY = 12;
@@ -81,8 +83,22 @@ async function persistTokenModelTestResults(results: AccountTokenModelTestResult
   if (results.length === 0) return;
   const checkedAt = new Date().toISOString();
   const tokenIds = normalizeTokenIds(results.map((result) => result.tokenId));
+  const existingRows = tokenIds.length > 0
+    ? await db.select()
+      .from(schema.tokenModelAvailability)
+      .where(inArray(schema.tokenModelAvailability.tokenId, tokenIds))
+      .all()
+    : [];
+  const existingByKey = new Map<string, typeof schema.tokenModelAvailability.$inferSelect>(
+    existingRows.map((row) => [`${row.tokenId}:${row.modelName.toLowerCase()}`, row]),
+  );
+  let routeRelevantAvailabilityChanged = false;
 
   for (const result of results) {
+    const existing = existingByKey.get(`${result.tokenId}:${result.model.toLowerCase()}`);
+    if (existing?.routeEnabled === true && existing.available !== result.available) {
+      routeRelevantAvailabilityChanged = true;
+    }
     await db.insert(schema.tokenModelAvailability)
       .values({
         tokenId: result.tokenId,
@@ -113,6 +129,11 @@ async function persistTokenModelTestResults(results: AccountTokenModelTestResult
       .set({ updatedAt: checkedAt })
       .where(inArray(schema.accountTokens.id, tokenIds))
       .run();
+  }
+
+  if (routeRelevantAvailabilityChanged) {
+    invalidateTokenRouterCache();
+    scheduleRoutesOnlyRebuild('account-token-model-availability-changed');
   }
 }
 

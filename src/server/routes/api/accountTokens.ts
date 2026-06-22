@@ -18,9 +18,14 @@ import {
 } from '../../services/accountTokenService.js';
 import { getAdapter } from '../../services/platforms/index.js';
 import { getCredentialModeFromExtraConfig, getProxyUrlFromExtraConfig, resolvePlatformUserId } from '../../services/accountExtraConfig.js';
-import { appendBackgroundTaskLog, startBackgroundTask } from '../../services/backgroundTaskService.js';
+import {
+  appendBackgroundTaskLog,
+  startBackgroundTask,
+  waitForBackgroundTaskCompletion,
+} from '../../services/backgroundTaskService.js';
 import { withAccountProxyOverride } from '../../services/siteProxy.js';
-import { rebuildTokenRoutesFromAvailability, type ModelRefreshResult } from '../../services/modelService.js';
+import { type ModelRefreshResult } from '../../services/modelService.js';
+import { scheduleRoutesOnlyRebuild } from '../../services/routeRefreshWorkflow.js';
 import { deleteRouteChannelsByTokenIdsPreservingStats } from '../../services/routeChannelStatsService.js';
 import {
   type CoverageBatchRebuildResult,
@@ -44,6 +49,7 @@ import {
   testAccountTokenModelAvailability,
 } from '../../services/accountTokenAvailabilityTestService.js';
 import {
+  recordManualAccountTokenHealthCheckResults,
   runAccountTokenHealthCheck,
   updateAccountTokenHealthCheckConfig,
 } from '../../services/accountTokenHealthCheckService.js';
@@ -73,6 +79,29 @@ type SyncExecutionResult = {
   total: number;
   defaultTokenId?: number | null;
 };
+
+function shouldRunAsyncAccountTokenTask(body: Record<string, unknown>): boolean {
+  return body.async === true || body.background === true || body.wait === false;
+}
+
+function buildTaskQueuedResponse(task: { id: string; status: string }, reused: boolean) {
+  return {
+    success: true,
+    queued: true,
+    reused,
+    jobId: task.id,
+    taskId: task.id,
+    status: task.status,
+    message: reused ? '检测任务已在后台执行中' : '检测任务已在后台启动',
+  };
+}
+
+function buildTaskFailureReply(reply: any, task: { error?: string | null } | null, fallbackMessage: string) {
+  return reply.code(502).send({
+    success: false,
+    message: task?.error || fallbackMessage,
+  });
+}
 
 type CoverageRefreshFailureItem = {
   accountId: number;
@@ -314,6 +343,9 @@ function normalizeTokenValueKey(value: unknown): string {
 async function removeRouteChannelsForAccountTokens(tokenIds: number[]): Promise<number> {
   const removed = await deleteRouteChannelsByTokenIdsPreservingStats(tokenIds);
   invalidateTokenRouterCache();
+  if (removed > 0) {
+    scheduleRoutesOnlyRebuild('account-token-route-channels-removed');
+  }
   return removed;
 }
 
@@ -326,10 +358,9 @@ async function saveAccountTokenEnabledPreference(token: typeof schema.accountTok
   });
 }
 
-async function rebuildAccountTokenRoutesNow(): Promise<Awaited<ReturnType<typeof rebuildTokenRoutesFromAvailability>>> {
-  const routeRebuild = await rebuildTokenRoutesFromAvailability();
+function scheduleAccountTokenRouteRebuild(reason: string) {
   invalidateTokenRouterCache();
-  return routeRebuild;
+  scheduleRoutesOnlyRebuild(reason);
 }
 
 async function removeRouteChannelsForDisabledAccountTokens(accountId: number): Promise<number> {
@@ -1367,7 +1398,7 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     const successIds: number[] = [];
     const failedItems: Array<{ id: number; message: string }> = [];
     let removedRouteChannels = 0;
-    let routeRebuild: Awaited<ReturnType<typeof rebuildTokenRoutesFromAvailability>> | null = null;
+    let routesChanged = false;
 
     for (const id of ids) {
       try {
@@ -1391,9 +1422,13 @@ export async function accountTokensRoutes(app: FastifyInstance) {
           failedItems.push({ id, message: '待补全令牌不能修改启用状态，请先补全明文 token' });
           continue;
         }
+        const nextEnabled = action === 'enable';
+        if (existing.enabled !== nextEnabled) {
+          routesChanged = true;
+        }
         await db.update(schema.accountTokens)
           .set({
-            enabled: action === 'enable',
+            enabled: nextEnabled,
             autoDisabledAt: null,
             autoDisabledReason: null,
             autoDisabledPreviousEnabled: null,
@@ -1405,9 +1440,9 @@ export async function accountTokensRoutes(app: FastifyInstance) {
           accountId: existing.accountId,
           tokenGroup: existing.tokenGroup,
           tokenName: existing.name,
-          enabled: action === 'enable',
+          enabled: nextEnabled,
         });
-        if (action === 'disable') {
+        if (nextEnabled === false && existing.enabled !== false) {
           removedRouteChannels += await removeRouteChannelsForAccountTokens([id]);
           if (existing.isDefault) {
             await repairDefaultToken(existing.accountId);
@@ -1420,8 +1455,8 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       }
     }
 
-    if (successIds.length > 0 && action === 'enable') {
-      routeRebuild = await rebuildAccountTokenRoutesNow();
+    if (successIds.length > 0 && routesChanged) {
+      scheduleAccountTokenRouteRebuild(`account-token-batch-${action}`);
     }
 
     return {
@@ -1430,7 +1465,7 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       successIds,
       failedItems,
       removedRouteChannels,
-      routeRebuild,
+      routeRebuildScheduled: successIds.length > 0 && routesChanged,
     };
   });
 
@@ -1460,7 +1495,9 @@ export async function accountTokensRoutes(app: FastifyInstance) {
 
     const body = parsedBody.data;
     const updates: Record<string, unknown> = { updatedAt: new Date().toISOString() };
-    let nextValueStatus = resolveAccountTokenValueStatus(existing);
+    const previousValueStatus = resolveAccountTokenValueStatus(existing);
+    let nextValueStatus = previousValueStatus;
+    let routesChanged = false;
 
     if (body.name !== undefined) {
       updates.name = (body.name || '').trim() || existing.name;
@@ -1476,6 +1513,9 @@ export async function accountTokensRoutes(app: FastifyInstance) {
         ? ACCOUNT_TOKEN_VALUE_STATUS_MASKED_PENDING
         : ACCOUNT_TOKEN_VALUE_STATUS_READY;
       updates.valueStatus = nextValueStatus;
+      if (previousValueStatus !== nextValueStatus) {
+        routesChanged = true;
+      }
     }
 
     if (body.group !== undefined) {
@@ -1483,10 +1523,12 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     }
 
     if (nextValueStatus === ACCOUNT_TOKEN_VALUE_STATUS_MASKED_PENDING) {
+      if (existing.enabled !== false) routesChanged = true;
       updates.enabled = false;
       updates.isDefault = false;
     } else {
       if (body.enabled !== undefined) {
+        if (existing.enabled !== body.enabled) routesChanged = true;
         updates.enabled = body.enabled;
         updates.autoDisabledAt = null;
         updates.autoDisabledReason = null;
@@ -1504,10 +1546,9 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     }
 
     let removedRouteChannels = 0;
-    let routeRebuild: Awaited<ReturnType<typeof rebuildTokenRoutesFromAvailability>> | null = null;
     if (nextValueStatus !== ACCOUNT_TOKEN_VALUE_STATUS_MASKED_PENDING && body.enabled !== undefined) {
       await saveAccountTokenEnabledPreference(latest);
-      if (latest.enabled === false) {
+      if (latest.enabled === false && existing.enabled !== false) {
         removedRouteChannels = await removeRouteChannelsForAccountTokens([tokenId]);
       }
     } else if (nextValueStatus === ACCOUNT_TOKEN_VALUE_STATUS_MASKED_PENDING) {
@@ -1529,11 +1570,11 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       return reply.code(500).send({ success: false, message: '更新失败' });
     }
 
-    if (body.enabled !== undefined && latest.enabled === true && isUsableAccountToken(latest)) {
-      routeRebuild = await rebuildAccountTokenRoutesNow();
+    if (routesChanged) {
+      scheduleAccountTokenRouteRebuild('account-token-updated');
     }
 
-    return { success: true, localOnly: body.enabled !== undefined, token: latest, removedRouteChannels, routeRebuild };
+    return { success: true, localOnly: body.enabled !== undefined, token: latest, removedRouteChannels, routeRebuildScheduled: routesChanged };
   });
 
   app.post<{ Params: { id: string } }>('/api/account-tokens/:id/default', async (request, reply) => {
@@ -1664,27 +1705,34 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       return reply.code(404).send({ success: false, message: '模型不存在，请先拉取令牌模型列表' });
     }
 
+    const nextRouteEnabled = body.routeEnabled === true;
+    const routeEnabledChanged = modelRow.routeEnabled !== nextRouteEnabled;
     const now = new Date().toISOString();
-    await db.update(schema.tokenModelAvailability)
-      .set({
-        routeEnabled: body.routeEnabled,
-        checkedAt: modelRow.checkedAt || now,
-      })
-      .where(eq(schema.tokenModelAvailability.id, modelRow.id))
-      .run();
-    const routeRebuild = await rebuildTokenRoutesFromAvailability();
+    if (routeEnabledChanged || !modelRow.checkedAt) {
+      await db.update(schema.tokenModelAvailability)
+        .set({
+          routeEnabled: nextRouteEnabled,
+          routeEnabledSource: 'manual',
+          routeManualDisabledAt: nextRouteEnabled ? null : now,
+          checkedAt: modelRow.checkedAt || now,
+        })
+        .where(eq(schema.tokenModelAvailability.id, modelRow.id))
+        .run();
+    }
+    if (routeEnabledChanged) {
+      scheduleAccountTokenRouteRebuild('account-token-model-route-enabled-changed');
+    }
     const cachedModels = await getAccountTokenModels(tokenId, { refresh: false });
-    invalidateTokenRouterCache();
 
     return {
       success: true,
       tokenId,
       modelName,
-      routeEnabled: body.routeEnabled,
+      routeEnabled: nextRouteEnabled,
       models: cachedModels?.models || [],
       modelNames: cachedModels?.modelNames || [],
       checkedAt: cachedModels?.checkedAt || null,
-      routeRebuild,
+      routeRebuildScheduled: routeEnabledChanged,
     };
   });
 
@@ -1717,17 +1765,57 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     return { success: true, token };
   });
 
-  app.post<{ Params: { id: string } }>('/api/account-tokens/:id/health-check/run', async (request, reply) => {
+  app.post<{ Params: { id: string }; Body: unknown }>('/api/account-tokens/:id/health-check/run', async (request, reply) => {
     const tokenId = Number.parseInt(request.params.id, 10);
     if (Number.isNaN(tokenId)) {
       return reply.code(400).send({ success: false, message: '令牌 ID 无效' });
     }
-    try {
+    const body = (request.body || {}) as Record<string, unknown>;
+    const runHealthCheckTask = async (taskId?: string) => {
+      const startedAt = Date.now();
+      appendBackgroundTaskLog(taskId || '', `开始检测令牌 #${tokenId}`);
       const result = await runAccountTokenHealthCheck(tokenId);
       if (!result) {
-        return reply.code(404).send({ success: false, message: '令牌不存在' });
+        throw new Error('令牌不存在');
       }
+      appendBackgroundTaskLog(
+        taskId || '',
+        `令牌 #${tokenId} 检测完成：${result.result?.message || (result.result?.available ? '可用' : '不可用')}，耗时 ${Date.now() - startedAt}ms`,
+      );
       return { success: true, ...result };
+    };
+
+    try {
+      let taskId = '';
+      const { task, reused } = startBackgroundTask(
+        {
+          type: 'token',
+          title: `检测令牌 #${tokenId}`,
+          dedupeKey: `account-token-health-check:${tokenId}`,
+          keepMs: 30 * 60_000,
+          notifyOnFailure: true,
+          successTitle: `令牌 #${tokenId} 检测完成`,
+          failureTitle: `令牌 #${tokenId} 检测失败`,
+          successMessage: '令牌测活已完成',
+          failureMessage: '令牌测活失败',
+        },
+        async () => {
+          await Promise.resolve();
+          return runHealthCheckTask(taskId);
+        },
+      );
+      taskId = task.id;
+      if (shouldRunAsyncAccountTokenTask(body)) {
+        return reply.code(202).send(buildTaskQueuedResponse(task, reused));
+      }
+      const completedTask = await waitForBackgroundTaskCompletion(task.id, 50);
+      if (!completedTask || completedTask.status === 'failed') {
+        if (completedTask?.error === '令牌不存在') {
+          return reply.code(404).send({ success: false, message: '令牌不存在' });
+        }
+        return buildTaskFailureReply(reply, completedTask, '令牌测活失败');
+      }
+      return completedTask.result;
     } catch (error: any) {
       return reply.code(502).send({
         success: false,
@@ -1755,20 +1843,59 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       return reply.code(400).send({ success: false, message: '单次最多测试 100 个令牌' });
     }
 
-    try {
+    const runModelTestTask = async (taskId?: string) => {
       const startedAt = Date.now();
+      appendBackgroundTaskLog(taskId || '', `开始检测模型 ${model}，令牌 ${tokenIds.length} 个`);
       app.log.info({ model, tokenCount: tokenIds.length }, 'account token model availability test started');
       const result = await testAccountTokenModelAvailability({ model, tokenIds });
+      const healthCheckTokens = await recordManualAccountTokenHealthCheckResults(result.results);
+      const availableCount = result.results.filter((item) => item.available).length;
+      appendBackgroundTaskLog(
+        taskId || '',
+        `模型 ${model} 检测完成：可用 ${availableCount} / ${result.results.length}，耗时 ${Date.now() - startedAt}ms`,
+      );
       app.log.info({
         model,
         tokenCount: tokenIds.length,
-        availableCount: result.results.filter((item) => item.available).length,
+        availableCount,
         durationMs: Date.now() - startedAt,
       }, 'account token model availability test completed');
       return {
         success: true,
         ...result,
+        healthCheckTokens,
       };
+    };
+
+    try {
+      let taskId = '';
+      const dedupeTokenIds = [...tokenIds].sort((a, b) => a - b).join(',');
+      const { task, reused } = startBackgroundTask(
+        {
+          type: 'token',
+          title: `检测模型 ${model}（${tokenIds.length} 个令牌）`,
+          dedupeKey: `account-token-model-test:${model}:${dedupeTokenIds}`,
+          keepMs: 30 * 60_000,
+          notifyOnFailure: true,
+          successTitle: `模型 ${model} 检测完成`,
+          failureTitle: `模型 ${model} 检测失败`,
+          successMessage: '令牌模型检测已完成',
+          failureMessage: '令牌模型检测失败',
+        },
+        async () => {
+          await Promise.resolve();
+          return runModelTestTask(taskId);
+        },
+      );
+      taskId = task.id;
+      if (shouldRunAsyncAccountTokenTask(body)) {
+        return reply.code(202).send(buildTaskQueuedResponse(task, reused));
+      }
+      const completedTask = await waitForBackgroundTaskCompletion(task.id, 50);
+      if (!completedTask || completedTask.status === 'failed') {
+        return buildTaskFailureReply(reply, completedTask, '测试令牌可用性失败');
+      }
+      return completedTask.result;
     } catch (error: any) {
       return reply.code(502).send({
         success: false,
@@ -1810,10 +1937,12 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     }
 
     await persistSkippedAccountTokenModelAvailability(results);
+    const healthCheckTokens = await recordManualAccountTokenHealthCheckResults(results);
     return {
       success: true,
       total: results.length,
       results,
+      healthCheckTokens,
     };
   });
 

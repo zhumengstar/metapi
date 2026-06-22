@@ -1136,6 +1136,8 @@ export async function refreshModelsForAccount(
       await db.insert(schema.tokenModelAvailability).values({
         tokenId: token.id,
         modelName,
+        routeEnabledSource: 'manual',
+        healthCheckSuccessStreak: 0,
         latencyMs,
         checkedAt,
       }).onConflictDoUpdate({

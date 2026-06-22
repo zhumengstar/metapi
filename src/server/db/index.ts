@@ -308,6 +308,9 @@ function ensureTokenManagementSchema() {
       model_name text NOT NULL,
       available integer,
       route_enabled integer DEFAULT false,
+      route_enabled_source text DEFAULT 'manual',
+      health_check_success_streak integer DEFAULT 0,
+      route_manual_disabled_at text,
       message text,
       http_status integer,
       response_text text,
@@ -328,6 +331,15 @@ function ensureTokenManagementSchema() {
   }
   if (!tableColumnExists('token_model_availability', 'response_text')) {
     execSqliteLegacyCompat(`ALTER TABLE token_model_availability ADD COLUMN response_text text;`);
+  }
+  if (!tableColumnExists('token_model_availability', 'route_enabled_source')) {
+    execSqliteLegacyCompat(`ALTER TABLE token_model_availability ADD COLUMN route_enabled_source text DEFAULT 'manual';`);
+  }
+  if (!tableColumnExists('token_model_availability', 'health_check_success_streak')) {
+    execSqliteLegacyCompat(`ALTER TABLE token_model_availability ADD COLUMN health_check_success_streak integer DEFAULT 0;`);
+  }
+  if (!tableColumnExists('token_model_availability', 'route_manual_disabled_at')) {
+    execSqliteLegacyCompat(`ALTER TABLE token_model_availability ADD COLUMN route_manual_disabled_at text;`);
   }
 
   execSqliteLegacyCompat(`

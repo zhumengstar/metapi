@@ -1,6 +1,3 @@
-CREATE TABLE IF NOT EXISTS `route_channel_stat_snapshots` (`id` INT AUTO_INCREMENT NOT NULL PRIMARY KEY, `identity_key` TEXT NOT NULL, `model_pattern` TEXT NOT NULL, `account_id` INT NOT NULL, `token_id` INT, `oauth_route_unit_id` INT, `source_model` TEXT, `success_count` INT DEFAULT 0, `fail_count` INT DEFAULT 0, `total_latency_ms` INT DEFAULT 0, `total_cost` DOUBLE DEFAULT 0, `total_input_tokens` INT DEFAULT 0, `last_used_at` VARCHAR(191), `last_selected_at` VARCHAR(191), `last_fail_at` VARCHAR(191), `consecutive_fail_count` INT NOT NULL DEFAULT 0, `cooldown_level` INT NOT NULL DEFAULT 0, `cooldown_until` VARCHAR(191), `created_at` VARCHAR(191) DEFAULT (DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s')), `updated_at` VARCHAR(191) DEFAULT (DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s')));
-CREATE UNIQUE INDEX `route_channel_stat_snapshots_identity_unique` ON `route_channel_stat_snapshots` (`identity_key`(191));
-CREATE INDEX `route_channel_stat_snapshots_account_id_idx` ON `route_channel_stat_snapshots` (`account_id`);
-CREATE INDEX `route_channel_stat_snapshots_model_pattern_idx` ON `route_channel_stat_snapshots` (`model_pattern`(191));
-CREATE INDEX `route_channel_stat_snapshots_oauth_route_unit_id_idx` ON `route_channel_stat_snapshots` (`oauth_route_unit_id`);
-CREATE INDEX `route_channel_stat_snapshots_token_id_idx` ON `route_channel_stat_snapshots` (`token_id`);
+ALTER TABLE `token_model_availability` ADD COLUMN `route_enabled_source` VARCHAR(191) DEFAULT 'manual';
+ALTER TABLE `token_model_availability` ADD COLUMN `health_check_success_streak` INT DEFAULT 0;
+ALTER TABLE `token_model_availability` ADD COLUMN `route_manual_disabled_at` VARCHAR(191);

@@ -2537,6 +2537,24 @@
           "notNull": false,
           "defaultValue": "false",
           "primaryKey": false
+        },
+        "route_enabled_source": {
+          "logicalType": "text",
+          "notNull": false,
+          "defaultValue": "'manual'",
+          "primaryKey": false
+        },
+        "health_check_success_streak": {
+          "logicalType": "integer",
+          "notNull": false,
+          "defaultValue": "0",
+          "primaryKey": false
+        },
+        "route_manual_disabled_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
         }
       }
     },

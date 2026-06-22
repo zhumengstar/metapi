@@ -85,6 +85,9 @@ export async function loadCachedAccountTokenModels(tokenId: number) {
   const rows = await db.select({
     modelName: schema.tokenModelAvailability.modelName,
     routeEnabled: schema.tokenModelAvailability.routeEnabled,
+    routeEnabledSource: schema.tokenModelAvailability.routeEnabledSource,
+    healthCheckSuccessStreak: schema.tokenModelAvailability.healthCheckSuccessStreak,
+    routeManualDisabledAt: schema.tokenModelAvailability.routeManualDisabledAt,
     checkedAt: schema.tokenModelAvailability.checkedAt,
   })
     .from(schema.tokenModelAvailability)
@@ -100,7 +103,13 @@ export async function loadCachedAccountTokenModels(tokenId: number) {
   return {
     models: normalizeModels(rows.map((row) => row.modelName)).map((modelName) => {
       const matched = rows.find((row) => row.modelName.trim().toLowerCase() === modelName.toLowerCase());
-      return { name: modelName, routeEnabled: matched?.routeEnabled === true };
+      return {
+        name: modelName,
+        routeEnabled: matched?.routeEnabled === true,
+        routeEnabledSource: matched?.routeEnabledSource || 'manual',
+        healthCheckSuccessStreak: matched?.healthCheckSuccessStreak || 0,
+        routeManualDisabledAt: matched?.routeManualDisabledAt || null,
+      };
     }),
     checkedAt,
   };
@@ -183,6 +192,8 @@ export async function getAccountTokenModels(
         tokenId,
         modelName,
         routeEnabled: false,
+        routeEnabledSource: 'manual',
+        healthCheckSuccessStreak: 0,
         latencyMs,
         checkedAt,
       })
