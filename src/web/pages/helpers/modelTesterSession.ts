@@ -158,6 +158,12 @@ export type ModelTesterSessionState = {
 export type TestChatPayload = TesterProxyEnvelope;
 export type ProxyTestEnvelope = TesterProxyEnvelope;
 
+export type ModelTesterModelOption = {
+  name: string;
+  protocol: PlaygroundProtocol;
+  mode: PlaygroundMode;
+};
+
 export const MODEL_TESTER_SESSION_VERSION = 5;
 export const MODEL_TESTER_STORAGE_KEY = 'metapi:model-tester:session:v5';
 
@@ -895,34 +901,81 @@ const parsePendingPayload = (
   return null;
 };
 
-export const collectModelTesterModelNames = (
-  marketplace: { models?: Array<{ name?: unknown }>; } | null | undefined,
-  routes: Array<{ modelPattern?: unknown; enabled?: unknown; }> | null | undefined,
-): string[] => {
-  const result: string[] = [];
-  const seen = new Set<string>();
-
-  const appendModel = (rawName: unknown) => {
-    if (typeof rawName !== 'string') return;
-    const name = rawName.trim();
-    if (!name || seen.has(name)) return;
-    seen.add(name);
-    result.push(name);
-  };
-
-  for (const item of marketplace?.models || []) {
-    appendModel(item?.name);
+const inferModelTesterMode = (modelName: string): PlaygroundMode => {
+  const normalized = modelName.trim().toLowerCase();
+  if (/(^|[-_.])(image|img|dall-e|imagen)([-_.]|$)/i.test(normalized) || normalized.includes('gpt-image')) {
+    return 'images.generate';
   }
+  if (/(^|[-_.])(video|sora|veo)([-_.]|$)/i.test(normalized)) {
+    return 'videos.create';
+  }
+  if (normalized.includes('embedding') || normalized.includes('embed')) {
+    return 'embeddings';
+  }
+  if (normalized.includes('search')) {
+    return 'search';
+  }
+  return 'conversation';
+};
+
+const inferModelTesterProtocol = (modelName: string, mode: PlaygroundMode): PlaygroundProtocol => {
+  if (mode !== 'conversation') return 'openai';
+  const normalized = modelName.trim().toLowerCase();
+  if (normalized.startsWith('claude')) return 'claude';
+  if (normalized.startsWith('gemini')) return 'gemini';
+  if (normalized.startsWith('o') || normalized.startsWith('gpt-5') || normalized.startsWith('gpt-4.1')) return 'responses';
+  return 'openai';
+};
+
+const isRouteChannelUsableForModelTester = (channel: any): boolean => {
+  if (!channel || channel.enabled === false) return false;
+  if (channel.token && channel.token.enabled === false) return false;
+  if (channel.modelTestResult?.available === false) return false;
+  return true;
+};
+
+export const collectModelTesterModelOptions = (
+  _marketplace: { models?: Array<{ name?: unknown }>; } | null | undefined,
+  routes: Array<{ modelPattern?: unknown; displayName?: unknown; enabled?: unknown; channels?: unknown; }> | null | undefined,
+): ModelTesterModelOption[] => {
+  const routeBacked: ModelTesterModelOption[] = [];
+  const seenRouteModels = new Set<string>();
+
+  const buildOption = (rawName: unknown): ModelTesterModelOption | null => {
+    if (typeof rawName !== 'string') return null;
+    const name = rawName.trim();
+    if (!name) return null;
+    const mode = inferModelTesterMode(name);
+    return {
+      name,
+      mode,
+      protocol: inferModelTesterProtocol(name, mode),
+    };
+  };
 
   for (const route of routes || []) {
     if (!route || route.enabled === false) continue;
     if (typeof route.modelPattern !== 'string') continue;
     const modelPattern = route.modelPattern.trim();
     if (!modelPattern || !isExactModelPattern(modelPattern)) continue;
-    appendModel(modelPattern);
+    const channels = Array.isArray(route.channels) ? route.channels : [];
+    if (!channels.some(isRouteChannelUsableForModelTester)) continue;
+    const option = buildOption(typeof route.displayName === 'string' && route.displayName.trim()
+      ? route.displayName
+      : modelPattern);
+    if (!option || seenRouteModels.has(option.name)) continue;
+    seenRouteModels.add(option.name);
+    routeBacked.push(option);
   }
 
-  return result;
+  return routeBacked;
+};
+
+export const collectModelTesterModelNames = (
+  marketplace: { models?: Array<{ name?: unknown }>; } | null | undefined,
+  routes: Array<{ modelPattern?: unknown; displayName?: unknown; enabled?: unknown; channels?: unknown; }> | null | undefined,
+): string[] => {
+  return collectModelTesterModelOptions(marketplace, routes).map((option) => option.name);
 };
 
 export const filterModelTesterModelNames = (models: string[], query: string): string[] => {

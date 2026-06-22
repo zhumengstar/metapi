@@ -20,7 +20,7 @@ import {
   buildVideoInspectRequestEnvelope,
   attachForcedChannelToEnvelope,
   countConversationTurns,
-  collectModelTesterModelNames,
+  collectModelTesterModelOptions,
   createLoadingAssistantMessage,
   createMessage,
   createConversationUserMessage,
@@ -40,16 +40,17 @@ import {
   type ConversationContentPart,
   type ConversationUploadedFile,
   type DebugTab,
+  type ModelTesterModelOption,
   type ModelTesterInputs,
   type ModelTesterModeState,
-    type ParameterEnabled,
-    type PlaygroundMode,
-    type PlaygroundProtocol,
-    type PlaygroundMultipartFile,
-    type ProxyTestEnvelope,
-    type TestTargetFormat,
-    type TestChatPayload,
-  } from './helpers/modelTesterSession.js';
+  type ParameterEnabled,
+  type PlaygroundMode,
+  type PlaygroundProtocol,
+  type PlaygroundMultipartFile,
+  type ProxyTestEnvelope,
+  type TestTargetFormat,
+  type TestChatPayload,
+} from './helpers/modelTesterSession.js';
 import {
   buildConversationFileAccept,
   buildConversationFileHint,
@@ -612,6 +613,23 @@ const PROTOCOL_OPTIONS: Array<{ value: PlaygroundProtocol; label: string }> = [
   { value: 'gemini', label: 'Gemini Native (/gemini/v1beta/models/*)' },
 ];
 
+const applyModelTesterRecommendedTarget = (
+  prev: ModelTesterInputs,
+  option?: ModelTesterModelOption | null,
+): ModelTesterInputs => {
+  if (!option) return prev;
+  const mode = option.mode || prev.mode;
+  const protocol = option.protocol || prev.protocol;
+  return {
+    ...prev,
+    model: option.name,
+    mode,
+    protocol,
+    targetFormat: protocol,
+    stream: mode === 'conversation' ? prev.stream : false,
+  };
+};
+
 const inputBaseStyle: React.CSSProperties = {
   width: '100%',
   padding: '10px 14px',
@@ -659,6 +677,7 @@ function ParameterRow(props: {
 export default function ModelTester() {
   const isMobile = useIsMobile();
   const [models, setModels] = useState<string[]>([]);
+  const [modelOptions, setModelOptions] = useState<ModelTesterModelOption[]>([]);
   const [modelSearch, setModelSearch] = useState('');
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
@@ -737,6 +756,7 @@ export default function ModelTester() {
         return {
           ...prev,
           protocol: value as ModelTesterInputs['protocol'],
+          targetFormat: value as ModelTesterInputs['targetFormat'],
         };
       }
       return { ...prev, [key]: value };
@@ -751,6 +771,7 @@ export default function ModelTester() {
     setInputs((prev) => ({
       ...prev,
       protocol,
+      targetFormat: protocol,
     }));
   }, []);
 
@@ -807,10 +828,12 @@ export default function ModelTester() {
           throw marketResult.reason || routesResult.reason || new Error('failed to fetch models');
         }
 
-        const names = collectModelTesterModelNames(
+        const options = collectModelTesterModelOptions(
           marketResult.status === 'fulfilled' ? marketResult.value : null,
           routesResult.status === 'fulfilled' ? routesResult.value : null,
         );
+        const names = options.map((option) => option.name);
+        setModelOptions(options);
         setModels(names);
 
         const restoredModel = restoredSessionRef.current?.inputs.model || '';
@@ -822,7 +845,8 @@ export default function ModelTester() {
             : names[0] || '';
 
         if (nextModel) {
-          setInputs((prev) => ({ ...prev, model: nextModel }));
+          const option = options.find((item) => item.name === nextModel) || null;
+          setInputs((prev) => applyModelTesterRecommendedTarget(prev, option));
         }
       } catch {
         setError('加载模型列表失败。');
@@ -1494,8 +1518,14 @@ export default function ModelTester() {
   }, [filteredModels.length, modelSearch, models.length]);
 
   const modelSelectOptions = useMemo(
-    () => filteredModels.map((item) => ({ value: item, label: item })),
-    [filteredModels],
+    () => filteredModels.map((item) => {
+      const option = modelOptions.find((entry) => entry.name === item);
+      const suffix = option
+        ? ` · ${option.mode === 'conversation' ? '对话' : option.mode} / ${option.protocol}`
+        : '';
+      return { value: item, label: `${item}${suffix}` };
+    }),
+    [filteredModels, modelOptions],
   );
   const canSend = useMemo(() => {
     if (sending || pendingJobId || !inputs.model) return false;
@@ -2348,7 +2378,7 @@ export default function ModelTester() {
 
       <div style={{ display: 'grid', gridTemplateColumns: isMobile ? 'repeat(2, minmax(0, 1fr))' : 'repeat(4, 1fr)', gap: 12, marginBottom: 16 }} className="animate-slide-up stagger-1">
         <div className="stat-summary-card stat-summary-purple">
-          <div className="stat-summary-card-label">模型数量</div>
+          <div className="stat-summary-card-label">路由可用模型</div>
           <div className="stat-summary-card-value">{models.length}</div>
         </div>
         <div className="stat-summary-card stat-summary-blue">
@@ -2429,13 +2459,19 @@ export default function ModelTester() {
               </button>
             </div>
             <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginBottom: 6 }}>
-              {modelCountText}
+              {modelCountText}，仅展示路由通道当前可用的模型
             </div>
             <ModernSelect
               value={currentModelVisible ? inputs.model : ''}
               onChange={(next) => {
                 if (!next) return;
-                updateInput('model', next);
+                const option = modelOptions.find((item) => item.name === next) || {
+                  name: next,
+                  mode: inputs.mode,
+                  protocol: inputs.protocol,
+                };
+                setInputs((prev) => applyModelTesterRecommendedTarget(prev, option));
+                setForcedChannelId(null);
               }}
               options={modelSelectOptions}
               placeholder={
@@ -2457,6 +2493,11 @@ export default function ModelTester() {
             {customRequestMode && (
               <div style={{ fontSize: 11, color: 'var(--color-warning)', marginTop: 4 }}>
                 自定义请求模式下模型选择将被忽略。
+              </div>
+            )}
+            {!customRequestMode && inputs.model && (
+              <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 4 }}>
+                选择模型后会按路由模型类型自动切换测试模式和协议。
               </div>
             )}
           </div>
