@@ -1,7 +1,7 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { createHash } from 'node:crypto';
 import sharp from 'sharp';
-import { fetch } from 'undici';
+import { fetch, Response } from 'undici';
 import { config } from '../../config.js';
 import { tokenRouter } from '../../services/tokenRouter.js';
 import { reportProxyAllFailed, reportTokenExpired } from '../../services/alertService.js';
@@ -13,6 +13,11 @@ import { withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
 import { getProxyUrlFromExtraConfig } from '../../services/accountExtraConfig.js';
 import { composeProxyLogMessage } from '../../services/proxyLogMessage.js';
 import { formatUtcSqlDateTime } from '../../services/localTimeService.js';
+import { buildOauthProviderHeaders } from '../../services/oauth/service.js';
+import { getOauthInfoFromAccount } from '../../services/oauth/oauthAccount.js';
+import { resolveAntigravityProviderAction } from '../../proxy-core/providers/antigravityRuntime.js';
+import { dispatchRuntimeRequest } from '../../services/runtimeDispatch.js';
+import { readRuntimeResponseText } from '../../proxy-core/executors/types.js';
 import { cloneFormDataWithOverrides, ensureMultipartBufferParser, parseMultipartFormData } from './multipart.js';
 import { getProxyAuthContext } from '../../middleware/auth.js';
 import { buildUpstreamUrl } from './upstreamUrl.js';
@@ -120,24 +125,21 @@ export async function imagesProxyRoute(app: FastifyInstance) {
       try {
         const { upstream, text, firstByteLatencyMs } = await runWithSiteApiEndpointPool(selected.site, async (target) => {
           const attemptStartedAtMs = Date.now();
-          const targetUrl = buildUpstreamUrl(target.baseUrl, '/v1/images/generations');
           const response = await fetchWithObservedFirstByte(
-            async (signal) => fetch(targetUrl, withSiteRecordProxyRequestInit(selected.site, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${selected.tokenValue}`,
-              },
-              body: JSON.stringify(forwardBody),
+            async (signal) => dispatchImageGenerationRequest({
+              selected,
+              targetBaseUrl: target.baseUrl,
+              body: forwardBody,
               signal,
-            }, getProxyUrlFromExtraConfig(selected.account.extraConfig))),
+              downstreamHeaders: request.headers as Record<string, unknown>,
+            }),
             {
               firstByteTimeoutMs,
               startedAtMs: attemptStartedAtMs,
             },
           );
           const observedFirstByteLatencyMs = getObservedResponseMeta(response)?.firstByteLatencyMs ?? null;
-          const responseText = await response.text();
+          const responseText = await readRuntimeResponseText(response);
           if (!response.ok) {
             throw new SiteApiEndpointRequestError(responseText || 'unknown error', {
               status: response.status,
@@ -638,6 +640,193 @@ function parseUpstreamImageResponse(text: string): { ok: true; value: any } | { 
   } catch {
     return { ok: false, message: text || 'Upstream returned malformed JSON' };
   }
+}
+
+async function dispatchImageGenerationRequest(input: {
+  selected: any;
+  targetBaseUrl: string;
+  body: Record<string, unknown>;
+  signal?: AbortSignal;
+  downstreamHeaders: Record<string, unknown>;
+}) {
+  if (isInternalGeminiImagePlatform(input.selected.site?.platform)) {
+    return dispatchInternalGeminiImageGeneration(input);
+  }
+
+  const targetUrl = buildUpstreamUrl(input.targetBaseUrl, '/v1/images/generations');
+  return fetch(targetUrl, withSiteRecordProxyRequestInit(input.selected.site, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${input.selected.tokenValue}`,
+    },
+    body: JSON.stringify(input.body),
+    signal: input.signal,
+  }, getProxyUrlFromExtraConfig(input.selected.account.extraConfig)));
+}
+
+async function dispatchInternalGeminiImageGeneration(input: {
+  selected: any;
+  body: Record<string, unknown>;
+  signal?: AbortSignal;
+  downstreamHeaders: Record<string, unknown>;
+}) {
+  const selected = input.selected;
+  const modelName = String(input.body.model || selected.actualModel || '').trim();
+  const platform = String(selected.site?.platform || '').trim().toLowerCase();
+  const isGeminiCli = platform === 'gemini-cli';
+  const action = isGeminiCli
+    ? 'generateContent'
+    : resolveAntigravityProviderAction('generateContent', false, modelName);
+  const upstreamPath = action === 'streamGenerateContent'
+    ? '/v1internal:streamGenerateContent?alt=sse'
+    : '/v1internal:generateContent';
+  const requestBody = buildGeminiImageGenerationBody(input.body);
+  const oauth = getOauthInfoFromAccount(selected.account);
+  const requestHeaders = {
+    'Content-Type': 'application/json',
+    ...(action === 'streamGenerateContent' ? { Accept: 'text/event-stream' } : {}),
+    Authorization: `Bearer ${selected.tokenValue}`,
+    ...buildOauthProviderHeaders({
+      account: selected.account,
+      downstreamHeaders: input.downstreamHeaders,
+    }),
+  };
+
+  const upstream = await dispatchRuntimeRequest({
+    siteUrl: selected.site.url,
+    targetUrl: `${selected.site.url}${upstreamPath}`,
+    signal: input.signal,
+    request: {
+      endpoint: 'chat',
+      path: upstreamPath,
+      headers: requestHeaders,
+      body: requestBody,
+      runtime: {
+        executor: isGeminiCli ? 'gemini-cli' : 'antigravity',
+        modelName,
+        stream: false,
+        oauthProjectId: oauth?.projectId || null,
+        action,
+      },
+    },
+    buildInit: async (_requestUrl, requestForFetch) => withSiteRecordProxyRequestInit(selected.site, {
+      method: 'POST',
+      headers: requestForFetch.headers,
+      body: JSON.stringify(requestForFetch.body),
+    }, getProxyUrlFromExtraConfig(selected.account.extraConfig)),
+  });
+
+  if (!upstream.ok) return upstream;
+
+  const responseText = await readRuntimeResponseText(upstream);
+  const converted = convertGeminiImageResponseToOpenAi(responseText);
+  return new Response(JSON.stringify(converted.value), {
+    status: converted.ok ? upstream.status : 502,
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+  });
+}
+
+function isInternalGeminiImagePlatform(platform: unknown): boolean {
+  const normalized = String(platform || '').trim().toLowerCase();
+  return normalized === 'antigravity' || normalized === 'gemini-cli';
+}
+
+function buildGeminiImageGenerationBody(body: Record<string, unknown>): Record<string, unknown> {
+  const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+  const aspectRatio = resolveGeminiImageAspectRatio(body.size);
+  return {
+    contents: [
+      {
+        role: 'user',
+        parts: [{ text: prompt || 'Generate an image.' }],
+      },
+    ],
+    generationConfig: {
+      responseModalities: ['TEXT', 'IMAGE'],
+      imageConfig: { aspectRatio },
+    },
+  };
+}
+
+function resolveGeminiImageAspectRatio(size: unknown): string {
+  const parsed = parseImageSize(size);
+  if (!parsed) return '1:1';
+  if (parsed.width === parsed.height) return '1:1';
+  return parsed.width > parsed.height ? '16:9' : '9:16';
+}
+
+function convertGeminiImageResponseToOpenAi(text: string): { ok: true; value: any } | { ok: false; value: any } {
+  let parsed: any;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return {
+      ok: false,
+      value: {
+        error: {
+          message: text || 'Upstream returned malformed Gemini image response',
+          type: 'upstream_error',
+        },
+      },
+    };
+  }
+
+  const images = extractGeminiInlineImages(parsed);
+  if (images.length === 0) {
+    return {
+      ok: false,
+      value: {
+        error: {
+          message: 'Gemini image response did not contain inline image data',
+          type: 'upstream_error',
+        },
+      },
+    };
+  }
+
+  return {
+    ok: true,
+    value: {
+      created: Math.floor(Date.now() / 1000),
+      data: images.map((image) => ({
+        b64_json: image.data,
+        ...(image.mimeType ? { mime_type: image.mimeType } : {}),
+      })),
+    },
+  };
+}
+
+function extractGeminiInlineImages(payload: unknown): Array<{ data: string; mimeType: string | null }> {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return [];
+  const response = (payload as Record<string, unknown>).response;
+  const root = response && typeof response === 'object' && !Array.isArray(response)
+    ? response as Record<string, unknown>
+    : payload as Record<string, unknown>;
+  const candidates = Array.isArray(root.candidates) ? root.candidates : [];
+  const images: Array<{ data: string; mimeType: string | null }> = [];
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue;
+    const content = (candidate as Record<string, unknown>).content;
+    if (!content || typeof content !== 'object' || Array.isArray(content)) continue;
+    const parts = Array.isArray((content as Record<string, unknown>).parts)
+      ? (content as Record<string, unknown>).parts as unknown[]
+      : [];
+    for (const part of parts) {
+      if (!part || typeof part !== 'object' || Array.isArray(part)) continue;
+      const record = part as Record<string, unknown>;
+      const inlineData = record.inlineData || record.inline_data;
+      if (!inlineData || typeof inlineData !== 'object' || Array.isArray(inlineData)) continue;
+      const inlineRecord = inlineData as Record<string, unknown>;
+      const data = typeof inlineRecord.data === 'string' ? inlineRecord.data.trim() : '';
+      if (!data) continue;
+      const mimeType = typeof inlineRecord.mimeType === 'string'
+        ? inlineRecord.mimeType
+        : (typeof inlineRecord.mime_type === 'string' ? inlineRecord.mime_type : null);
+      images.push({ data, mimeType });
+    }
+  }
+  return images;
 }
 
 type ParsedImageSize = {

@@ -213,6 +213,80 @@ describe('/v1/images/edits route', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it('routes Antigravity image generation through internal Gemini runtime and returns OpenAI image data', async () => {
+    selectChannelMock.mockReturnValue({
+      channel: { id: 41, routeId: 22 },
+      site: {
+        id: 79,
+        name: 'antigravity-site',
+        url: 'https://cloudcode-pa.googleapis.com',
+        platform: 'antigravity',
+      },
+      account: {
+        id: 39,
+        username: 'antigravity-user@example.com',
+        extraConfig: JSON.stringify({
+          oauth: {
+            provider: 'antigravity',
+            email: 'antigravity-user@example.com',
+            projectId: 'project-demo',
+          },
+        }),
+      },
+      tokenName: 'default',
+      tokenValue: 'antigravity-access-token',
+      actualModel: 'gemini-3.1-flash-image',
+    });
+    fetchMock.mockResolvedValue(new Response([
+      'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"inlineData":{"mimeType":"image/png","data":"aW1hZ2U="}}]},"finishReason":"STOP","index":0}]}}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n'), {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/images/generations',
+      headers: {
+        authorization: 'Bearer sk-demo',
+      },
+      payload: {
+        model: 'gemini-3.1-flash-image',
+        prompt: 'a small cat',
+        size: '1024x1024',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const [targetUrl, requestInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(targetUrl).toBe('https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse');
+    expect(JSON.parse(String(requestInit.body))).toMatchObject({
+      model: 'gemini-3.1-flash-image',
+      requestType: 'image_gen',
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: 'a small cat' }],
+        },
+      ],
+      generationConfig: {
+        responseModalities: ['TEXT', 'IMAGE'],
+        imageConfig: { aspectRatio: '1:1' },
+      },
+    });
+    expect(JSON.parse(response.body)).toMatchObject({
+      data: [
+        {
+          b64_json: 'aW1hZ2U=',
+          mime_type: 'image/png',
+        },
+      ],
+    });
+  });
+
   it('keeps image generation size unchanged when channel image upscale is disabled', async () => {
     fetchMock.mockResolvedValue(new Response(JSON.stringify({
       created: 1,
