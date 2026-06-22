@@ -169,6 +169,57 @@ async function request<T = any>(
   return res.json() as Promise<T>;
 }
 
+type BackgroundTaskStatus = "pending" | "running" | "succeeded" | "failed";
+
+type BackgroundTaskApiResponse<T = any> = {
+  success?: boolean;
+  task?: {
+    id: string;
+    status: BackgroundTaskStatus;
+    result?: T;
+    error?: string | null;
+    message?: string | null;
+  };
+};
+
+async function waitForTaskResult<T = any>(
+  taskId: string,
+  options: { timeoutMs?: number; pollMs?: number; signal?: AbortSignal } = {},
+): Promise<T> {
+  const timeoutMs = Math.max(1_000, options.timeoutMs ?? 10 * 60_000);
+  const pollMs = Math.max(250, options.pollMs ?? 1_000);
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    if (options.signal?.aborted) {
+      throw new DOMException("任务等待已取消", "AbortError");
+    }
+    const response = await request<BackgroundTaskApiResponse<T>>(
+      `/api/tasks/${encodeURIComponent(taskId)}`,
+      { timeoutMs: 30_000, signal: options.signal },
+    );
+    const task = response.task;
+    if (!task) {
+      throw new Error("后台任务不存在或已过期");
+    }
+    if (task.status === "succeeded") {
+      return task.result as T;
+    }
+    if (task.status === "failed") {
+      throw new Error(task.error || task.message || "后台任务执行失败");
+    }
+    if (Date.now() >= deadline) {
+      throw new Error("后台任务仍在执行中，请稍后刷新查看结果");
+    }
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, Math.min(pollMs, Math.max(0, deadline - Date.now())));
+      options.signal?.addEventListener("abort", () => {
+        clearTimeout(timer);
+        resolve();
+      }, { once: true });
+    });
+  }
+}
+
 async function streamSse(
   url: string,
   handlers: {
@@ -930,16 +981,17 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(data),
     }),
-  runAccountTokenHealthCheck: (id: number) =>
+  runAccountTokenHealthCheck: (id: number, options?: { async?: boolean }) =>
     request(`/api/account-tokens/${id}/health-check/run`, {
       method: "POST",
-      timeoutMs: 90_000,
+      body: options?.async ? JSON.stringify({ async: true }) : undefined,
+      timeoutMs: options?.async ? 30_000 : 90_000,
     }),
-  testAccountTokenModelAvailability: (data: { model: string; tokenIds: number[] }) =>
+  testAccountTokenModelAvailability: (data: { model: string; tokenIds: number[]; async?: boolean }) =>
     request("/api/account-tokens/models/test", {
       method: "POST",
       body: JSON.stringify(data),
-      timeoutMs: 240_000,
+      timeoutMs: data.async ? 30_000 : 240_000,
     }),
   saveSkippedAccountTokenModelAvailability: (data: { results: Array<{
     tokenId: number;
@@ -1312,6 +1364,7 @@ export const api = {
       `/api/tasks?limit=${Math.max(1, Math.min(200, Math.trunc(limit)))}`,
     ),
   getTask: (id: string) => request(`/api/tasks/${encodeURIComponent(id)}`),
+  waitForTaskResult,
 
   // Auth management
   getAuthInfo: () => request("/api/settings/auth/info"),

@@ -121,6 +121,7 @@ type TokenAvailabilityFilter = 'all' | 'available' | 'unavailable';
 const ACCOUNT_SELECT_SEARCH_PLACEHOLDER = '筛选账号（名称 / 站点）';
 const DEFAULT_BATCH_TEST_MODEL = 'gpt-5.5';
 const IMAGE_MODEL_TEST_SKIPPED_MESSAGE = '只有图片模型，未进行聊天可用性测试';
+const TOKEN_RATIO_FILTER_STORAGE_KEY = 'metapi.tokens.maxGroupRatioFilter';
 const DEFAULT_TOKEN_SORT_RULES: TokenSortRule[] = [
   { key: 'status', order: 'desc' },
   { key: 'ratio', order: 'asc' },
@@ -173,6 +174,23 @@ function formatGroupRatio(value?: number | null) {
   if (!Number.isFinite(value)) return '';
   const normalized = Number(value);
   return `${Number.isInteger(normalized) ? normalized : normalized.toFixed(3).replace(/0+$/, '').replace(/\.$/, '')}x`;
+}
+
+function readStoredTokenRatioFilter() {
+  if (typeof window === 'undefined') return '';
+  try {
+    const value = window.localStorage.getItem(TOKEN_RATIO_FILTER_STORAGE_KEY);
+    return typeof value === 'string' ? value : '';
+  } catch {
+    return '';
+  }
+}
+
+function normalizeTokenRatioFilterInput(value: string) {
+  const normalized = value.replace(/[^\d.]/g, '');
+  const firstDotIndex = normalized.indexOf('.');
+  if (firstDotIndex < 0) return normalized;
+  return `${normalized.slice(0, firstDotIndex + 1)}${normalized.slice(firstDotIndex + 1).replace(/\./g, '')}`;
 }
 
 function resolveTokenAvailabilityResult(
@@ -424,6 +442,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
   const [modelSearch, setModelSearch] = useState('');
   const [tokenStatusFilter, setTokenStatusFilter] = useState<TokenStatusFilter>('all');
   const [tokenAvailabilityFilter, setTokenAvailabilityFilter] = useState<TokenAvailabilityFilter>('all');
+  const [maxGroupRatioFilter, setMaxGroupRatioFilter] = useState(readStoredTokenRatioFilter);
   const [testingModelTokens, setTestingModelTokens] = useState(false);
   const [testingAvailabilityTokenIds, setTestingAvailabilityTokenIds] = useState<number[]>([]);
   const [tokenAvailabilityById, setTokenAvailabilityById] = useState<Record<number, TokenAvailabilityTestResult>>({});
@@ -499,6 +518,19 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      if (maxGroupRatioFilter.trim()) {
+        window.localStorage.setItem(TOKEN_RATIO_FILTER_STORAGE_KEY, maxGroupRatioFilter.trim());
+      } else {
+        window.localStorage.removeItem(TOKEN_RATIO_FILTER_STORAGE_KEY);
+      }
+    } catch {
+      // Ignore storage failures; the current page state still applies the filter.
+    }
+  }, [maxGroupRatioFilter]);
 
   useEffect(() => {
     return () => {
@@ -592,6 +624,8 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     const tokenValue = (token: any) => String(token?.tokenMasked || token?.token || '').toLowerCase();
     const groupLabel = (token: any) => String(token?.tokenGroup || '').toLowerCase();
     const normalizedModelSearch = modelSearch.trim().toLowerCase();
+    const maxGroupRatio = Number(maxGroupRatioFilter);
+    const hasMaxGroupRatioFilter = Number.isFinite(maxGroupRatio) && maxGroupRatio > 0;
     const tokenModelNames = (token: any): string[] => (
       Array.isArray(token?.modelNames)
         ? token.modelNames.map((item: unknown) => String(item || '').trim()).filter(Boolean)
@@ -624,6 +658,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       if (tokenStatusFilter === 'disabled' && (token?.enabled || isMaskedPendingToken(token) || isAutoDisabledToken(token))) return false;
       if (tokenStatusFilter === 'pending' && !isMaskedPendingToken(token)) return false;
       if (tokenStatusFilter === 'autoDisabled' && !isAutoDisabledToken(token)) return false;
+      if (hasMaxGroupRatioFilter && ratioValue(token) >= maxGroupRatio) return false;
       if (tokenAvailabilityFilter !== 'all') {
         const tokenId = Number(token?.id);
         const result = resolveTokenAvailabilityResult(token, modelSearch, tokenAvailabilityById[tokenId]);
@@ -666,9 +701,10 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       if (nameCmp !== 0) return nameCmp;
       return Number(left?.id || 0) - Number(right?.id || 0);
     });
-  }, [modelSearch, syncingAccountId, tokenAvailabilityById, tokenAvailabilityFilter, tokenSortRules, tokenStatusFilter, tokens]);
+  }, [maxGroupRatioFilter, modelSearch, syncingAccountId, tokenAvailabilityById, tokenAvailabilityFilter, tokenSortRules, tokenStatusFilter, tokens]);
   const allVisibleTokensSelected = accountClusteredTokens.length > 0
     && accountClusteredTokens.every((token) => selectedTokenIds.includes(token.id));
+  const hasSelectedTokens = selectedTokenIds.length > 0;
   const visibleTokenIdSignature = useMemo(() => (
     accountClusteredTokens
       .map((token: any) => Number(token?.id))
@@ -682,8 +718,10 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       : [];
 
     setSelectedTokenIds((current) => {
-      if (current.length === visibleIds.length && current.every((id, index) => id === visibleIds[index])) return current;
-      return visibleIds;
+      const visibleIdSet = new Set(visibleIds);
+      const next = current.filter((id) => visibleIdSet.has(id));
+      if (next.length === current.length) return current;
+      return next;
     });
   }, [visibleTokenIdSignature]);
 
@@ -1006,7 +1044,10 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         });
         if (res?.token) tokenForRun = { ...tokenForRun, ...res.token };
       }
-      const res = await api.runAccountTokenHealthCheck(tokenId);
+      const queuedRun = await api.runAccountTokenHealthCheck(tokenId, { async: true });
+      const res = queuedRun?.jobId
+        ? await api.waitForTaskResult(queuedRun.jobId, { timeoutMs: 10 * 60_000, pollMs: 1_000 })
+        : queuedRun;
       const result = res?.result as TokenAvailabilityTestResult | undefined;
       const results = Array.isArray(res?.results) ? res.results as TokenAvailabilityTestResult[] : [];
       const responseToken = res?.token || tokenForRun;
@@ -1500,12 +1541,24 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       let finishedCount = 0;
       await runWithConcurrency(normalizedTokenIds, MODEL_TEST_CONCURRENCY, async (tokenId) => {
         try {
-          const res = await api.testAccountTokenModelAvailability({
+          const queuedTest = await api.testAccountTokenModelAvailability({
             model,
             tokenIds: [tokenId],
+            async: true,
           });
+          const res = queuedTest?.jobId
+            ? await api.waitForTaskResult(queuedTest.jobId, { timeoutMs: 10 * 60_000, pollMs: 1_000 })
+            : queuedTest;
           const results: TokenAvailabilityTestResult[] = Array.isArray(res?.results) ? res.results : [];
           applyModelAvailabilityResults(model, results);
+          if (Array.isArray(res?.healthCheckTokens)) {
+            for (const responseToken of res.healthCheckTokens) {
+              const tokenId = Number(responseToken?.id);
+              if (!Number.isInteger(tokenId) || tokenId <= 0) continue;
+              const tokenResults = results.filter((item) => Number(item?.tokenId) === tokenId);
+              patchTokenFromHealthCheckResponse(tokenId, responseToken, null, tokenResults);
+            }
+          }
           availableCount += results.filter((result) => result.available).length;
           finishedCount += results.length;
         } finally {
@@ -1519,7 +1572,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       setTestingModelTokens(false);
       setTestingAvailabilityTokenIds([]);
     }
-  }, [applyModelAvailabilityResults, modelSearch, toast]);
+  }, [applyModelAvailabilityResults, modelSearch, patchTokenFromHealthCheckResponse, toast]);
 
   const handleTestFilteredModelTokens = useCallback(async () => {
     await testModelTokens(modelTestTokenIds, '没有匹配该模型的令牌');
@@ -1565,7 +1618,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       let total = 0;
       let availableCount = 0;
       if (imageOnlySkippedResults.length > 0) {
-        await api.saveSkippedAccountTokenModelAvailability({ results: imageOnlySkippedResults });
+        const skippedRes = await api.saveSkippedAccountTokenModelAvailability({ results: imageOnlySkippedResults });
         const resultsByModel = new Map<string, TokenAvailabilityTestResult[]>();
         for (const result of imageOnlySkippedResults) {
           const group = resultsByModel.get(result.model) || [];
@@ -1575,17 +1628,37 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         for (const [skippedModel, results] of resultsByModel) {
           applyModelAvailabilityResults(skippedModel, results);
         }
+        if (Array.isArray(skippedRes?.healthCheckTokens)) {
+          for (const responseToken of skippedRes.healthCheckTokens) {
+            const tokenId = Number(responseToken?.id);
+            if (!Number.isInteger(tokenId) || tokenId <= 0) continue;
+            const tokenResults = imageOnlySkippedResults.filter((item) => Number(item?.tokenId) === tokenId);
+            patchTokenFromHealthCheckResponse(tokenId, responseToken, null, tokenResults);
+          }
+        }
         total += imageOnlySkippedResults.length;
       }
       const testJobs = testGroups.flatMap(([testModel, tokenIds]) => tokenIds.map((tokenId) => ({ testModel, tokenId })));
       await runWithConcurrency(testJobs, MODEL_TEST_CONCURRENCY, async ({ testModel, tokenId }) => {
         try {
-          const res = await api.testAccountTokenModelAvailability({
+          const queuedTest = await api.testAccountTokenModelAvailability({
             model: testModel,
             tokenIds: [tokenId],
+            async: true,
           });
+          const res = queuedTest?.jobId
+            ? await api.waitForTaskResult(queuedTest.jobId, { timeoutMs: 10 * 60_000, pollMs: 1_000 })
+            : queuedTest;
           const results: TokenAvailabilityTestResult[] = Array.isArray(res?.results) ? res.results : [];
           applyModelAvailabilityResults(testModel, results);
+          if (Array.isArray(res?.healthCheckTokens)) {
+            for (const responseToken of res.healthCheckTokens) {
+              const tokenId = Number(responseToken?.id);
+              if (!Number.isInteger(tokenId) || tokenId <= 0) continue;
+              const tokenResults = results.filter((item) => Number(item?.tokenId) === tokenId);
+              patchTokenFromHealthCheckResponse(tokenId, responseToken, null, tokenResults);
+            }
+          }
           total += results.length;
           availableCount += results.filter((result) => result.available).length;
         } finally {
@@ -1604,7 +1677,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       setTestingModelTokens(false);
       setTestingAvailabilityTokenIds([]);
     }
-  }, [applyModelAvailabilityResults, modelSearch, selectedTokenIds, testModelTokens, toast, tokens]);
+  }, [applyModelAvailabilityResults, modelSearch, patchTokenFromHealthCheckResponse, selectedTokenIds, testModelTokens, toast, tokens]);
 
   const showAvailabilityTooltip = useCallback((
     event: React.MouseEvent<HTMLElement> | React.FocusEvent<HTMLElement>,
@@ -2651,34 +2724,68 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         {renderModelFilterControl(false)}
       </div>
 
-      {selectedTokenIds.length > 0 && (
-        <ResponsiveBatchActionBar
-          isMobile={isMobile}
-          info={`已选 ${selectedTokenIds.length} 项`}
-          desktopStyle={{ marginBottom: 12 }}
-        >
-          <button onClick={() => runBatchTokenAction('enable')} disabled={batchActionLoading || testingModelTokens} className="btn btn-ghost" style={{ border: '1px solid var(--color-border)' }}>
-            批量启用
-          </button>
-          <button onClick={() => runBatchTokenAction('disable')} disabled={batchActionLoading || testingModelTokens} className="btn btn-ghost" style={{ border: '1px solid var(--color-border)' }}>
-            批量禁用
-          </button>
-          <button
-            onClick={() => void handleBatchTestSelectedTokens()}
-            disabled={batchActionLoading || testingModelTokens}
-            className="btn btn-ghost"
-            style={{ border: '1px solid var(--color-border)' }}
-            title={modelSearch.trim()
+      <ResponsiveBatchActionBar
+        isMobile={isMobile}
+        info={hasSelectedTokens ? `已选 ${selectedTokenIds.length} 项` : '未选择令牌'}
+        desktopStyle={{ marginBottom: 12 }}
+      >
+        <button onClick={() => runBatchTokenAction('enable')} disabled={!hasSelectedTokens || batchActionLoading || testingModelTokens} className="btn btn-ghost" style={{ border: '1px solid var(--color-border)' }}>
+          批量启用
+        </button>
+        <button onClick={() => runBatchTokenAction('disable')} disabled={!hasSelectedTokens || batchActionLoading || testingModelTokens} className="btn btn-ghost" style={{ border: '1px solid var(--color-border)' }}>
+          批量禁用
+        </button>
+        <button
+          onClick={() => void handleBatchTestSelectedTokens()}
+          disabled={!hasSelectedTokens || batchActionLoading || testingModelTokens}
+          className="btn btn-ghost"
+          style={{ border: '1px solid var(--color-border)' }}
+          title={!hasSelectedTokens
+            ? '请先选择需要检测的令牌'
+            : modelSearch.trim()
               ? `检测已选 ${selectedTokenIds.length} 个令牌的 ${modelSearch.trim()}`
               : `未输入模型时默认检测 ${DEFAULT_BATCH_TEST_MODEL}，没有则检测令牌的第一个模型`}
-          >
-            {testingModelTokens ? <><span className="spinner spinner-sm" /> 检测中...</> : '批量检测'}
-          </button>
-          <button data-testid="tokens-batch-delete" onClick={() => runBatchTokenAction('delete')} disabled={batchActionLoading || testingModelTokens} className="btn btn-link btn-link-danger">
-            批量删除
-          </button>
-        </ResponsiveBatchActionBar>
-      )}
+        >
+          {testingModelTokens ? <><span className="spinner spinner-sm" /> 检测中...</> : '批量检测'}
+        </button>
+        <button data-testid="tokens-batch-delete" onClick={() => runBatchTokenAction('delete')} disabled={!hasSelectedTokens || batchActionLoading || testingModelTokens} className="btn btn-link btn-link-danger">
+          批量删除
+        </button>
+        <label
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 8,
+            minWidth: 0,
+            color: 'var(--color-text-muted)',
+            fontSize: 13,
+            whiteSpace: 'nowrap',
+          }}
+          title="只展示分组倍率小于该数字的令牌；空白时不过滤"
+        >
+          <span>倍率小于</span>
+          <input
+            type="number"
+            min="0"
+            step="0.001"
+            inputMode="decimal"
+            value={maxGroupRatioFilter}
+            onChange={(event) => setMaxGroupRatioFilter(normalizeTokenRatioFilterInput(event.target.value))}
+            placeholder="不限制"
+            aria-label="只展示小于该倍率的令牌"
+            style={{
+              width: 104,
+              height: 34,
+              borderRadius: 8,
+              border: '1px solid var(--color-border)',
+              background: 'var(--color-surface)',
+              color: 'var(--color-text)',
+              padding: '0 10px',
+              textAlign: 'center',
+            }}
+          />
+        </label>
+      </ResponsiveBatchActionBar>
 
       {availabilityTooltip && typeof document !== 'undefined'
         ? createPortal((

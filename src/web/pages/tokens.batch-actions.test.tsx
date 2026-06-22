@@ -131,7 +131,7 @@ describe('Tokens batch actions', () => {
     }
   });
 
-  it('selects visible tokens by default and toggles a token when clicking the row', async () => {
+  it('does not select visible tokens by default and toggles a token when clicking the row', async () => {
     let root!: WebTestRenderer;
     try {
       await act(async () => {
@@ -147,7 +147,7 @@ describe('Tokens batch actions', () => {
 
       const row = root.root.find((node) => node.props['data-testid'] === 'token-row-1');
       const checkboxBefore = root.root.find((node) => node.props['data-testid'] === 'token-select-1');
-      expect(checkboxBefore.props.checked).toBe(true);
+      expect(checkboxBefore.props.checked).toBe(false);
 
       await act(async () => {
         row.props.onClick({ target: { closest: () => null } });
@@ -155,13 +155,13 @@ describe('Tokens batch actions', () => {
       await flushMicrotasks();
 
       const checkboxAfter = root.root.find((node) => node.props['data-testid'] === 'token-select-1');
-      expect(checkboxAfter.props.checked).toBe(false);
+      expect(checkboxAfter.props.checked).toBe(true);
     } finally {
       root?.unmount();
     }
   });
 
-  it('selects the exact model search results by default', async () => {
+  it('does not select exact model search results by default', async () => {
     let root!: WebTestRenderer;
     try {
       await act(async () => {
@@ -182,8 +182,40 @@ describe('Tokens batch actions', () => {
       await flushMicrotasks();
 
       const checkboxA = root.root.find((node) => node.props['data-testid'] === 'token-select-1');
-      expect(checkboxA.props.checked).toBe(true);
+      expect(checkboxA.props.checked).toBe(false);
       expect(root.root.findAll((node) => node.props['data-testid'] === 'token-select-2')).toHaveLength(0);
+    } finally {
+      root?.unmount();
+    }
+  });
+
+  it('keeps the batch toolbar visible and disabled without selected tokens', async () => {
+    let root!: WebTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <ToastProvider>
+            <MemoryRouter initialEntries={['/accounts?segment=tokens']}>
+              <TokensPanel />
+            </MemoryRouter>
+          </ToastProvider>,
+        );
+      });
+      await flushMicrotasks();
+
+      const batchEnableButton = root.root
+        .findAll((node) => node.type === 'button')
+        .find((node) => Array.isArray(node.children) && node.children.includes('批量启用'));
+      const batchDisableButton = root.root
+        .findAll((node) => node.type === 'button')
+        .find((node) => Array.isArray(node.children) && node.children.includes('批量禁用'));
+      const batchDeleteButton = root.root.find((node) => node.props['data-testid'] === 'tokens-batch-delete');
+
+      expect(batchEnableButton).toBeTruthy();
+      expect(batchDisableButton).toBeTruthy();
+      expect(batchEnableButton!.props.disabled).toBe(true);
+      expect(batchDisableButton!.props.disabled).toBe(true);
+      expect(batchDeleteButton.props.disabled).toBe(true);
     } finally {
       root?.unmount();
     }
@@ -228,10 +260,12 @@ describe('Tokens batch actions', () => {
       expect(apiMock.testAccountTokenModelAvailability).toHaveBeenNthCalledWith(1, {
         model: 'gpt-5.5',
         tokenIds: [1],
+        async: true,
       });
       expect(apiMock.testAccountTokenModelAvailability).toHaveBeenNthCalledWith(2, {
         model: 'gpt-4o-mini',
         tokenIds: [2],
+        async: true,
       });
     } finally {
       root?.unmount();
