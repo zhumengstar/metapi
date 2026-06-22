@@ -219,6 +219,10 @@ const SITE_TRANSIENT_FAILURE_PATTERNS: RegExp[] = [
 const USAGE_LIMIT_RATE_LIMIT_PATTERNS: RegExp[] = [
   /usage_limit_reached/i,
   /usage\s+limit\s+has\s+been\s+reached/i,
+  /RESOURCE_EXHAUSTED/i,
+  /QUOTA_EXHAUSTED/i,
+  /exhausted\s+your\s+capacity/i,
+  /quotaResetTimeStamp/i,
   /quota\s+exceeded/i,
   /rate\s+limit/i,
   /\blimit\b/i,
@@ -1053,6 +1057,96 @@ function isTransientSiteRuntimeFailure(context: SiteRuntimeFailureContext = {}):
   return status >= 500 || status === 429 || matchesAnyPattern(SITE_TRANSIENT_FAILURE_PATTERNS, errorText);
 }
 
+function parseGoogleQuotaDelayMs(value: unknown): number | null {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text) return null;
+
+  const secondsOnly = text.match(/^(\d+(?:\.\d+)?)s$/i);
+  if (secondsOnly?.[1]) {
+    const seconds = Number(secondsOnly[1]);
+    return Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds * 1000) : null;
+  }
+
+  const match = text.match(/^(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m)?(?:(\d+(?:\.\d+)?)s)?$/i);
+  if (!match) return null;
+
+  const hours = match[1] ? Number(match[1]) : 0;
+  const minutes = match[2] ? Number(match[2]) : 0;
+  const seconds = match[3] ? Number(match[3]) : 0;
+  const totalMs = ((hours * 60 * 60) + (minutes * 60) + seconds) * 1000;
+  return Number.isFinite(totalMs) && totalMs > 0 ? Math.ceil(totalMs) : null;
+}
+
+function collectGoogleQuotaResetCandidates(value: unknown, nowMs: number, candidates: number[]): void {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectGoogleQuotaResetCandidates(item, nowMs, candidates);
+    }
+    return;
+  }
+  if (!isRecord(value)) return;
+
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === 'string') {
+      if (/^(quotaResetTimeStamp|quotaResetTimestamp|resetTime)$/i.test(key)) {
+        const resetMs = Date.parse(entry);
+        if (Number.isFinite(resetMs)) {
+          candidates.push(resetMs);
+        }
+      }
+
+      if (/^(retryDelay|quotaResetDelay)$/i.test(key)) {
+        const delayMs = parseGoogleQuotaDelayMs(entry);
+        if (delayMs) {
+          candidates.push(nowMs + delayMs);
+        }
+      }
+    }
+
+    collectGoogleQuotaResetCandidates(entry, nowMs, candidates);
+  }
+}
+
+function parseGoogleQuotaResetHint(status: number, errorText: string, nowMs = Date.now()): string | null {
+  if (status !== 429 || !errorText.trim()) return null;
+
+  const candidates: number[] = [];
+  try {
+    collectGoogleQuotaResetCandidates(JSON.parse(errorText), nowMs, candidates);
+  } catch {
+    // Upstream errors are not always valid JSON; regex fallbacks below cover plain text bodies.
+  }
+
+  for (const match of errorText.matchAll(/quotaResetTimeStamp["']?\s*[:=]\s*["']([^"']+)["']/gi)) {
+    const resetMs = Date.parse(match[1] || '');
+    if (Number.isFinite(resetMs)) {
+      candidates.push(resetMs);
+    }
+  }
+
+  for (const match of errorText.matchAll(/(?:retryDelay|quotaResetDelay)["']?\s*[:=]\s*["']([^"']+)["']/gi)) {
+    const delayMs = parseGoogleQuotaDelayMs(match[1]);
+    if (delayMs) {
+      candidates.push(nowMs + delayMs);
+    }
+  }
+
+  const resetAfterMatch = errorText.match(/quota\s+will\s+reset\s+after\s+([0-9hms.\s]+)/i);
+  if (resetAfterMatch?.[1]) {
+    const delayMs = parseGoogleQuotaDelayMs(resetAfterMatch[1].replace(/\s+/g, ''));
+    if (delayMs) {
+      candidates.push(nowMs + delayMs);
+    }
+  }
+
+  const futureCandidates = candidates
+    .filter((value) => Number.isFinite(value) && value > nowMs)
+    .sort((a, b) => a - b);
+  const resetMs = futureCandidates[0];
+  return typeof resetMs === 'number' ? new Date(resetMs).toISOString() : null;
+}
+
 function resolveShortWindowLimitCooldown(
   account: typeof schema.accounts.$inferSelect,
   context: SiteRuntimeFailureContext = {},
@@ -1061,6 +1155,11 @@ function resolveShortWindowLimitCooldown(
   const status = typeof context.status === 'number' ? context.status : 0;
   const errorText = (context.errorText || '').trim();
   if (!isUsageLimitRateLimitFailure({ status, errorText })) return null;
+
+  const googleResetAt = parseGoogleQuotaResetHint(status, errorText, nowMs);
+  if (googleResetAt) {
+    return googleResetAt;
+  }
 
   const resetHint = parseCodexQuotaResetHint(status, errorText, nowMs);
   if (resetHint) {

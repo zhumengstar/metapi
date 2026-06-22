@@ -499,6 +499,81 @@ describe('TokenRouter runtime cache', () => {
     expect(record?.failCount).toBe(0);
   });
 
+  it('uses Google quota reset hints for Antigravity quota cooldowns', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'antigravity-quota-site',
+      url: 'https://antigravity-quota.example.com',
+      platform: 'antigravity',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'antigravity-quota-user',
+      accessToken: 'antigravity-access-token',
+      status: 'active',
+      oauthProvider: 'antigravity',
+      extraConfig: JSON.stringify({
+        credentialMode: 'oauth',
+        oauth: {
+          provider: 'antigravity',
+          projectId: 'test-project',
+        },
+      }),
+    }).returning().get();
+
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gemini-2.5-pro',
+      routingStrategy: 'stable_first',
+      enabled: true,
+    }).returning().get();
+
+    const channel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: account.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+
+    const resetAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const router = new TokenRouter();
+    await router.recordFailure(channel.id, {
+      status: 429,
+      errorText: JSON.stringify({
+        error: {
+          code: 429,
+          message: 'You have exhausted your capacity on this model. Your quota will reset after 10m.',
+          status: 'RESOURCE_EXHAUSTED',
+          details: [
+            {
+              '@type': 'type.googleapis.com/google.rpc.ErrorInfo',
+              reason: 'QUOTA_EXHAUSTED',
+              domain: 'cloudcode-pa.googleapis.com',
+              metadata: {
+                model: 'gemini-2.5-pro',
+                quotaResetTimeStamp: resetAt,
+                quotaResetDelay: '600s',
+              },
+            },
+            {
+              '@type': 'type.googleapis.com/google.rpc.RetryInfo',
+              retryDelay: '600s',
+            },
+          ],
+        },
+      }),
+      modelName: 'gemini-2.5-pro',
+    });
+
+    const record = await db.select().from(schema.routeChannels)
+      .where(eq(schema.routeChannels.id, channel.id))
+      .get();
+
+    expect(Date.parse(String(record?.cooldownUntil || ''))).toBe(Date.parse(resetAt));
+    expect(record?.failCount).toBe(0);
+  });
+
   it('keeps generic 429 backoff when the error is not limit-related', async () => {
     const site = await db.insert(schema.sites).values({
       name: 'generic-429-site',
