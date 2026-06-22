@@ -132,6 +132,114 @@ describe('upstreamRequestBuilder', () => {
     expect(request.headers['x-test-header']).toBeUndefined();
   });
 
+  it('strips response-only usage and cache statistics before forwarding chat requests', () => {
+    const request = buildUpstreamEndpointRequest({
+      endpoint: 'chat',
+      modelName: 'upstream-gpt',
+      stream: false,
+      tokenValue: 'sk-test',
+      sitePlatform: 'sub2api',
+      siteUrl: 'https://example.com',
+      openaiBody: {
+        model: 'gpt-5.2',
+        messages: [{ role: 'user', content: 'hello' }],
+        prompt_cache_key: 'cache-key-1',
+        stream_options: { include_usage: true },
+        usage: {
+          prompt_tokens: 10,
+          prompt_tokens_details: { cached_tokens: 5 },
+        },
+        prompt_tokens_details: { cached_tokens: 5 },
+        input_tokens_details: { cached_tokens: 5 },
+        cached_tokens: 5,
+        cache_read_tokens: 5,
+        billingDetails: { source: 'local-log' },
+      },
+      downstreamFormat: 'openai',
+    });
+
+    expect(request.body.prompt_cache_key).toBe('cache-key-1');
+    expect(request.body.stream_options).toEqual({ include_usage: true });
+    expect(request.body).not.toHaveProperty('usage');
+    expect(request.body).not.toHaveProperty('prompt_tokens_details');
+    expect(request.body).not.toHaveProperty('input_tokens_details');
+    expect(request.body).not.toHaveProperty('cached_tokens');
+    expect(request.body).not.toHaveProperty('cache_read_tokens');
+    expect(request.body).not.toHaveProperty('billingDetails');
+  });
+
+  it('requests upstream usage details for streaming chat completions by default', () => {
+    const request = buildUpstreamEndpointRequest({
+      endpoint: 'chat',
+      modelName: 'upstream-gpt',
+      stream: true,
+      tokenValue: 'sk-test',
+      sitePlatform: 'sub2api',
+      siteUrl: 'https://example.com',
+      openaiBody: {
+        model: 'gpt-5.2',
+        messages: [{ role: 'user', content: 'hello' }],
+      },
+      downstreamFormat: 'openai',
+    });
+
+    expect(request.body.stream).toBe(true);
+    expect(request.body.stream_options).toEqual({ include_usage: true });
+  });
+
+  it('preserves explicit streaming chat options while requesting upstream usage details', () => {
+    const request = buildUpstreamEndpointRequest({
+      endpoint: 'chat',
+      modelName: 'upstream-gpt',
+      stream: true,
+      tokenValue: 'sk-test',
+      sitePlatform: 'sub2api',
+      siteUrl: 'https://example.com',
+      openaiBody: {
+        model: 'gpt-5.2',
+        messages: [{ role: 'user', content: 'hello' }],
+        stream_options: { include_obfuscation: true },
+      },
+      downstreamFormat: 'openai',
+    });
+
+    expect(request.body.stream_options).toEqual({
+      include_obfuscation: true,
+      include_usage: true,
+    });
+  });
+
+  it('strips response-only usage and cache statistics before forwarding native responses requests', () => {
+    const request = buildUpstreamEndpointRequest({
+      endpoint: 'responses',
+      modelName: 'upstream-gpt',
+      stream: false,
+      tokenValue: 'sk-test',
+      sitePlatform: 'openai',
+      siteUrl: 'https://example.com',
+      openaiBody: {},
+      downstreamFormat: 'responses',
+      responsesOriginalBody: {
+        model: 'gpt-5.2',
+        input: 'hello',
+        prompt_cache_key: 'cache-key-2',
+        usage: {
+          input_tokens: 10,
+          input_tokens_details: { cached_tokens: 5 },
+        },
+        input_tokens_details: { cached_tokens: 5 },
+        cache_creation_tokens: 3,
+        billing_details: { source: 'local-log' },
+      },
+    });
+
+    expect(request.body.prompt_cache_key).toBe('cache-key-2');
+    expect(request.body).not.toHaveProperty('usage');
+    expect(request.body).not.toHaveProperty('input_tokens_details');
+    expect(request.body).not.toHaveProperty('cache_creation_tokens');
+    expect(request.body).not.toHaveProperty('billing_details');
+  });
+
   it('drops responses-style continuation fields before proxying Claude count_tokens upstream', () => {
     const request = buildClaudeCountTokensUpstreamRequest({
       modelName: 'claude-opus-4-6',

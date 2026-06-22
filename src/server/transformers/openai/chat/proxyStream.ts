@@ -55,6 +55,7 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
   };
   let terminalNormalizedFinal: ReturnType<typeof normalizeOpenAiChatFinalToNormalized> | null = null;
   let forwardedDownstreamOutput = false;
+  let openAiFinishChunkForwarded = false;
   const pendingWrites: string[] = [];
 
   const extractFailureMessage = (payload: unknown, fallback = 'upstream stream failed'): string => {
@@ -112,8 +113,34 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
 
   const flushPendingWrites = () => {
     if (pendingWrites.length <= 0) return;
+    markOpenAiFinishChunks(pendingWrites);
     input.writeLines([...pendingWrites]);
     pendingWrites.length = 0;
+  };
+
+  const markOpenAiFinishChunks = (lines: string[]) => {
+    if (input.downstreamFormat !== 'openai') return;
+    for (const line of lines) {
+      if (!line.startsWith('data: ') || line.trim() === 'data: [DONE]') continue;
+      try {
+        const payload = JSON.parse(line.slice(6));
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) continue;
+        const choices: unknown[] = Array.isArray((payload as Record<string, unknown>).choices)
+          ? (payload as Record<string, unknown>).choices as unknown[]
+          : [];
+        if (choices.some((choice) => (
+          choice
+          && typeof choice === 'object'
+          && !Array.isArray(choice)
+          && typeof (choice as Record<string, unknown>).finish_reason === 'string'
+          && ((choice as Record<string, unknown>).finish_reason as string).length > 0
+        ))) {
+          openAiFinishChunkForwarded = true;
+        }
+      } catch {
+        // Non-JSON data lines are forwarded unchanged by the caller.
+      }
+    }
   };
 
   const emitLines = (lines: string[], options?: { meaningful?: boolean; force?: boolean }) => {
@@ -123,18 +150,21 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
       return;
     }
     if (forwardedDownstreamOutput) {
+      markOpenAiFinishChunks(lines);
       input.writeLines(lines);
       return;
     }
     if (options?.force) {
       pendingWrites.length = 0;
       forwardedDownstreamOutput = true;
+      markOpenAiFinishChunks(lines);
       input.writeLines(lines);
       return;
     }
     if (options?.meaningful) {
       forwardedDownstreamOutput = true;
       flushPendingWrites();
+      markOpenAiFinishChunks(lines);
       input.writeLines(lines);
       return;
     }
@@ -205,6 +235,7 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
       && terminalResult.status !== 'failed'
       && chatAggregateState
       && chatAggregateState.choices.size > 0
+      && !openAiFinishChunkForwarded
     ) {
       const needsTerminalFinishChunk = Array.from(chatAggregateState.choices.values())
         .some((choice) => !choice.finishReason);

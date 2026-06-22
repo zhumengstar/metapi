@@ -92,6 +92,29 @@ const METAPI_INTERNAL_HEADER_BLOCKLIST = new Set([
   'x-metapi-responses-websocket-transport',
 ]);
 
+const RESPONSE_ONLY_USAGE_FIELDS = new Set([
+  'usage',
+  'usage_details',
+  'usageDetails',
+  'usagePayload',
+  'prompt_tokens',
+  'completion_tokens',
+  'total_tokens',
+  'input_tokens',
+  'output_tokens',
+  'prompt_tokens_details',
+  'completion_tokens_details',
+  'input_tokens_details',
+  'output_tokens_details',
+  'cached_tokens',
+  'cache_read_tokens',
+  'cache_creation_tokens',
+  'billingDetails',
+  'billing_details',
+  'estimated_cost',
+  'estimatedCost',
+]);
+
 const ANTIGRAVITY_RUNTIME_USER_AGENT = 'antigravity/1.19.6 darwin/arm64';
 
 function shouldSkipPassthroughHeader(key: string): boolean {
@@ -227,6 +250,34 @@ function stripClaudeMessagesContinuationFields(
   delete next.previous_response_id;
   delete next.prompt_cache_key;
   return next;
+}
+
+function stripResponseOnlyUsageFields(
+  body: Record<string, unknown>,
+): Record<string, unknown> {
+  const next = { ...body };
+  for (const key of RESPONSE_ONLY_USAGE_FIELDS) {
+    delete next[key];
+  }
+  return next;
+}
+
+function ensureChatStreamUsageRequest(
+  body: Record<string, unknown>,
+  stream: boolean,
+): Record<string, unknown> {
+  if (!stream) return body;
+  const streamOptions = isRecord(body.stream_options)
+    ? { ...body.stream_options }
+    : {};
+  if (streamOptions.include_usage === true) return body;
+  return {
+    ...body,
+    stream_options: {
+      ...streamOptions,
+      include_usage: true,
+    },
+  };
 }
 
 function buildAntigravityRuntimeHeaders(input: {
@@ -514,7 +565,7 @@ export function buildUpstreamEndpointRequest(input: {
     return next;
   };
 
-  const openaiBody = stripGeminiUnsupportedFields(input.openaiBody);
+  const openaiBody = stripResponseOnlyUsageFields(stripGeminiUnsupportedFields(input.openaiBody));
   const runtime = {
     executor: (
       sitePlatform === 'codex'
@@ -586,11 +637,11 @@ export function buildUpstreamEndpointRequest(input: {
       && input.claudeOriginalBody
       && input.forceNormalizeClaudeBody !== true
     )
-      ? {
+      ? stripResponseOnlyUsageFields({
         ...stripClaudeMessagesContinuationFields(input.claudeOriginalBody),
         model: input.modelName,
         stream: input.stream,
-      }
+      })
       : null;
     const normalizedClaudeBody = (
       input.downstreamFormat === 'claude'
@@ -598,7 +649,7 @@ export function buildUpstreamEndpointRequest(input: {
       && input.forceNormalizeClaudeBody === true
     )
       ? sanitizeAnthropicMessagesBody({
-        ...stripClaudeMessagesContinuationFields(input.claudeOriginalBody),
+        ...stripResponseOnlyUsageFields(stripClaudeMessagesContinuationFields(input.claudeOriginalBody)),
         model: input.modelName,
         stream: input.stream,
       })
@@ -654,11 +705,11 @@ export function buildUpstreamEndpointRequest(input: {
       : {};
     const rawBody = (
       input.downstreamFormat === 'responses' && input.responsesOriginalBody
-        ? {
+        ? stripResponseOnlyUsageFields({
           ...stripGeminiUnsupportedFields(input.responsesOriginalBody),
           model: input.modelName,
           stream: input.stream,
-        }
+        })
         : convertOpenAiBodyToResponsesBodyViaTransformer(openaiBody, input.modelName, input.stream)
     );
     const sanitizedResponsesBody = sanitizeResponsesBodyForProxyViaTransformer(rawBody, input.modelName, input.stream);
@@ -718,7 +769,7 @@ export function buildUpstreamEndpointRequest(input: {
 
   const headers = ensureStreamAcceptHeader(commonHeaders, input.stream);
   const chatBody = {
-    ...openaiBody,
+    ...ensureChatStreamUsageRequest(openaiBody, input.stream),
     model: input.modelName,
     stream: input.stream,
   };

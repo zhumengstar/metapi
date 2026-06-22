@@ -618,6 +618,7 @@ export async function handleChatSurfaceRequest(
         });
         const streamResponse = {
           end() {
+            if (!streamStarted) return;
             sseSink.end();
           },
         };

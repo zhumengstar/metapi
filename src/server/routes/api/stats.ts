@@ -301,6 +301,15 @@ function toRoundedMicroNumber(value: number | null | undefined): number {
   return Math.round(Number(value || 0) * 1_000_000) / 1_000_000;
 }
 
+function readProxyLogNonNegativeNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+  if (typeof value === "string") {
+    const parsed = Number(value.trim());
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return null;
+}
+
 function normalizeNullableText(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
@@ -614,8 +623,13 @@ function mapProxyLogRow(
       ? row.proxy_logs.errorMessage
       : "",
   );
-  const billingDetails = parseProxyLogBillingDetails(
-    row.proxy_logs.billingDetails,
+  const rawBillingDetails = parseProxyLogBillingDetails(row.proxy_logs.billingDetails);
+  const billingDetails = normalizeProxyLogBillingDetailsForDisplay(
+    rawBillingDetails,
+    {
+      promptTokens: row.proxy_logs.promptTokens,
+      cacheReadTokens: readBillingUsageToken(rawBillingDetails, "cacheReadTokens"),
+    },
   );
   const cacheReadTokens = readBillingUsageToken(billingDetails, "cacheReadTokens");
   const rawPromptTokens = typeof row.proxy_logs.promptTokens === "number"
@@ -733,6 +747,70 @@ function convertBillingDetailsToActualAmount(
       cacheReadCost: toActualAmount(breakdown.cacheReadCost, ratio),
       cacheCreationCost: toActualAmount(breakdown.cacheCreationCost, ratio),
       totalCost: toActualAmount(breakdown.totalCost, ratio),
+    },
+  };
+}
+
+function normalizeProxyLogBillingDetailsForDisplay(
+  billingDetails: ReturnType<typeof parseProxyLogBillingDetails>,
+  input: {
+    promptTokens?: unknown;
+    cacheReadTokens?: number | null;
+  },
+) {
+  if (!billingDetails || typeof billingDetails !== "object" || Array.isArray(billingDetails)) {
+    return billingDetails;
+  }
+  const usage = billingDetails.usage && typeof billingDetails.usage === "object" && !Array.isArray(billingDetails.usage)
+    ? billingDetails.usage as Record<string, unknown>
+    : null;
+  const breakdown = billingDetails.breakdown && typeof billingDetails.breakdown === "object" && !Array.isArray(billingDetails.breakdown)
+    ? billingDetails.breakdown as Record<string, unknown>
+    : null;
+  if (!usage) return billingDetails;
+
+  const promptTokens = readProxyLogNonNegativeNumber(input.promptTokens)
+    ?? readProxyLogNonNegativeNumber(usage.promptTokens);
+  const cacheReadTokens = readProxyLogNonNegativeNumber(input.cacheReadTokens)
+    ?? readProxyLogNonNegativeNumber(usage.cacheReadTokens)
+    ?? 0;
+  const cacheCreationTokens = readProxyLogNonNegativeNumber(usage.cacheCreationTokens) ?? 0;
+  const billablePromptTokens = readProxyLogNonNegativeNumber(usage.billablePromptTokens);
+  if (
+    promptTokens == null
+    || billablePromptTokens !== 0
+    || cacheReadTokens + cacheCreationTokens <= promptTokens
+  ) {
+    return billingDetails;
+  }
+
+  const nextUsage = {
+    ...usage,
+    promptTokens,
+    billablePromptTokens: promptTokens,
+    promptTokensIncludeCache: false,
+  };
+  if (!breakdown) {
+    return {
+      ...billingDetails,
+      usage: nextUsage,
+    };
+  }
+
+  const inputPerMillion = readProxyLogNonNegativeNumber(breakdown.inputPerMillion);
+  const nextInputCost = inputPerMillion == null
+    ? readProxyLogNonNegativeNumber(breakdown.inputCost)
+    : toRoundedMicroNumber((promptTokens / 1_000_000) * inputPerMillion);
+  const outputCost = readProxyLogNonNegativeNumber(breakdown.outputCost) ?? 0;
+  const cacheReadCost = readProxyLogNonNegativeNumber(breakdown.cacheReadCost) ?? 0;
+  const cacheCreationCost = readProxyLogNonNegativeNumber(breakdown.cacheCreationCost) ?? 0;
+  return {
+    ...billingDetails,
+    usage: nextUsage,
+    breakdown: {
+      ...breakdown,
+      inputCost: nextInputCost,
+      totalCost: toRoundedMicroNumber((nextInputCost ?? 0) + outputCost + cacheReadCost + cacheCreationCost),
     },
   };
 }

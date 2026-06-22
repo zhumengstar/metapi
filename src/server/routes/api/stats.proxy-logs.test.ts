@@ -354,6 +354,101 @@ describe("stats proxy logs routes", () => {
     });
   });
 
+  it("falls back to stored prompt tokens when legacy billing details zeroed billable input", async () => {
+    const site = await db
+      .insert(schema.sites)
+      .values({
+        name: "legacy-cache-site",
+        url: "https://legacy-cache.example.com",
+        platform: "new-api",
+      })
+      .returning()
+      .get();
+
+    const account = await db
+      .insert(schema.accounts)
+      .values({
+        siteId: site.id,
+        username: "legacy-cache-user",
+        accessToken: "legacy-cache-token",
+        status: "active",
+      })
+      .returning()
+      .get();
+
+    const inserted = await db
+      .insert(schema.proxyLogs)
+      .values({
+        accountId: account.id,
+        modelRequested: "gpt-5.5",
+        modelActual: "gpt-5.5",
+        status: "success",
+        promptTokens: 3971,
+        completionTokens: 82,
+        totalTokens: 4053,
+        estimatedCost: 0.004272,
+        createdAt: formatUtcSqlDateTime(new Date("2026-03-09T08:06:00.000Z")),
+        billingDetails: JSON.stringify({
+          usage: {
+            promptTokens: 3971,
+            billablePromptTokens: 0,
+            cacheReadTokens: 168960,
+            cacheCreationTokens: 0,
+            completionTokens: 82,
+            promptTokensIncludeCache: true,
+          },
+          breakdown: {
+            inputPerMillion: 5,
+            outputPerMillion: 30,
+            cacheReadPerMillion: 0.5,
+            cacheCreationPerMillion: 5,
+            inputCost: 0,
+            outputCost: 0.00246,
+            cacheReadCost: 0.08448,
+            cacheCreationCost: 0,
+            totalCost: 0.08694,
+          },
+        }),
+      })
+      .run();
+
+    const logId = Number(inserted.lastInsertRowid || 0);
+    const listResponse = await app.inject({
+      method: "GET",
+      url: "/api/stats/proxy-logs?limit=20",
+    });
+    const detailResponse = await app.inject({
+      method: "GET",
+      url: `/api/stats/proxy-logs/${logId}`,
+    });
+
+    expect(listResponse.statusCode).toBe(200);
+    expect(detailResponse.statusCode).toBe(200);
+    const listBody = listResponse.json() as {
+      items: Array<Record<string, unknown>>;
+    };
+    const detailBody = detailResponse.json() as {
+      billingDetails?: {
+        usage?: Record<string, unknown>;
+        breakdown?: Record<string, unknown>;
+      };
+    };
+
+    expect(listBody.items[0]).toMatchObject({
+      promptTokens: 3971,
+      cacheReadTokens: 168960,
+      cacheHitRate: 97.7,
+    });
+    expect(detailBody.billingDetails?.usage).toMatchObject({
+      billablePromptTokens: 3971,
+      promptTokensIncludeCache: false,
+    });
+    expect(detailBody.billingDetails?.breakdown).toMatchObject({
+      inputCost: 0.019855,
+      totalCost: 0.106795,
+    });
+  });
+
   it("prefers the selected account token group ratio over billing detail ratio for proxy logs", async () => {
     const site = await db
       .insert(schema.sites)

@@ -111,6 +111,26 @@ describe('proxyUsageParser', () => {
     });
   });
 
+  it('treats OpenAI cached_tokens alias as separate from prompt_tokens', () => {
+    const usage = parseProxyUsage({
+      usage: {
+        prompt_tokens: 3971,
+        completion_tokens: 82,
+        total_tokens: 4053,
+        prompt_cache_hit_tokens: 168960,
+      },
+    });
+
+    expect(usage).toEqual({
+      promptTokens: 3971,
+      completionTokens: 82,
+      totalTokens: 4053,
+      cacheReadTokens: 168960,
+      cacheCreationTokens: 0,
+      promptTokensIncludeCache: null,
+    });
+  });
+
   it('parses anthropic cache usage fields without treating input tokens as cache-inclusive', () => {
     const usage = parseProxyUsage({
       usage: {

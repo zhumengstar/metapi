@@ -217,6 +217,41 @@ describe('openAiChatTransformer.inbound', () => {
       streamOptionsIncludeUsage: true,
     });
   });
+
+  it('serializes streaming usage as a standard usage-only chat chunk', () => {
+    const context = openAiChatTransformer.createStreamContext('gpt-5');
+    context.id = 'chatcmpl_usage';
+    context.created = 1_706_000_000;
+    const lines = openAiChatTransformer.serializeStreamEvent({
+      usagePayload: {
+        prompt_tokens: 123,
+        completion_tokens: 45,
+        total_tokens: 168,
+      },
+      usageDetails: {
+        prompt_tokens_details: {
+          cached_tokens: 100,
+        },
+      },
+    } as any, context, undefined as any);
+
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0].slice('data: '.length))).toEqual({
+      id: 'chatcmpl_usage',
+      object: 'chat.completion.chunk',
+      created: 1_706_000_000,
+      model: 'gpt-5',
+      choices: [],
+      usage: {
+        prompt_tokens: 123,
+        completion_tokens: 45,
+        total_tokens: 168,
+        prompt_tokens_details: {
+          cached_tokens: 100,
+        },
+      },
+    });
+  });
 });
 
 describe('openAiChatTransformer.outbound', () => {
@@ -501,7 +536,7 @@ describe('openAiChatTransformer.stream', () => {
     });
   });
 
-  it('preserves annotations, citations, and usage payload on serialized stream chunks', () => {
+  it('preserves annotations and citations while serializing usage as a standard usage-only chunk', () => {
     const context = openAiChatTransformer.createStreamContext('gpt-5');
     const event = openAiChatTransformer.transformStreamEvent({
       id: 'chatcmpl-1',
@@ -533,6 +568,10 @@ describe('openAiChatTransformer.stream', () => {
 
     expect(payloads[0]).toMatchObject({
       citations: ['https://c.example', 'https://a.example'],
+    });
+    expect((payloads[0] as any).usage).toBeUndefined();
+    expect(payloads[1]).toMatchObject({
+      choices: [],
       usage: {
         prompt_tokens: 11,
         completion_tokens: 7,
@@ -568,7 +607,8 @@ describe('openAiChatTransformer.stream', () => {
       openAiChatTransformer.serializeStreamEvent(event, context, createClaudeDownstreamContext()),
     );
 
-    expect(payloads[0]).toMatchObject({
+    expect(payloads[1]).toMatchObject({
+      choices: [],
       usage: {
         prompt_tokens: 11,
         completion_tokens: 7,

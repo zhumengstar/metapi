@@ -174,8 +174,6 @@ function detectPromptTokensIncludeCache(record: Record<string, unknown>): boolea
     'promptTokensDetails',
     'input_tokens_details',
     'inputTokensDetails',
-    'prompt_cache_hit_tokens',
-    'promptCacheHitTokens',
   ].some((key) => key in record);
   if (hasDetailCacheFields) return true;
 

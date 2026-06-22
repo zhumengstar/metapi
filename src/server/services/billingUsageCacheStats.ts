@@ -43,19 +43,27 @@ export function resolveBillablePromptTokensForCacheStats(input: {
   promptTokens?: number | null;
   cacheReadTokens?: number | null;
 }): number | null {
-  const billablePromptTokens = readBillingUsageToken(input.billingDetails, 'billablePromptTokens');
-  if (billablePromptTokens != null) return billablePromptTokens;
-
   const rawPromptTokens = readNonNegativeNumber(input.promptTokens)
     ?? readBillingUsageToken(input.billingDetails, 'promptTokens');
   if (rawPromptTokens == null) return null;
 
-  const promptTokensIncludeCache = readBillingUsageBoolean(input.billingDetails, 'promptTokensIncludeCache');
-  if (promptTokensIncludeCache === false) return rawPromptTokens;
-
   const cacheReadTokens = input.cacheReadTokens ?? readBillingUsageToken(input.billingDetails, 'cacheReadTokens') ?? 0;
   const cacheCreationTokens = readBillingUsageToken(input.billingDetails, 'cacheCreationTokens') ?? 0;
-  return Math.max(0, rawPromptTokens - cacheReadTokens - cacheCreationTokens);
+  const cachedInputTokens = cacheReadTokens + cacheCreationTokens;
+
+  const billablePromptTokens = readBillingUsageToken(input.billingDetails, 'billablePromptTokens');
+  if (billablePromptTokens != null) {
+    if (billablePromptTokens === 0 && rawPromptTokens > 0 && cachedInputTokens > rawPromptTokens) {
+      return rawPromptTokens;
+    }
+    return billablePromptTokens;
+  }
+
+  const promptTokensIncludeCache = readBillingUsageBoolean(input.billingDetails, 'promptTokensIncludeCache');
+  if (promptTokensIncludeCache === false) return rawPromptTokens;
+  if (promptTokensIncludeCache === true && cachedInputTokens > rawPromptTokens) return rawPromptTokens;
+
+  return Math.max(0, rawPromptTokens - cachedInputTokens);
 }
 
 export function calculateCacheHitRatePercent(input: {

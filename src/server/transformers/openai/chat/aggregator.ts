@@ -65,6 +65,18 @@ function getChoiceAggregate(state: OpenAiChatAggregateState, index: number): Cho
   return created;
 }
 
+function hasChoiceDeltaSignal(event: OpenAiChatChoiceDelta): boolean {
+  return !!(
+    event.role
+    || event.contentDelta
+    || event.reasoningDelta
+    || event.finishReason
+    || (Array.isArray(event.toolCallDeltas) && event.toolCallDeltas.length > 0)
+    || (Array.isArray(event.annotations) && event.annotations.length > 0)
+    || (Array.isArray(event.citations) && event.citations.length > 0)
+  );
+}
+
 function applyChoiceDelta(choice: ChoiceAggregate, event: OpenAiChatChoiceDelta) {
   if (event.role) choice.role = event.role;
   if (event.contentDelta) choice.content.push(event.contentDelta);
@@ -123,6 +135,7 @@ export function applyOpenAiChatStreamEvent(
     } satisfies OpenAiChatChoiceDelta];
 
   for (const choiceEvent of choiceEvents) {
+    if (!hasChoiceDeltaSignal(choiceEvent)) continue;
     const choice = getChoiceAggregate(state, choiceEvent.index);
     applyChoiceDelta(choice, choiceEvent);
   }

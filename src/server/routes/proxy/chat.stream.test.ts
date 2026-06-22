@@ -206,6 +206,46 @@ describe('chat proxy stream behavior', () => {
     expect(recordFailureMock).not.toHaveBeenCalled();
   });
 
+  it('keeps streaming usage as the final chat chunk before DONE for OpenAI-compatible parsers', async () => {
+    const encoder = new TextEncoder();
+    const upstreamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"id":"chatcmpl-upstream","object":"chat.completion.chunk","created":1706000000,"model":"upstream-gpt","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'));
+        controller.enqueue(encoder.encode('data: {"id":"chatcmpl-upstream","object":"chat.completion.chunk","created":1706000000,"model":"upstream-gpt","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}\n\n'));
+        controller.enqueue(encoder.encode('data: {"id":"chatcmpl-upstream","object":"chat.completion.chunk","created":1706000000,"model":"upstream-gpt","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'));
+        controller.enqueue(encoder.encode('data: {"id":"chatcmpl-upstream","object":"chat.completion.chunk","created":1706000000,"model":"upstream-gpt","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":7}}}\n\n'));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+      },
+    });
+
+    fetchMock.mockResolvedValue(new Response(upstreamBody, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-5.5',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode, response.body).toBe(200);
+    const dataLines = response.body
+      .split('\n')
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => line.slice(6));
+    expect(dataLines.at(-1)).toBe('[DONE]');
+    const finalPayload = JSON.parse(dataLines.at(-2) || '{}');
+    expect(finalPayload.choices).toEqual([]);
+    expect(finalPayload.usage?.prompt_tokens_details?.cached_tokens).toBe(7);
+    expect(dataLines.slice(0, -1).filter((line) => line.includes('"finish_reason":"stop"')).length).toBe(1);
+  });
+
   it('decodes zstd-compressed non-stream chat responses before serializing downstream JSON', async () => {
     const payload = JSON.stringify({
       id: 'chatcmpl-zstd',

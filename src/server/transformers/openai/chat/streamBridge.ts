@@ -20,6 +20,36 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
+function buildUsagePayload(event: OpenAiChatNormalizedStreamEvent): Record<string, unknown> | null {
+  if (!event.usagePayload && !event.usageDetails) return null;
+  const usagePayload = {
+    ...(isRecord(event.usagePayload) ? event.usagePayload : {}),
+    ...(event.usageDetails?.prompt_tokens_details
+      ? { prompt_tokens_details: event.usageDetails.prompt_tokens_details }
+      : {}),
+    ...(event.usageDetails?.completion_tokens_details
+      ? { completion_tokens_details: event.usageDetails.completion_tokens_details }
+      : {}),
+  };
+  return Object.keys(usagePayload).length > 0 ? usagePayload : null;
+}
+
+function buildUsageOnlyChunk(
+  event: OpenAiChatNormalizedStreamEvent,
+  context: StreamTransformContext,
+): string | null {
+  const usagePayload = buildUsagePayload(event);
+  if (!usagePayload) return null;
+  return `data: ${JSON.stringify({
+    id: context.id || `chatcmpl-${Date.now()}`,
+    object: 'chat.completion.chunk',
+    created: context.created,
+    model: context.model,
+    choices: [],
+    usage: usagePayload,
+  })}\n\n`;
+}
+
 function getMultiChoiceToolState(
   context: StreamTransformContext,
 ): Record<string, { id?: string; name?: string; arguments?: string }> {
@@ -93,18 +123,8 @@ export const openAiChatStream = {
       && event.choiceEvents.length > 0
       && (event.choiceEvents.length > 1 || event.choiceEvents[0]?.index !== 0)
     ) {
-      const usagePayload = event.usagePayload
-        ? {
-          ...(isRecord(event.usagePayload) ? event.usagePayload : {}),
-          ...(event.usageDetails?.prompt_tokens_details
-            ? { prompt_tokens_details: event.usageDetails.prompt_tokens_details }
-            : {}),
-          ...(event.usageDetails?.completion_tokens_details
-            ? { completion_tokens_details: event.usageDetails.completion_tokens_details }
-            : {}),
-        }
-        : undefined;
-      return [`data: ${JSON.stringify({
+      const usageOnlyChunk = buildUsageOnlyChunk(event, context);
+      const lines = [`data: ${JSON.stringify({
         id: context.id || `chatcmpl-${Date.now()}`,
         object: 'chat.completion.chunk',
         created: context.created,
@@ -149,10 +169,11 @@ export const openAiChatStream = {
               finish_reason: choiceEvent.finishReason ?? null,
             };
           })
-          .sort((left, right) => left.index - right.index),
+              .sort((left, right) => left.index - right.index),
         ...(Array.isArray(event.citations) && event.citations.length > 0 ? { citations: event.citations } : {}),
-        ...(usagePayload && Object.keys(usagePayload).length > 0 ? { usage: usagePayload } : {}),
       })}\n\n`];
+      if (usageOnlyChunk) lines.push(usageOnlyChunk);
+      return lines;
     }
 
     const lines = serializeNormalizedStreamEvent(
@@ -162,13 +183,12 @@ export const openAiChatStream = {
       downstreamContext ?? createClaudeDownstreamContext(),
     );
 
+    const usageOnlyChunk = buildUsageOnlyChunk(event, context);
     if (
       (!Array.isArray(event.annotations) || event.annotations.length <= 0)
       && (!Array.isArray(event.citations) || event.citations.length <= 0)
-      && !event.usagePayload
-      && !event.usageDetails
     ) {
-      return lines;
+      return usageOnlyChunk ? [...lines, usageOnlyChunk] : lines;
     }
 
     const parsedEvents = parseSerializedSse(lines);
@@ -185,22 +205,10 @@ export const openAiChatStream = {
         firstChoice.delta.annotations = event.annotations;
       }
 
-      if (event.usagePayload || event.usageDetails) {
-        payload.usage = {
-          ...(isRecord(event.usagePayload) ? event.usagePayload : {}),
-          ...(event.usageDetails?.prompt_tokens_details
-            ? { prompt_tokens_details: event.usageDetails.prompt_tokens_details }
-            : {}),
-          ...(event.usageDetails?.completion_tokens_details
-            ? { completion_tokens_details: event.usageDetails.completion_tokens_details }
-            : {}),
-        };
-      }
-
       lines[parsed.index] = `data: ${JSON.stringify(payload)}\n\n`;
     }
 
-    return lines;
+    return usageOnlyChunk ? [...lines, usageOnlyChunk] : lines;
   },
   serializeDone(
     context: StreamTransformContext,

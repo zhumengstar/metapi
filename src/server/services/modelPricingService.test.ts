@@ -179,6 +179,46 @@ describe('modelPricingService', () => {
     expect(cost).toBe(0.00372);
   });
 
+  it('keeps prompt tokens billable when cache-inclusive marker conflicts with token counts', () => {
+    const model: PricingModel = {
+      modelName: 'gpt-5.5',
+      quotaType: 0,
+      modelRatio: 2.5,
+      completionRatio: 6,
+      cacheRatio: 0.1,
+      cacheCreationRatio: 1,
+      modelPrice: null,
+      enableGroups: ['default'],
+    };
+
+    const detail = calculateModelUsageBreakdown(
+      model,
+      {
+        promptTokens: 3971,
+        completionTokens: 82,
+        totalTokens: 4053,
+        cacheReadTokens: 168960,
+        cacheCreationTokens: 0,
+        promptTokensIncludeCache: true,
+      },
+      { default: 1 },
+    );
+
+    expect(detail).toMatchObject({
+      usage: {
+        billablePromptTokens: 3971,
+        cacheReadTokens: 168960,
+        promptTokensIncludeCache: true,
+      },
+      breakdown: {
+        inputCost: 0.019855,
+        outputCost: 0.00246,
+        cacheReadCost: 0.08448,
+        totalCost: 0.106795,
+      },
+    });
+  });
+
   it('uses upstream ratios for GPT models when upstream pricing is available', () => {
     const model: PricingModel = {
       modelName: 'gpt-5.5',
