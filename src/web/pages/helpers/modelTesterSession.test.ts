@@ -14,10 +14,12 @@ import {
   buildRawProxyRequestEnvelope,
   buildSearchRequestEnvelope,
   attachForcedChannelToEnvelope,
+  collectModelTesterModelOptions,
   collectModelTesterModelNames,
   countConversationTurns,
   createConversationUserMessage,
   extractConversationUploadedFilesFromMessage,
+  filterModelTesterModelOptionsByMode,
   filterModelTesterModelNames,
   parseCustomRequestBody,
   parseModelTesterSession,
@@ -897,7 +899,7 @@ describe('modelTesterSession', () => {
     });
   });
 
-  it('merges marketplace models with exact enabled route models for tester options', () => {
+  it('collects exact enabled route models for tester options', () => {
     const modelNames = collectModelTesterModelNames(
       {
         models: [
@@ -906,16 +908,132 @@ describe('modelTesterSession', () => {
         ],
       },
       [
-        { modelPattern: 'BAAI/bge-large-en-v1.5', enabled: true },
-        { modelPattern: 'claude-*', enabled: true },
+        { modelPattern: 'BAAI/bge-large-en-v1.5', enabled: true, channels: [{ enabled: true }] },
+        { modelPattern: 'claude-*', enabled: true, channels: [{ enabled: true }] },
         { modelPattern: 'gemini-2.5-pro', enabled: false },
       ],
     );
 
     expect(modelNames).toEqual([
-      'gpt-4o-mini',
-      'bge-large-en-v1.5',
       'BAAI/bge-large-en-v1.5',
+    ]);
+  });
+
+  it('keeps image route models when chat health test was skipped for image-only testing', () => {
+    const options = collectModelTesterModelOptions(
+      null,
+      [
+        {
+          modelPattern: 'gpt-image-2',
+          enabled: true,
+          channels: [
+            {
+              enabled: true,
+              modelTestResult: {
+                available: false,
+                message: '图片模型不进行聊天可用性测试',
+              },
+            },
+          ],
+        },
+        {
+          modelPattern: 'gpt-5.5',
+          enabled: true,
+          channels: [
+            {
+              enabled: true,
+              modelTestResult: {
+                available: false,
+                message: '上游 401',
+              },
+            },
+          ],
+        },
+      ],
+    );
+
+    expect(options.map((option) => option.name)).toEqual(['gpt-image-2']);
+    expect(options[0]?.mode).toBe('images.generate');
+  });
+
+  it('keeps image route models visible even when a chat-style test failed', () => {
+    const options = collectModelTesterModelOptions(
+      null,
+      [
+        {
+          modelPattern: 'gpt-image-2',
+          enabled: true,
+          channels: [
+            {
+              enabled: true,
+              modelTestResult: {
+                available: false,
+                message: 'The model is not supported on chat completions',
+              },
+            },
+          ],
+        },
+      ],
+    );
+
+    expect(options.map((option) => option.name)).toEqual(['gpt-image-2']);
+  });
+
+  it('filters tester model options by selected mode', () => {
+    const options = collectModelTesterModelOptions(
+      null,
+      [
+        { modelPattern: 'gpt-5.5', enabled: true, channels: [{ enabled: true }] },
+        { modelPattern: 'gpt-image-2', enabled: true, channels: [{ enabled: true }] },
+        { modelPattern: 'text-embedding-3-large', enabled: true, channels: [{ enabled: true }] },
+      ],
+    );
+
+    expect(filterModelTesterModelOptionsByMode(options, 'conversation').map((option) => option.name)).toEqual(['gpt-5.5']);
+    expect(filterModelTesterModelOptionsByMode(options, 'images.generate').map((option) => option.name)).toEqual(['gpt-image-2']);
+    expect(filterModelTesterModelOptionsByMode(options, 'embeddings').map((option) => option.name)).toEqual(['text-embedding-3-large']);
+  });
+
+  it('keeps the route model pattern as the tester request value when a display name exists', () => {
+    const options = collectModelTesterModelOptions(
+      null,
+      [
+        {
+          modelPattern: 'gpt-image-2',
+          displayName: '高清图片生成',
+          enabled: true,
+          channels: [{ enabled: true }],
+        },
+      ],
+    );
+
+    expect(options).toEqual([
+      expect.objectContaining({
+        name: 'gpt-image-2',
+        label: '高清图片生成',
+        mode: 'images.generate',
+      }),
+    ]);
+  });
+
+  it('collects providers from route site names for model tester display', () => {
+    const options = collectModelTesterModelOptions(
+      null,
+      [
+        {
+          modelPattern: 'gpt-5.5',
+          enabled: true,
+          siteNames: ['Alicepan', 'Muling'],
+          channels: [{ enabled: true }],
+        },
+      ],
+    );
+
+    expect(options).toEqual([
+      expect.objectContaining({
+        name: 'gpt-5.5',
+        provider: 'Alicepan+Muling',
+      }),
     ]);
   });
 

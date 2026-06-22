@@ -25,6 +25,7 @@ import {
   createMessage,
   createConversationUserMessage,
   extractConversationUploadedFilesFromMessage,
+  filterModelTesterModelOptionsByMode,
   filterModelTesterModelNames,
   finalizeIncompleteMessage,
   findLastLoadingAssistantIndex,
@@ -293,6 +294,65 @@ const extractAssistantResult = (result: unknown): { content: string; reasoningCo
 
   return processed;
 };
+
+type ExtractedImageResult = {
+  src: string;
+  label: string;
+};
+
+function collectImageResultSources(value: unknown, path = 'result'): ExtractedImageResult[] {
+  if (!value || typeof value !== 'object') return [];
+  const record = value as Record<string, any>;
+  const results: ExtractedImageResult[] = [];
+
+  const pushUrl = (raw: unknown, label: string) => {
+    if (typeof raw !== 'string') return;
+    const trimmed = raw.trim();
+    if (!trimmed) return;
+    if (/^(https?:|data:image\/)/i.test(trimmed)) {
+      results.push({ src: trimmed, label });
+    }
+  };
+  const pushBase64 = (raw: unknown, label: string, mimeType = 'image/png') => {
+    if (typeof raw !== 'string') return;
+    const trimmed = raw.trim();
+    if (!trimmed) return;
+    if (trimmed.startsWith('data:image/')) {
+      results.push({ src: trimmed, label });
+      return;
+    }
+    results.push({ src: `data:${mimeType};base64,${trimmed}`, label });
+  };
+
+  pushUrl(record.url, path);
+  pushUrl(record.image_url, path);
+  pushUrl(record.imageUrl, path);
+  pushBase64(record.b64_json, path);
+  pushBase64(record.base64, path);
+  pushBase64(record.image_base64, path);
+  pushBase64(record.imageBase64, path);
+
+  if (typeof record.type === 'string' && record.type.includes('image')) {
+    pushUrl(record.fileUri, path);
+    pushUrl(record.file_uri, path);
+    pushBase64(record.data, path, typeof record.mimeType === 'string' ? record.mimeType : 'image/png');
+  }
+
+  for (const key of ['data', 'output', 'content', 'parts', 'images', 'result']) {
+    const nested = record[key];
+    if (Array.isArray(nested)) {
+      nested.forEach((item, index) => {
+        results.push(...collectImageResultSources(item, `${path}.${key}[${index}]`));
+      });
+    } else if (nested && typeof nested === 'object') {
+      results.push(...collectImageResultSources(nested, `${path}.${key}`));
+    }
+  }
+
+  return results.filter((item, index, array) => (
+    array.findIndex((other) => other.src === item.src) === index
+  ));
+}
 
 const replaceMessageAt = (messages: ChatMessage[], index: number, nextMessage: ChatMessage): ChatMessage[] => [
   ...messages.slice(0, index),
@@ -727,6 +787,7 @@ export default function ModelTester() {
   const restoredSessionRef = useRef<ReturnType<typeof parseModelTesterSession>>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
   const streamStopRequestedRef = useRef(false);
+  const pendingJobNonConversationRef = useRef(false);
   const conversationFileCapability = useMemo(
     () => resolveConversationFileCapability(inputs.protocol),
     [inputs.protocol],
@@ -766,6 +827,36 @@ export default function ModelTester() {
   const updateModeState = useCallback(<K extends keyof ModelTesterModeState>(key: K, value: ModelTesterModeState[K]) => {
     setModeState((prev) => ({ ...prev, [key]: value }));
   }, []);
+
+  const updateMode = useCallback((mode: PlaygroundMode) => {
+    setInputs((prev) => {
+      const currentOption = modelOptions.find((option) => option.name === prev.model) || null;
+      if (currentOption?.mode === mode || (mode === 'images.edit' && currentOption?.mode === 'images.generate')) {
+        return {
+          ...prev,
+          mode,
+          stream: mode === 'conversation' ? prev.stream : false,
+        };
+      }
+
+      const nextOption = filterModelTesterModelOptionsByMode(modelOptions, mode)[0] || null;
+      if (nextOption) {
+        return {
+          ...applyModelTesterRecommendedTarget(prev, nextOption),
+          mode,
+          stream: mode === 'conversation' ? prev.stream : false,
+        };
+      }
+
+      return {
+        ...prev,
+        mode,
+        stream: mode === 'conversation' ? prev.stream : false,
+      };
+    });
+    setForcedChannelId(null);
+    setModelSearch('');
+  }, [modelOptions]);
 
   const updateProtocol = useCallback((protocol: PlaygroundProtocol) => {
     setInputs((prev) => ({
@@ -1324,10 +1415,8 @@ export default function ModelTester() {
         requestKind: 'json',
         stream: false,
         jobMode: false,
-        rawMode: customRequestMode,
-        ...(customRequestMode
-          ? { rawJsonText: customRequestBody }
-          : { jsonBody: { model: inputs.model, prompt: assetPrompt.trim() } }),
+        rawMode: false,
+        jsonBody: { model: inputs.model, prompt: assetPrompt.trim() },
       };
     }
 
@@ -1442,10 +1531,28 @@ export default function ModelTester() {
     void api.deleteProxyTestJob(jobId).catch(() => { });
   }, []);
 
+  const shouldRunProxyEnvelopeAsJob = useCallback((envelope: ProxyTestEnvelope): boolean => {
+    if (envelope.jobMode) return true;
+    const path = envelope.path || '';
+    if (/^\/v1\/images\/(?:generations|edits)(?:\?.*)?$/i.test(path)) return true;
+    if (envelope.method === 'POST' && /^\/v1\/videos(?:\?.*)?$/i.test(path)) return true;
+    return false;
+  }, []);
+
+  const shouldStoreProxyJobAsNonConversation = useCallback((envelope: ProxyTestEnvelope | null): boolean => {
+    const path = envelope?.path || '';
+    if (/^\/v1\/images\/(?:generations|edits)(?:\?.*)?$/i.test(path)) return true;
+    if (envelope?.method === 'POST' && /^\/v1\/videos(?:\?.*)?$/i.test(path)) return true;
+    return false;
+  }, []);
+
   useEffect(() => {
     if (!pendingJobId) return;
 
     let active = true;
+    const jobIsNonConversation = pendingJobNonConversationRef.current
+      || shouldStoreProxyJobAsNonConversation(pendingPayload);
+    pendingJobNonConversationRef.current = jobIsNonConversation;
     setSending(true);
 
     const pollTask = async () => {
@@ -1460,20 +1567,28 @@ export default function ModelTester() {
           }
 
           if (status.status === 'succeeded') {
-            setMessages((prev) => applyAssistantSuccess(prev, status.result));
+            if (jobIsNonConversation) {
+              setNonConversationResult(status.result);
+            } else {
+              setMessages((prev) => applyAssistantSuccess(prev, status.result));
+            }
             setError('');
             setDebugResponse(formatJson(status.result));
             setActiveDebugTab(DEBUG_TABS.RESPONSE);
             pushDebug('info', `任务 ${pendingJobId} 已成功。`);
           } else if (status.status === 'cancelled') {
-            setMessages((prev) => applyAssistantStopped(prev));
+            if (!jobIsNonConversation) {
+              setMessages((prev) => applyAssistantStopped(prev));
+            }
             setError('生成已取消。');
             setDebugResponse(formatJson(status.error));
             setActiveDebugTab(DEBUG_TABS.RESPONSE);
             pushDebug('warn', `任务 ${pendingJobId} 已取消。`);
           } else {
             const message = extractErrorMessage(status.error);
-            setMessages((prev) => applyAssistantError(prev, message));
+            if (!jobIsNonConversation) {
+              setMessages((prev) => applyAssistantError(prev, message));
+            }
             setError(message);
             setDebugResponse(formatJson(status.error));
             setActiveDebugTab(DEBUG_TABS.RESPONSE);
@@ -1482,6 +1597,7 @@ export default function ModelTester() {
 
           setPendingJobId(null);
           setPendingPayload(null);
+          pendingJobNonConversationRef.current = false;
           setSending(false);
           finalizeJob(pendingJobId);
           return;
@@ -1497,35 +1613,46 @@ export default function ModelTester() {
     return () => {
       active = false;
     };
-  }, [finalizeJob, pendingJobId, pushDebug]);
+  }, [finalizeJob, pendingJobId, pendingPayload, pushDebug, shouldStoreProxyJobAsNonConversation]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
   const turnCount = useMemo(() => countConversationTurns(messages), [messages]);
+  const modeFilteredOptions = useMemo(
+    () => filterModelTesterModelOptionsByMode(modelOptions, inputs.mode),
+    [inputs.mode, modelOptions],
+  );
+  const modeFilteredModels = useMemo(
+    () => modeFilteredOptions.map((option) => option.name),
+    [modeFilteredOptions],
+  );
   const filteredModels = useMemo(
-    () => filterModelTesterModelNames(models, modelSearch),
-    [modelSearch, models],
+    () => filterModelTesterModelNames(modeFilteredModels, modelSearch),
+    [modelSearch, modeFilteredModels],
   );
   const currentModelVisible = useMemo(
     () => filteredModels.includes(inputs.model),
     [filteredModels, inputs.model],
   );
   const modelCountText = useMemo(() => {
-    if (!modelSearch.trim()) return `共 ${models.length} 个模型`;
-    return `匹配 ${filteredModels.length} / ${models.length}`;
-  }, [filteredModels.length, modelSearch, models.length]);
+    const modeLabel = CONVERSATION_MODE_OPTIONS.find((option) => option.value === inputs.mode)?.label || inputs.mode;
+    if (!modelSearch.trim()) return `${modeLabel} ${modeFilteredModels.length} / 全部 ${models.length}`;
+    return `${modeLabel} 匹配 ${filteredModels.length} / ${modeFilteredModels.length}`;
+  }, [filteredModels.length, inputs.mode, modeFilteredModels.length, modelSearch, models.length]);
 
   const modelSelectOptions = useMemo(
     () => filteredModels.map((item) => {
       const option = modelOptions.find((entry) => entry.name === item);
-      const suffix = option
-        ? ` · ${option.mode === 'conversation' ? '对话' : option.mode} / ${option.protocol}`
-        : '';
-      return { value: item, label: `${item}${suffix}` };
+      const provider = option?.provider?.trim() || '未知供应商';
+      return { value: item, label: `${provider}/${item}` };
     }),
     [filteredModels, modelOptions],
+  );
+  const imageResults = useMemo(
+    () => collectImageResultSources(nonConversationResult),
+    [nonConversationResult],
   );
   const canSend = useMemo(() => {
     if (sending || pendingJobId || !inputs.model) return false;
@@ -1896,6 +2023,26 @@ export default function ModelTester() {
       return;
     }
 
+    if (!nextMessages && shouldRunProxyEnvelopeAsJob(effectiveEnvelope)) {
+      setSending(true);
+      setPendingPayload(effectiveEnvelope);
+      pendingJobNonConversationRef.current = shouldStoreProxyJobAsNonConversation(effectiveEnvelope);
+      try {
+        const created = await api.startProxyTestJob(effectiveEnvelope) as { jobId: string };
+        setPendingJobId(created.jobId);
+        pushDebug('info', `已创建代理任务 ${created.jobId}：${effectiveEnvelope.path}`);
+      } catch (requestError: any) {
+        pendingJobNonConversationRef.current = false;
+        const message = requestError?.message || '请求失败';
+        setError(message);
+        setDebugResponse(formatJson({ error: { message } }));
+        setActiveDebugTab(DEBUG_TABS.RESPONSE);
+        pushDebug('error', `创建代理任务失败：${message}`);
+        setSending(false);
+      }
+      return;
+    }
+
     setSending(true);
     try {
       const result = await api.proxyTest(effectiveEnvelope);
@@ -1921,7 +2068,7 @@ export default function ModelTester() {
     } finally {
       setSending(false);
     }
-  }, [attachEnvelopeForcedChannel, pushDebug, startProxyStream]);
+  }, [attachEnvelopeForcedChannel, pushDebug, shouldRunProxyEnvelopeAsJob, shouldStoreProxyJobAsNonConversation, startProxyStream]);
 
   const buildPayloadWithMessages = useCallback((nextMessages: ChatMessage[]): {
     payload: TestChatPayload | null;
@@ -2427,7 +2574,7 @@ export default function ModelTester() {
               value={inputs.mode}
               onChange={(next) => {
                 if (!next) return;
-                updateInput('mode', next as PlaygroundMode);
+                updateMode(next as PlaygroundMode);
               }}
               options={CONVERSATION_MODE_OPTIONS}
               placeholder="请选择测试模式"
@@ -2459,7 +2606,7 @@ export default function ModelTester() {
               </button>
             </div>
             <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginBottom: 6 }}>
-              {modelCountText}，仅展示路由通道当前可用的模型
+              {modelCountText}，已按测试模式筛选，仅展示路由通道当前可用的模型
             </div>
             <ModernSelect
               value={currentModelVisible ? inputs.model : ''}
@@ -2786,21 +2933,17 @@ export default function ModelTester() {
                   </div>
                 </div>
 
-                {Array.isArray((nonConversationResult as any)?.data) && (nonConversationResult as any).data.some((item: any) => item?.url || item?.b64_json) && (
+                {imageResults.length > 0 && (
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }}>
-                    {(nonConversationResult as any).data.map((item: any, index: number) => {
-                      const imageSrc = typeof item?.url === 'string'
-                        ? item.url
-                        : (typeof item?.b64_json === 'string' ? `data:image/png;base64,${item.b64_json}` : '');
-                      if (!imageSrc) return null;
+                    {imageResults.map((item, index) => {
                       return (
-                        <div key={`image-${index}`} style={{
+                        <div key={`${item.label}-${index}`} style={{
                           border: '1px solid var(--color-border-light)',
                           borderRadius: 'var(--radius-md)',
                           overflow: 'hidden',
                           background: 'var(--color-bg-card)',
                         }}>
-                          <img src={imageSrc} alt={`generated-${index}`} style={{ width: '100%', display: 'block' }} />
+                          <img src={item.src} alt={`generated-${index}`} style={{ width: '100%', display: 'block' }} />
                         </div>
                       );
                     })}

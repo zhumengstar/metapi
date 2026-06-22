@@ -160,9 +160,13 @@ export type ProxyTestEnvelope = TesterProxyEnvelope;
 
 export type ModelTesterModelOption = {
   name: string;
+  label?: string;
+  provider?: string;
   protocol: PlaygroundProtocol;
   mode: PlaygroundMode;
 };
+
+export type ModelTesterModeFilter = PlaygroundMode | 'all';
 
 export const MODEL_TESTER_SESSION_VERSION = 5;
 export const MODEL_TESTER_STORAGE_KEY = 'metapi:model-tester:session:v5';
@@ -918,6 +922,18 @@ const inferModelTesterMode = (modelName: string): PlaygroundMode => {
   return 'conversation';
 };
 
+const isImageOrVideoTesterMode = (mode: PlaygroundMode): boolean =>
+  mode === 'images.generate' || mode === 'images.edit' || mode === 'videos.create' || mode === 'videos.inspect';
+
+const isImageOnlySkippedModelTestResult = (result: any): boolean => {
+  if (!result || result.available !== false) return false;
+  const message = String(result.message || '').trim();
+  return message === '只有图片模型，未进行聊天可用性测试'
+    || message.includes('图片模型不进行聊天可用性测试')
+    || message.includes('图片模型跳过文本测活')
+    || message.includes('仅图片模型');
+};
+
 const inferModelTesterProtocol = (modelName: string, mode: PlaygroundMode): PlaygroundProtocol => {
   if (mode !== 'conversation') return 'openai';
   const normalized = modelName.trim().toLowerCase();
@@ -927,27 +943,57 @@ const inferModelTesterProtocol = (modelName: string, mode: PlaygroundMode): Play
   return 'openai';
 };
 
-const isRouteChannelUsableForModelTester = (channel: any): boolean => {
+const isRouteChannelUsableForModelTester = (channel: any, mode: PlaygroundMode): boolean => {
   if (!channel || channel.enabled === false) return false;
   if (channel.token && channel.token.enabled === false) return false;
-  if (channel.modelTestResult?.available === false) return false;
+  if (isImageOrVideoTesterMode(mode)) return true;
+  if (channel.modelTestResult?.available === false) {
+    return isImageOnlySkippedModelTestResult(channel.modelTestResult);
+  }
   return true;
 };
 
 export const collectModelTesterModelOptions = (
   _marketplace: { models?: Array<{ name?: unknown }>; } | null | undefined,
-  routes: Array<{ modelPattern?: unknown; displayName?: unknown; enabled?: unknown; channels?: unknown; }> | null | undefined,
+  routes: Array<{ modelPattern?: unknown; displayName?: unknown; enabled?: unknown; siteNames?: unknown; channels?: unknown; }> | null | undefined,
 ): ModelTesterModelOption[] => {
   const routeBacked: ModelTesterModelOption[] = [];
   const seenRouteModels = new Set<string>();
 
-  const buildOption = (rawName: unknown): ModelTesterModelOption | null => {
+  const normalizeProvider = (rawSiteNames: unknown, rawChannels: unknown): string | undefined => {
+    const siteNames = new Set<string>();
+    if (Array.isArray(rawSiteNames)) {
+      for (const item of rawSiteNames) {
+        if (typeof item === 'string' && item.trim()) siteNames.add(item.trim());
+      }
+    }
+    if (Array.isArray(rawChannels)) {
+      for (const channel of rawChannels) {
+        const siteName = (channel as any)?.site?.name;
+        if (typeof siteName === 'string' && siteName.trim()) siteNames.add(siteName.trim());
+      }
+    }
+    const providers = Array.from(siteNames);
+    if (providers.length === 0) return undefined;
+    if (providers.length <= 2) return providers.join('+');
+    return `${providers.slice(0, 2).join('+')}等${providers.length}个`;
+  };
+
+  const buildOption = (rawName: unknown, rawLabel?: unknown, rawProvider?: unknown): ModelTesterModelOption | null => {
     if (typeof rawName !== 'string') return null;
     const name = rawName.trim();
     if (!name) return null;
     const mode = inferModelTesterMode(name);
+    const label = typeof rawLabel === 'string' && rawLabel.trim() && rawLabel.trim() !== name
+      ? rawLabel.trim()
+      : undefined;
+    const provider = typeof rawProvider === 'string' && rawProvider.trim()
+      ? rawProvider.trim()
+      : undefined;
     return {
       name,
+      ...(label ? { label } : {}),
+      ...(provider ? { provider } : {}),
       mode,
       protocol: inferModelTesterProtocol(name, mode),
     };
@@ -959,11 +1005,9 @@ export const collectModelTesterModelOptions = (
     const modelPattern = route.modelPattern.trim();
     if (!modelPattern || !isExactModelPattern(modelPattern)) continue;
     const channels = Array.isArray(route.channels) ? route.channels : [];
-    if (!channels.some(isRouteChannelUsableForModelTester)) continue;
-    const option = buildOption(typeof route.displayName === 'string' && route.displayName.trim()
-      ? route.displayName
-      : modelPattern);
+    const option = buildOption(modelPattern, route.displayName, normalizeProvider(route.siteNames, channels));
     if (!option || seenRouteModels.has(option.name)) continue;
+    if (!channels.some((channel) => isRouteChannelUsableForModelTester(channel, option.mode))) continue;
     seenRouteModels.add(option.name);
     routeBacked.push(option);
   }
@@ -995,6 +1039,20 @@ export const filterModelTesterModelNames = (models: string[], query: string): st
       return a.index - b.index;
     })
     .map((item) => item.name);
+};
+
+export const filterModelTesterModelOptionsByMode = (
+  options: ModelTesterModelOption[],
+  mode: ModelTesterModeFilter,
+): ModelTesterModelOption[] => {
+  if (mode === 'all') return [...options];
+  if (mode === 'images.edit') {
+    return options.filter((option) => option.mode === 'images.generate' || option.mode === 'images.edit');
+  }
+  if (mode === 'videos.inspect') {
+    return options.filter((option) => option.mode === 'videos.create' || option.mode === 'videos.inspect');
+  }
+  return options.filter((option) => option.mode === mode);
 };
 
 export const createMessage = (role: ChatRole, content: string, extra: Partial<ChatMessage> = {}): ChatMessage => ({
