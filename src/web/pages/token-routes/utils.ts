@@ -246,9 +246,7 @@ export function getChannelDecisionState(
   }
 
   if (!candidate.eligible) {
-    const nowIso = new Date().toISOString();
-    const cooldownActive = !!channel.cooldownUntil && channel.cooldownUntil > nowIso;
-    if (cooldownActive || candidate.reason.includes('冷却中')) {
+    if (candidate.reason.includes('冷却中')) {
       return {
         probability: 0,
         showBar: true,

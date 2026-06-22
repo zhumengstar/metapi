@@ -8,7 +8,7 @@ import {
 import { isUsableAccountToken } from './accountTokenService.js';
 import { probeRuntimeModel } from './runtimeModelProbe.js';
 import * as routeRefreshWorkflow from './routeRefreshWorkflow.js';
-import { invalidateTokenRouterCache } from './tokenRouter.js';
+import { invalidateTokenRouterCache, tokenRouter } from './tokenRouter.js';
 
 export type RouteChannelModelTestResult = Omit<AccountTokenModelTestResult, 'tokenId'> & {
   channelId: number;
@@ -95,7 +95,13 @@ export async function testRouteChannelModelAvailability(input: {
     }
     const test = await testAccountTokenModelAvailability({ model, tokenIds: [channel.tokenId] });
     const result = test.results[0];
-    if (result) return buildTokenResultForChannel(channel, result);
+    if (result) {
+      if (result.available) {
+        await tokenRouter.recordProbeSuccess(channel.id, result.latencyMs ?? 0, model, channel.accountId);
+        invalidateTokenRouterCache();
+      }
+      return buildTokenResultForChannel(channel, result);
+    }
     return buildAccountProbeResult({
       channel,
       model,
@@ -134,6 +140,7 @@ export async function testRouteChannelModelAvailability(input: {
     .run();
 
   if (available) {
+    await tokenRouter.recordProbeSuccess(channel.id, probe.latencyMs ?? 0, model, channel.accountId);
     await routeRefreshWorkflow.rebuildRoutesOnly();
     invalidateTokenRouterCache();
   }

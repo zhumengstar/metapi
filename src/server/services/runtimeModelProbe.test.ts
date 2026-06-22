@@ -91,6 +91,24 @@ describe('probeRuntimeModel', () => {
     expect(result.latencyMs).not.toBeNull();
   });
 
+  it('skips gpt image models instead of probing them through chat completions', async () => {
+    const { probeRuntimeModel } = await import('./runtimeModelProbe.js');
+    const result = await probeRuntimeModel({
+      site,
+      account,
+      modelName: 'gpt-image-2',
+      timeoutMs: 30,
+    });
+
+    expect(result).toEqual({
+      status: 'skipped',
+      latencyMs: null,
+      reason: 'skipped non-conversation model probe',
+    });
+    expect(resolveUpstreamEndpointCandidatesMock).not.toHaveBeenCalled();
+    expect(dispatchRuntimeRequestMock).not.toHaveBeenCalled();
+  });
+
   it('uses the remaining timeout budget for the runtime request phase', async () => {
     resolveUpstreamEndpointCandidatesMock.mockImplementation(async () => {
       await new Promise((resolve) => setTimeout(resolve, 15));

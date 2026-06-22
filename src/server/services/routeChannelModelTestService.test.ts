@@ -90,6 +90,10 @@ describe('routeChannelModelTestService', () => {
       tokenId: null,
       enabled: true,
       sourceModel: 'gpt-5.5',
+      cooldownUntil: '2099-01-01T00:00:00.000Z',
+      lastFailAt: '2026-06-22T00:00:00.000Z',
+      consecutiveFailCount: 3,
+      cooldownLevel: 2,
     }).returning().get();
 
     const result = await testRouteChannelModelAvailability({
@@ -123,6 +127,15 @@ describe('routeChannelModelTestService', () => {
     expect(availability).toMatchObject({
       available: true,
       latencyMs: 42,
+    });
+    const refreshedChannel = await db.select().from(schema.routeChannels)
+      .where(eq(schema.routeChannels.id, channel.id))
+      .get();
+    expect(refreshedChannel).toMatchObject({
+      cooldownUntil: null,
+      lastFailAt: null,
+      consecutiveFailCount: 0,
+      cooldownLevel: 0,
     });
   });
 });

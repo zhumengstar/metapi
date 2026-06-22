@@ -179,12 +179,14 @@ const SITE_PROTOCOL_FAILURE_PATTERNS: RegExp[] = [
 const SITE_MODEL_FAILURE_PATTERNS: RegExp[] = [
   /unsupported\s+model/i,
   /model\s+not\s+supported/i,
+  /model\s+is\s+not\s+supported/i,
   /does\s+not\s+support(?:\s+the)?\s+model/i,
   /no\s+such\s+model/i,
   /unknown\s+model/i,
   /unknown\s+provider\s+for\s+model/i,
   /invalid\s+model/i,
   /model.*does\s+not\s+exist/i,
+  /not\s+supported\s+when\s+using\s+codex\s+with\s+a\s+chatgpt\s+account/i,
   /当前\s*api\s*不支持所选模型/i,
   /不支持所选模型/i,
 ];
@@ -2289,7 +2291,24 @@ function isOauthRouteUnitMemberCoolingDown(
   member: typeof schema.oauthRouteUnitMembers.$inferSelect,
   nowIso: string,
 ): boolean {
-  return !!member.cooldownUntil && member.cooldownUntil > nowIso;
+  return !!member.cooldownUntil
+    && member.cooldownUntil > nowIso
+    && (
+      (member.consecutiveFailCount ?? 0) > 0
+      || (member.cooldownLevel ?? 0) > 0
+    );
+}
+
+function isRouteChannelCoolingDown(
+  channel: typeof schema.routeChannels.$inferSelect,
+  nowIso: string,
+): boolean {
+  return !!channel.cooldownUntil
+    && channel.cooldownUntil > nowIso
+    && (
+      (channel.consecutiveFailCount ?? 0) > 0
+      || (channel.cooldownLevel ?? 0) > 0
+    );
 }
 
 function compareStableFirstCandidateOrder(left: RouteChannelCandidate, right: RouteChannelCandidate): number {
@@ -4161,7 +4180,7 @@ export class TokenRouter {
     const tokenValue = this.resolveChannelTokenValue(candidate);
     if (!tokenValue) reasonParts.push('令牌不可用');
 
-    if (candidate.channel.cooldownUntil && candidate.channel.cooldownUntil > nowIso) {
+    if (isRouteChannelCoolingDown(candidate.channel, nowIso)) {
       reasonParts.push('冷却中');
     }
 

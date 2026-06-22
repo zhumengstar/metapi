@@ -1480,6 +1480,7 @@ describe('TokenRouter selection scoring', () => {
       routeId: route.id,
       accountId: accountRecovered.id,
       tokenId: tokenRecovered.id,
+      sourceModel: 'gpt-5.3',
       priority: 0,
       weight: 10,
       enabled: true,
@@ -1492,6 +1493,7 @@ describe('TokenRouter selection scoring', () => {
       routeId: route.id,
       accountId: accountHealthy.id,
       tokenId: tokenHealthy.id,
+      sourceModel: 'gpt-5.3',
       priority: 0,
       weight: 10,
       enabled: true,
@@ -1512,6 +1514,12 @@ describe('TokenRouter selection scoring', () => {
       consecutiveFailCount: 0,
       cooldownLevel: 0,
     }).where(eq(schema.routeChannels.id, recoveredChannel.id)).run();
+    await db.update(schema.tokenModelAvailability).set({
+      available: true,
+      message: '请求成功',
+      httpStatus: 200,
+      responseText: 'OK',
+    }).where(eq(schema.tokenModelAvailability.tokenId, tokenRecovered.id)).run();
 
     await router.recordSuccess(recoveredChannel.id, 900, 0, 'gpt-5.3');
     for (let index = 0; index < 4; index += 1) {

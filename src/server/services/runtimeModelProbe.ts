@@ -25,10 +25,15 @@ const NON_CONVERSATION_MODEL_PATTERNS = [
   /(^|[-_/])whisper($|[-_/])/i,
   /(^|[-_/])tts($|[-_/])/i,
   /(^|[-_/])transcribe|transcription/i,
+  /(^|[-_/])gpt[-_]?image($|[-_/])/i,
+  /(^|[-_/])image(s)?($|[-_/])/i,
+  /(^|[-_/])img($|[-_/])/i,
   /(^|[-_/])dall-e($|[-_/])/i,
+  /(^|[-_/])dall[-_]?e($|[-_/])/i,
   /(^|[-_/])imagen($|[-_/])/i,
   /(^|[-_/])veo($|[-_/])/i,
   /(^|[-_/])cogvideo($|[-_/])/i,
+  /(^|[-_/])video($|[-_/])/i,
 ];
 
 const DEFINITE_UNSUPPORTED_PATTERNS = [
