@@ -4,6 +4,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { getOauthInfoFromAccount } from '../../services/oauth/oauthAccount.js';
 
 const fetchMock = vi.fn();
 const undiciAgentCtorMock = vi.fn();
@@ -2336,6 +2337,14 @@ describe('oauth routes', { timeout: 15_000 }, () => {
           },
         },
       }),
+    });
+    const persistedAccount = await db.select().from(schema.accounts).where(eq(schema.accounts.id, antigravityAccount.id)).get();
+    const persistedOauth = persistedAccount ? getOauthInfoFromAccount(persistedAccount) : null;
+    expect(persistedOauth?.quota?.antigravity?.credits).toMatchObject({
+      creditType: 'GOOGLE_ONE_AI',
+      creditAmount: 25000,
+      minimumCreditAmountForUsage: 50,
+      available: true,
     });
     expect(fetchMock).toHaveBeenLastCalledWith(
       'https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist',

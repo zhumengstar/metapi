@@ -717,16 +717,30 @@ async function persistQuotaSnapshot(accountId: number, snapshot: OauthQuotaSnaps
   if (!oauth) {
     throw new Error('account is not managed by oauth');
   }
+  const currentQuota = normalizeStoredQuotaSnapshot(oauth.quota);
+  const mergedQuota: OauthQuotaSnapshot = {
+    ...(currentQuota || {}),
+    ...snapshot,
+    antigravity: {
+      ...(currentQuota?.antigravity || {}),
+      ...(snapshot.antigravity || {}),
+      credits: {
+        ...(currentQuota?.antigravity?.credits || {}),
+        ...(snapshot.antigravity?.credits || {}),
+      },
+      ...(snapshot.antigravity?.modelFamilies ? { modelFamilies: snapshot.antigravity.modelFamilies } : {}),
+    },
+  };
   const nextExtraConfig = mergeAccountExtraConfig(account.extraConfig, {
     oauth: buildStoredOauthStateFromAccount(account, {
-      quota: snapshot,
+      quota: mergedQuota,
     }),
   });
   await db.update(schema.accounts).set({
     extraConfig: nextExtraConfig,
     updatedAt: new Date().toISOString(),
   }).where(eq(schema.accounts.id, accountId)).run();
-  return snapshot;
+  return mergedQuota;
 }
 
 export async function recordOauthQuotaHeadersSnapshot(input: {
