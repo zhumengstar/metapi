@@ -158,6 +158,46 @@ function buildGeminiToolConfig(toolChoice: unknown): Record<string, unknown> | u
   return undefined;
 }
 
+function normalizeOpenAiResponseModalities(modalities: unknown): string[] | null {
+  if (!Array.isArray(modalities)) return null;
+  const output: string[] = [];
+  for (const item of modalities) {
+    const normalized = asTrimmedString(item).toLowerCase();
+    if (normalized === 'text') output.push('TEXT');
+    if (normalized === 'image') output.push('IMAGE');
+    if (normalized === 'audio') output.push('AUDIO');
+  }
+  return output.length > 0 ? [...new Set(output)] : null;
+}
+
+function applyOpenAiImageGenerationConfig(
+  generationConfig: Record<string, unknown>,
+  body: Record<string, unknown>,
+): void {
+  const responseModalities = normalizeOpenAiResponseModalities(body.modalities);
+  if (responseModalities) {
+    generationConfig.responseModalities = responseModalities;
+  }
+
+  const imageConfig = isRecord(body.image_config) ? body.image_config : null;
+  if (!imageConfig) return;
+
+  const geminiImageConfig = isRecord(generationConfig.imageConfig)
+    ? { ...generationConfig.imageConfig }
+    : {};
+  const aspectRatio = asTrimmedString(imageConfig.aspect_ratio ?? imageConfig.aspectRatio);
+  if (aspectRatio) {
+    geminiImageConfig.aspectRatio = aspectRatio;
+  }
+  const imageSize = asTrimmedString(imageConfig.image_size ?? imageConfig.imageSize);
+  if (imageSize) {
+    geminiImageConfig.imageSize = imageSize.toLowerCase() === '4k' ? '4K' : imageSize;
+  }
+  if (Object.keys(geminiImageConfig).length > 0) {
+    generationConfig.imageConfig = geminiImageConfig;
+  }
+}
+
 export function convertOpenAiBodyToGeminiGenerateContentRequest(input: {
   body: Record<string, unknown>;
   modelName: string;
@@ -287,7 +327,9 @@ export function convertOpenAiBodyToGeminiGenerateContentRequest(input: {
     };
   }
 
-  const generationConfig: Record<string, unknown> = {};
+  const generationConfig: Record<string, unknown> = isRecord(input.body.generationConfig)
+    ? { ...input.body.generationConfig }
+    : {};
   const maxOutputTokens = Number(
     input.body.max_output_tokens
     ?? input.body.max_completion_tokens
@@ -310,6 +352,7 @@ export function convertOpenAiBodyToGeminiGenerateContentRequest(input: {
   if (thinkingConfig) {
     generationConfig.thinkingConfig = thinkingConfig;
   }
+  applyOpenAiImageGenerationConfig(generationConfig, input.body);
   if (Object.keys(generationConfig).length > 0) {
     request.generationConfig = generationConfig;
   }

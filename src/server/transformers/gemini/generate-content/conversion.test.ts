@@ -41,4 +41,27 @@ describe('convertOpenAiBodyToGeminiGenerateContentRequest', () => {
       },
     ]);
   });
+
+  it('maps OpenAI image generation options to Gemini generationConfig', () => {
+    const request = convertOpenAiBodyToGeminiGenerateContentRequest({
+      modelName: 'gemini-3.1-flash-image',
+      body: {
+        model: 'gemini-3.1-flash-image',
+        messages: [{ role: 'user', content: 'Create a landscape image.' }],
+        modalities: ['image', 'text'],
+        image_config: {
+          aspect_ratio: '16:9',
+          image_size: '4k',
+        },
+      },
+    });
+
+    expect(request.generationConfig).toEqual({
+      responseModalities: ['IMAGE', 'TEXT'],
+      imageConfig: {
+        aspectRatio: '16:9',
+        imageSize: '4K',
+      },
+    });
+  });
 });

@@ -118,6 +118,29 @@ describe('gemini generate-content request bridge', () => {
     expect(functionCallParts[0].thoughtSignature).toBe('real_sig_abc');
   });
 
+  it('maps OpenAI image generation options to Gemini generationConfig', () => {
+    const result = buildGeminiGenerateContentRequestFromOpenAi({
+      modelName: 'gemini-3.1-flash-image',
+      body: {
+        model: 'gemini-3.1-flash-image',
+        messages: [{ role: 'user', content: 'Create a landscape image.' }],
+        modalities: ['image', 'text'],
+        image_config: {
+          aspect_ratio: '16:9',
+          image_size: '4k',
+        },
+      },
+    }) as Record<string, unknown>;
+
+    expect(result.generationConfig).toEqual({
+      responseModalities: ['IMAGE', 'TEXT'],
+      imageConfig: {
+        aspectRatio: '16:9',
+        imageSize: '4K',
+      },
+    });
+  });
+
   it('splits text and signed functionCall parts into separate model messages', () => {
     const result = buildGeminiGenerateContentRequestFromOpenAi({
       modelName: 'gemini-3-flash-preview',
