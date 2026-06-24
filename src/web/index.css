@@ -3457,16 +3457,17 @@ textarea {
 
 .oauth-antigravity-quota {
   display: grid;
-  gap: 10px;
-  min-width: 280px;
-  max-width: 380px;
-  padding-top: 2px;
+  gap: 8px;
+  min-width: 240px;
+  max-width: 360px;
+  padding-top: 0;
 }
 
 .oauth-antigravity-plan {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   gap: 6px;
+  flex-wrap: wrap;
   font-size: 12px;
   color: var(--color-text-muted);
 }
@@ -3482,6 +3483,41 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--color-text-muted);
+}
+
+.oauth-antigravity-compact {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--color-bg) 92%, transparent);
+  border: 1px solid var(--color-border-light);
+}
+
+.oauth-antigravity-compact-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.oauth-antigravity-compact-label {
+  color: var(--color-text-muted);
+  min-width: 0;
+}
+
+.oauth-antigravity-compact-value {
+  color: var(--color-text-primary);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.oauth-antigravity-compact-hint {
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
 }
 
 .oauth-antigravity-family {
@@ -3507,9 +3543,9 @@ textarea {
 
 .oauth-antigravity-limit-row {
   display: grid;
-  grid-template-columns: 70px minmax(72px, auto) minmax(86px, 1fr);
+  grid-template-columns: 66px minmax(64px, auto) minmax(72px, 1fr);
   align-items: center;
-  gap: 4px 8px;
+  gap: 3px 6px;
   font-size: 11px;
   line-height: 1.25;
 }
@@ -3540,7 +3576,7 @@ textarea {
 
 .oauth-antigravity-bar {
   grid-column: 1 / -1;
-  height: 6px;
+  height: 5px;
   border-radius: 999px;
   background: var(--color-border-light);
   overflow: hidden;
@@ -3946,6 +3982,7 @@ textarea {
   font-family: var(--font-mono);
   color: var(--color-text-primary);
   word-break: break-all;
+  min-width: 0;
 }
 
 .oauth-models-item-meta {
@@ -3959,6 +3996,16 @@ textarea {
 
 .oauth-models-badge {
   font-size: 10px;
+}
+
+.oauth-models-availability-badge {
+  font-size: 11px;
+}
+
+.oauth-models-test-button {
+  font-size: 11px;
+  padding: 0;
+  white-space: nowrap;
 }
 
 .oauth-models-empty {

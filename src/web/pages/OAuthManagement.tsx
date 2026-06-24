@@ -689,6 +689,7 @@ function AntigravityQuotaPanel({ quota }: { quota: OAuthQuotaInfo }) {
   const creditLabel = credits
     ? `${credits.creditType || 'Google One AI'} ${credits.available === false ? '余额不足' : '可用'}`
     : '';
+  const hasFamilyWindows = !!gemini?.windows || !!claudeGpt?.windows;
   return (
     <div className="oauth-antigravity-quota">
       <div className="oauth-antigravity-plan">
@@ -697,18 +698,44 @@ function AntigravityQuotaPanel({ quota }: { quota: OAuthQuotaInfo }) {
         {tier ? <span className="oauth-antigravity-tier">{tier}</span> : null}
         {creditLabel ? <span className="oauth-antigravity-tier">{creditLabel}</span> : null}
       </div>
-      <AntigravityQuotaFamily
-        title={gemini?.label || 'Gemini 模型'}
-        models={(gemini?.models || ['Gemini Flash', 'Gemini Pro']).join(', ')}
-        quota={quota}
-        windows={gemini?.windows}
-      />
-      <AntigravityQuotaFamily
-        title={claudeGpt?.label || 'Claude 和 GPT 模型'}
-        models={(claudeGpt?.models || ['Claude Opus', 'Claude Sonnet', 'GPT-OSS']).join(', ')}
-        quota={quota}
-        windows={claudeGpt?.windows}
-      />
+      {hasFamilyWindows ? (
+        <>
+          {gemini?.windows ? (
+            <AntigravityQuotaFamily
+              title={gemini?.label || 'Gemini 模型'}
+              models={(gemini?.models || ['Gemini Flash', 'Gemini Pro']).join(', ')}
+              quota={quota}
+              windows={gemini?.windows}
+            />
+          ) : null}
+          {claudeGpt?.windows ? (
+            <AntigravityQuotaFamily
+              title={claudeGpt?.label || 'Claude 和 GPT 模型'}
+              models={(claudeGpt?.models || ['Claude Opus', 'Claude Sonnet', 'GPT-OSS']).join(', ')}
+              quota={quota}
+              windows={claudeGpt?.windows}
+            />
+          ) : null}
+        </>
+      ) : (
+        <div className="oauth-antigravity-compact">
+          <div className="oauth-antigravity-compact-line">
+            <span className="oauth-antigravity-compact-label">同步状态</span>
+            <span className="oauth-antigravity-compact-value">{quota.lastSyncAt ? '已同步' : '未同步'}</span>
+          </div>
+          <div className="oauth-antigravity-compact-line">
+            <span className="oauth-antigravity-compact-label">信用</span>
+            <span className="oauth-antigravity-compact-value">
+              {credits
+                ? `${credits.creditType || 'Google One AI'} ${credits.available === false ? '不足' : '可用'}`
+                : '未获取'}
+            </span>
+          </div>
+          <div className="oauth-antigravity-compact-hint">
+            当前接口未返回模型族额度窗口，仅保留信用同步结果。
+          </div>
+        </div>
+      )}
     </div>
   );
 }

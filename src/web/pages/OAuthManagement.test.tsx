@@ -415,6 +415,83 @@ describe('OAuthManagement page', () => {
     }
   });
 
+  it('renders compact antigravity quota summary when family windows are absent', async () => {
+    apiMock.getOAuthProviders.mockResolvedValue({
+      providers: [
+        {
+          provider: 'antigravity',
+          label: 'Antigravity',
+          platform: 'antigravity',
+          enabled: true,
+          loginType: 'oauth',
+          requiresProjectId: true,
+          supportsDirectAccountRouting: true,
+          supportsCloudValidation: true,
+          supportsNativeProxy: true,
+        },
+      ],
+    });
+    apiMock.getOAuthConnections.mockResolvedValue({
+      items: [
+        {
+          accountId: 8,
+          siteId: 3,
+          provider: 'antigravity',
+          email: 'ag-user@example.com',
+          accountKey: 'ag-account-123',
+          planType: 'Pro',
+          modelCount: 18,
+          modelsPreview: ['gemini-3-pro', 'claude-sonnet-4.5'],
+          status: 'healthy',
+          quota: {
+            status: 'supported',
+            source: 'official',
+            providerMessage: 'antigravity Google One AI credits loaded from loadCodeAssist',
+            lastSyncAt: '2026-06-25T01:00:00.000Z',
+            subscription: { planType: 'Pro' },
+            windows: {
+              fiveHour: { supported: false, message: 'refresh antigravity quota to populate Google One AI credit balance' },
+              sevenDay: { supported: false, message: 'refresh antigravity quota to populate Google One AI minimum usage amount' },
+            },
+            antigravity: {
+              credits: {
+                creditType: 'GOOGLE_ONE_AI',
+                creditAmount: 25000,
+                minimumCreditAmountForUsage: 50,
+                available: true,
+              },
+            },
+          },
+        },
+      ],
+      total: 1,
+      limit: 100,
+      offset: 0,
+    });
+
+    let root!: WebTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <ToastProvider>
+            <MemoryRouter>
+              <OAuthManagement />
+            </MemoryRouter>
+          </ToastProvider>,
+        );
+      });
+      await flushMicrotasks();
+
+      const text = collectText(root.root);
+      expect(text).toContain('当前接口未返回模型族额度窗口');
+      expect(text).toContain('GOOGLE_ONE_AI 可用');
+      expect(text).not.toContain('Gemini 模型');
+      expect(text).not.toContain('Claude 和 GPT 模型');
+    } finally {
+      root?.unmount();
+    }
+  });
+
   it('opens a models modal from the model count trigger and loads the full model list', async () => {
     apiMock.getOAuthProviders.mockResolvedValue({
       providers: [
