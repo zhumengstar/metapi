@@ -46,6 +46,7 @@ import {
   createGeminiCliStreamReader,
   unwrapGeminiCliPayload,
 } from '../../transformers/gemini/generate-content/cliBridge.js';
+import { geminiGenerateContentTransformer } from '../../transformers/gemini/generate-content/index.js';
 import { summarizeConversationFileInputsInOpenAiBody } from '../capabilities/conversationFileCapabilities.js';
 import { getObservedResponseMeta } from '../firstByteTimeout.js';
 import { getRuntimeResponseReader, readRuntimeResponseText } from '../executors/types.js';
@@ -944,7 +945,17 @@ export async function handleChatSurfaceRequest(
         );
         return reply.code(terminalFailureOutcome.status).send(terminalFailureOutcome.payload);
       }
-      const normalizedFinal = downstreamTransformer.transformFinalResponse(upstreamData, modelName, rawText);
+      const selectedPlatform = String(selected.site.platform || '').trim().toLowerCase();
+      const isInternalGeminiGenerateContentResponse = downstreamFormat === 'openai'
+        && (selectedPlatform === 'antigravity' || selectedPlatform === 'gemini-cli')
+        && successfulUpstreamPath.includes('generateContent');
+      const normalizedFinal = isInternalGeminiGenerateContentResponse
+        ? geminiGenerateContentTransformer.compatibility.normalizeGeminiGenerateContentResponseToOpenAiChat({
+          payload: upstreamData,
+          modelName,
+          fallbackText: rawText,
+        })
+        : downstreamTransformer.transformFinalResponse(upstreamData, modelName, rawText);
       const downstreamResponse = downstreamTransformer.serializeFinalResponse(normalizedFinal, parsedUsage);
 
       await recordSurfaceSuccess({

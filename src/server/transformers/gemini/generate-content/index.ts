@@ -57,7 +57,11 @@ import { geminiGenerateContentStream } from './streamBridge.js';
 import { createGeminiGenerateContentAggregateState, applyGeminiGenerateContentAggregate } from './aggregator.js';
 import { geminiGenerateContentUsage } from './usage.js';
 import { reasoningEffortToGeminiThinkingConfig, geminiThinkingConfigToReasoning } from './convert.js';
-import { buildOpenAiBodyFromGeminiRequest, serializeNormalizedFinalToGemini } from './compatibility.js';
+import {
+  buildOpenAiBodyFromGeminiRequest,
+  normalizeGeminiGenerateContentResponseToOpenAiChat,
+  serializeNormalizedFinalToGemini,
+} from './compatibility.js';
 import {
   buildCanonicalRequestToGeminiGenerateContentBody,
   parseGeminiGenerateContentRequestToCanonical,
@@ -79,6 +83,7 @@ export const geminiGenerateContentTransformer = {
   },
   compatibility: {
     buildOpenAiBodyFromGeminiRequest,
+    normalizeGeminiGenerateContentResponseToOpenAiChat,
     serializeNormalizedFinalToGemini,
   },
   parseProxyRequestPath: parseGeminiProxyRequestPath,
@@ -110,5 +115,6 @@ export {
   reasoningEffortToGeminiThinkingConfig,
   geminiThinkingConfigToReasoning,
   buildOpenAiBodyFromGeminiRequest,
+  normalizeGeminiGenerateContentResponseToOpenAiChat,
   serializeNormalizedFinalToGemini,
 };

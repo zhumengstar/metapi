@@ -119,6 +119,69 @@ function toOpenAiContent(contentParts: GeminiRecord[]): string | Array<Record<st
   return blocks;
 }
 
+function extractGeminiResponseRoot(payload: unknown): GeminiRecord | null {
+  if (!isRecord(payload)) return null;
+  const response = isRecord(payload.response) ? payload.response : null;
+  return response || payload;
+}
+
+function extractGeminiResponseParts(payload: unknown): Array<Record<string, unknown>> {
+  const root = extractGeminiResponseRoot(payload);
+  const candidates = Array.isArray(root?.candidates) ? root.candidates : [];
+  const firstCandidate = candidates.find((candidate): candidate is GeminiRecord => isRecord(candidate));
+  const content = isRecord(firstCandidate?.content) ? firstCandidate.content : null;
+  return Array.isArray(content?.parts)
+    ? content.parts.filter((part): part is GeminiRecord => isRecord(part))
+    : [];
+}
+
+function extractGeminiFinishReason(payload: unknown): string {
+  const root = extractGeminiResponseRoot(payload);
+  const candidates = Array.isArray(root?.candidates) ? root.candidates : [];
+  const firstCandidate = candidates.find((candidate): candidate is GeminiRecord => isRecord(candidate));
+  const reason = asTrimmedString(firstCandidate?.finishReason).toLowerCase();
+  if (reason === 'max_tokens' || reason === 'length') return 'length';
+  if (reason === 'tool_calls') return 'tool_calls';
+  return 'stop';
+}
+
+export function normalizeGeminiGenerateContentResponseToOpenAiChat(input: {
+  payload: unknown;
+  modelName: string;
+  fallbackText?: string;
+}): NormalizedFinalResponse & { choices?: Array<Record<string, unknown>> } {
+  const root = extractGeminiResponseRoot(input.payload);
+  const parts = extractGeminiResponseParts(input.payload);
+  const content = toOpenAiContent(parts);
+  const textContent = typeof content === 'string'
+    ? content
+    : content
+      .filter((part) => part.type === 'text' && typeof part.text === 'string')
+      .map((part) => part.text as string)
+      .join('');
+  const fallback = input.fallbackText || '';
+  const normalized: NormalizedFinalResponse & { choices?: Array<Record<string, unknown>> } = {
+    id: asTrimmedString(root?.responseId) || `chatcmpl-gemini-${Date.now()}`,
+    model: asTrimmedString(root?.modelVersion) || input.modelName,
+    created: Math.floor(Date.now() / 1000),
+    content: textContent || (parts.length > 0 ? '' : fallback),
+    reasoningContent: '',
+    finishReason: extractGeminiFinishReason(input.payload),
+    toolCalls: [],
+  };
+
+  normalized.choices = [{
+    index: 0,
+    role: 'assistant',
+    content: parts.length > 0 ? content : normalized.content,
+    reasoningContent: '',
+    toolCalls: [],
+    finishReason: normalized.finishReason,
+  }];
+
+  return normalized;
+}
+
 function extractToolDeclarations(tools: unknown): Array<Record<string, unknown>> | undefined {
   if (!Array.isArray(tools)) return undefined;
   const next = tools.flatMap((tool) => {

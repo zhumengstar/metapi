@@ -16,6 +16,7 @@ import {
   serializeAggregateJsonPayload,
   serializeAggregatePayload,
 } from './stream.js';
+import { openAiChatTransformer } from '../../openai/chat/index.js';
 
 describe('geminiGenerateContentTransformer.inbound', () => {
   it('reuses the same gemini url resolver helpers across transformer layers', () => {
@@ -413,6 +414,52 @@ describe('geminiGenerateContentTransformer.inbound', () => {
     });
     expect(body.reasoning_effort).toBeUndefined();
     expect(body.reasoning_budget).toBeUndefined();
+  });
+});
+
+describe('geminiGenerateContentTransformer.compatibility', () => {
+  it('serializes Gemini inline image responses as OpenAI chat image content blocks', () => {
+    const normalized = geminiGenerateContentTransformer.compatibility.normalizeGeminiGenerateContentResponseToOpenAiChat({
+      modelName: 'gemini-3.1-flash-image',
+      payload: {
+        responseId: 'gemini-image-response',
+        modelVersion: 'gemini-3.1-flash-image',
+        candidates: [
+          {
+            index: 0,
+            finishReason: 'STOP',
+            content: {
+              role: 'model',
+              parts: [
+                { text: 'done' },
+                {
+                  inlineData: {
+                    mimeType: 'image/jpeg',
+                    data: 'aW1hZ2U=',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    });
+
+    const payload = openAiChatTransformer.serializeFinalResponse(normalized, {
+      promptTokens: 1,
+      completionTokens: 2,
+      totalTokens: 3,
+    });
+
+    expect(payload.choices?.[0]?.message?.content).toEqual([
+      { type: 'text', text: 'done' },
+      {
+        type: 'image_url',
+        image_url: {
+          url: 'data:image/jpeg;base64,aW1hZ2U=',
+        },
+      },
+    ]);
   });
 });
 
