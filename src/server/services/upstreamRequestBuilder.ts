@@ -20,6 +20,7 @@ import {
   getInputHeader,
   headerValueToString,
 } from '../proxy-core/providers/headerUtils.js';
+import { ANTIGRAVITY_RUNTIME_USER_AGENT } from '../proxy-core/providers/antigravityUserAgent.js';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object';
@@ -114,8 +115,6 @@ const RESPONSE_ONLY_USAGE_FIELDS = new Set([
   'estimated_cost',
   'estimatedCost',
 ]);
-
-const ANTIGRAVITY_RUNTIME_USER_AGENT = 'antigravity/1.19.6 darwin/arm64';
 
 function shouldSkipPassthroughHeader(key: string): boolean {
   if (HOP_BY_HOP_HEADERS.has(key) || BLOCKED_PASSTHROUGH_HEADERS.has(key)) return true;

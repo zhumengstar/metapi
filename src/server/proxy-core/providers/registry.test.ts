@@ -222,7 +222,7 @@ describe('resolveProviderProfile', () => {
 
     expect(result.path).toBe('/v1internal:streamGenerateContent?alt=sse');
     expect(result.headers.Authorization).toBe('Bearer oauth-access-token');
-    expect(result.headers['User-Agent']).toBe('antigravity/1.19.6 darwin/arm64');
+    expect(result.headers['User-Agent']).toBe('antigravity/1.23.2 darwin/arm64');
     expect(result.headers['X-Goog-Api-Client']).toBeUndefined();
     expect(result.headers.Accept).toBe('text/event-stream');
     expect(result.runtime).toMatchObject({

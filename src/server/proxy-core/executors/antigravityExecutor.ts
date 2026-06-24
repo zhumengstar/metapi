@@ -9,6 +9,7 @@ import {
   readRuntimeResponseText,
   withRequestBody,
 } from './types.js';
+import { ANTIGRAVITY_RUNTIME_USER_AGENT } from '../providers/antigravityUserAgent.js';
 
 const ANTIGRAVITY_RUNTIME_BASE_URLS = [
   'https://daily-cloudcode-pa.googleapis.com',
@@ -223,7 +224,7 @@ export const antigravityExecutor: RuntimeExecutor = {
           Authorization: input.request.headers.Authorization || input.request.headers.authorization || '',
           'Content-Type': 'application/json',
           Accept: useStreamEndpoint ? 'text/event-stream' : 'application/json',
-          'User-Agent': 'antigravity/1.19.6 darwin/arm64',
+          'User-Agent': ANTIGRAVITY_RUNTIME_USER_AGENT,
         };
         let response: RuntimeResponse;
         try {
@@ -276,7 +277,7 @@ export const antigravityExecutor: RuntimeExecutor = {
       Authorization: input.request.headers.Authorization || input.request.headers.authorization || '',
       'Content-Type': 'application/json',
       Accept: useStreamEndpoint ? 'text/event-stream' : 'application/json',
-      'User-Agent': 'antigravity/1.19.6 darwin/arm64',
+      'User-Agent': ANTIGRAVITY_RUNTIME_USER_AGENT,
     }));
     if (fallbackResponse.ok) {
       return materializeAntigravitySuccessResponse(fallbackResponse, aggregateStreamResponse);
