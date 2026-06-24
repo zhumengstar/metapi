@@ -731,6 +731,12 @@ async function persistQuotaSnapshot(accountId: number, snapshot: OauthQuotaSnaps
       ...(snapshot.antigravity?.modelFamilies ? { modelFamilies: snapshot.antigravity.modelFamilies } : {}),
     },
   };
+  if (mergedQuota.antigravity?.credits && mergedQuota.antigravity.credits.creditAmount === undefined) {
+    delete mergedQuota.antigravity.credits.creditAmount;
+  }
+  if (mergedQuota.antigravity?.credits && mergedQuota.antigravity.credits.minimumCreditAmountForUsage === undefined) {
+    delete mergedQuota.antigravity.credits.minimumCreditAmountForUsage;
+  }
   const nextExtraConfig = mergeAccountExtraConfig(account.extraConfig, {
     oauth: buildStoredOauthStateFromAccount(account, {
       quota: mergedQuota,
