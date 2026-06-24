@@ -2360,6 +2360,75 @@ describe('oauth routes', { timeout: 15_000 }, () => {
     );
   });
 
+  it('keeps antigravity quota synchronized when loadCodeAssist only exposes the minimum usage amount', async () => {
+    const antigravitySite = await db.insert(schema.sites).values({
+      name: 'Antigravity OAuth',
+      url: 'https://example.com/antigravity',
+      platform: 'antigravity',
+      status: 'active',
+    }).returning().get();
+
+    const antigravityAccount = await db.insert(schema.accounts).values({
+      siteId: antigravitySite.id,
+      username: 'ag-user@example.com',
+      accessToken: 'oauth-access-token',
+      status: 'active',
+      oauthProvider: 'antigravity',
+      oauthAccountKey: 'ag-account-123',
+      extraConfig: JSON.stringify({
+        credentialMode: 'session',
+        oauth: {
+          provider: 'antigravity',
+          accountId: 'ag-account-123',
+          email: 'ag-user@example.com',
+          planType: 'pro',
+        },
+      }),
+    }).returning().get();
+
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      paidTier: {
+        id: 'tier-1',
+        availableCredits: [
+          {
+            creditType: 'GOOGLE_ONE_AI',
+            minimumCreditAmountForUsage: '50',
+          },
+        ],
+      },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const antigravityRefresh = await app.inject({
+      method: 'POST',
+      url: `/api/oauth/connections/${antigravityAccount.id}/quota/refresh`,
+    });
+
+    expect(antigravityRefresh.statusCode).toBe(200);
+    const responseBody = antigravityRefresh.json() as {
+      quota?: {
+        antigravity?: {
+          credits?: Record<string, unknown>;
+        };
+      };
+    };
+    expect(responseBody.quota?.antigravity?.credits).toMatchObject({
+      creditType: 'GOOGLE_ONE_AI',
+      minimumCreditAmountForUsage: 50,
+    });
+    expect(responseBody.quota?.antigravity?.credits?.creditAmount).toBeUndefined();
+
+    const persistedAccount = await db.select().from(schema.accounts).where(eq(schema.accounts.id, antigravityAccount.id)).get();
+    const persistedOauth = persistedAccount ? getOauthInfoFromAccount(persistedAccount) : null;
+    expect(persistedOauth?.quota?.antigravity?.credits).toMatchObject({
+      creditType: 'GOOGLE_ONE_AI',
+      minimumCreditAmountForUsage: 50,
+    });
+    expect(persistedOauth?.quota?.antigravity?.credits?.creditAmount).toBeUndefined();
+  });
+
   it('supports batch quota refresh for oauth connections', async () => {
     const codexSite = await db.insert(schema.sites).values({
       name: 'ChatGPT Codex OAuth',

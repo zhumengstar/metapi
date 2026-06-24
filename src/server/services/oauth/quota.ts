@@ -1001,10 +1001,20 @@ function extractAntigravityCreditSnapshot(
   if (oauth.provider !== 'antigravity' || !payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return null;
   }
-  const paidTier = (payload as Record<string, unknown>).paidTier;
+  const root = payload as Record<string, unknown>;
+  const paidTier = root.paidTier;
   if (!paidTier || typeof paidTier !== 'object' || Array.isArray(paidTier)) return null;
   const paidTierRecord = paidTier as Record<string, unknown>;
-  const credits = Array.isArray(paidTierRecord.availableCredits) ? paidTierRecord.availableCredits : [];
+  const availableCreditsSource = Array.isArray(paidTierRecord.availableCredits)
+    ? paidTierRecord.availableCredits
+    : Array.isArray(paidTierRecord.credits)
+      ? paidTierRecord.credits
+      : Array.isArray(root.availableCredits)
+        ? root.availableCredits
+        : Array.isArray(root.credits)
+          ? root.credits
+          : [];
+  const credits = availableCreditsSource;
   let selectedCredit: Record<string, unknown> | undefined;
   for (const rawCredit of credits) {
     if (!rawCredit || typeof rawCredit !== 'object' || Array.isArray(rawCredit)) continue;
@@ -1018,8 +1028,20 @@ function extractAntigravityCreditSnapshot(
   }
   if (!selectedCredit) return null;
 
-  const creditAmount = parseCreditAmount(selectedCredit.creditAmount);
-  const minimumCreditAmount = parseCreditAmount(selectedCredit.minimumCreditAmountForUsage);
+  const creditAmount = parseCreditAmount(
+    selectedCredit.creditAmount
+    ?? selectedCredit.creditBalance
+    ?? selectedCredit.balance
+    ?? selectedCredit.availableCreditAmount
+    ?? selectedCredit.availableCredits,
+  );
+  const minimumCreditAmount = parseCreditAmount(
+    selectedCredit.minimumCreditAmountForUsage
+    ?? selectedCredit.minCreditAmount
+    ?? selectedCredit.minimumUsageAmount
+    ?? selectedCredit.minimumUsageCreditAmount
+    ?? selectedCredit.minimumCreditAmount,
+  );
   if (creditAmount === undefined && minimumCreditAmount === undefined) return null;
 
   const tierId = asTrimmedString(paidTierRecord.id);

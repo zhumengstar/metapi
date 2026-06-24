@@ -687,7 +687,11 @@ function AntigravityQuotaPanel({ quota }: { quota: OAuthQuotaInfo }) {
   const claudeGpt = quota.antigravity?.modelFamilies?.claudeGpt;
   const credits = quota.antigravity?.credits;
   const creditLabel = credits
-    ? `${credits.creditType || 'Google One AI'} ${credits.available === false ? '余额不足' : '可用'}`
+    ? credits.creditAmount !== undefined
+      ? `${credits.creditType || 'Google One AI'} ${credits.creditAmount}${credits.available === false ? ' 不足' : ''}`
+      : credits.minimumCreditAmountForUsage !== undefined
+        ? `${credits.creditType || 'Google One AI'} 门槛 ${credits.minimumCreditAmountForUsage}`
+        : `${credits.creditType || 'Google One AI'} 已同步`
     : '';
   const hasFamilyWindows = !!gemini?.windows || !!claudeGpt?.windows;
   return (
@@ -727,12 +731,16 @@ function AntigravityQuotaPanel({ quota }: { quota: OAuthQuotaInfo }) {
             <span className="oauth-antigravity-compact-label">信用</span>
             <span className="oauth-antigravity-compact-value">
               {credits
-                ? `${credits.creditType || 'Google One AI'} ${credits.available === false ? '不足' : '可用'}`
+                ? credits.creditAmount !== undefined
+                  ? `${credits.creditType || 'Google One AI'} ${credits.creditAmount}${credits.available === false ? ' 不足' : ''}`
+                  : credits.minimumCreditAmountForUsage !== undefined
+                    ? `${credits.creditType || 'Google One AI'} 门槛 ${credits.minimumCreditAmountForUsage}`
+                    : `${credits.creditType || 'Google One AI'} 已同步`
                 : '未获取'}
             </span>
           </div>
           <div className="oauth-antigravity-compact-hint">
-            当前接口未返回模型族额度窗口，仅保留信用同步结果。
+            当前接口未返回完整额度窗口，已保留信用同步结果。
           </div>
         </div>
       )}

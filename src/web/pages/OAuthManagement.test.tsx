@@ -406,7 +406,7 @@ describe('OAuthManagement page', () => {
       const text = collectText(root.root);
       expect(text).toContain('Gemini 模型');
       expect(text).toContain('Claude 和 GPT 模型');
-      expect(text).toContain('GOOGLE_ONE_AI 可用');
+      expect(text).toContain('GOOGLE_ONE_AI 25000');
       expect(text).toContain('剩余 82%');
       expect(text).toContain('剩余 46%');
       expect(text.match(/剩余 100%/g)).toHaveLength(2);
@@ -483,8 +483,8 @@ describe('OAuthManagement page', () => {
       await flushMicrotasks();
 
       const text = collectText(root.root);
-      expect(text).toContain('当前接口未返回模型族额度窗口');
-      expect(text).toContain('GOOGLE_ONE_AI 可用');
+      expect(text).toContain('当前接口未返回完整额度窗口');
+      expect(text).toContain('GOOGLE_ONE_AI 25000');
       expect(text).not.toContain('Gemini 模型');
       expect(text).not.toContain('Claude 和 GPT 模型');
     } finally {
