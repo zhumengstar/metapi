@@ -720,6 +720,11 @@ export type OAuthQuotaWindowInfo = {
   message?: string | null;
 };
 
+export type OAuthQuotaWindowsInfo = {
+  fiveHour: OAuthQuotaWindowInfo;
+  sevenDay: OAuthQuotaWindowInfo;
+};
+
 export type OAuthQuotaInfo = {
   status: "supported" | "unsupported" | "error";
   source: "official" | "reverse_engineered";
@@ -731,10 +736,27 @@ export type OAuthQuotaInfo = {
     activeStart?: string | null;
     activeUntil?: string | null;
   } | null;
-  windows: {
-    fiveHour: OAuthQuotaWindowInfo;
-    sevenDay: OAuthQuotaWindowInfo;
-  };
+  windows: OAuthQuotaWindowsInfo;
+  antigravity?: {
+    credits?: {
+      creditType?: string | null;
+      creditAmount?: number | null;
+      minimumCreditAmountForUsage?: number | null;
+      available?: boolean | null;
+    } | null;
+    modelFamilies?: {
+      gemini?: {
+        label?: string | null;
+        models?: string[] | null;
+        windows: OAuthQuotaWindowsInfo;
+      } | null;
+      claudeGpt?: {
+        label?: string | null;
+        models?: string[] | null;
+        windows: OAuthQuotaWindowsInfo;
+      } | null;
+    } | null;
+  } | null;
   lastLimitResetAt?: string | null;
 };
 

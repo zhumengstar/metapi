@@ -2258,6 +2258,28 @@ describe('oauth routes', { timeout: 15_000 }, () => {
             minimumCreditAmountForUsage: '50',
           },
         ],
+        quotas: {
+          gemini: {
+            fiveHour: {
+              remainingPercent: 82,
+              resetAfterSeconds: 7200,
+            },
+            weekly: {
+              remainingPercent: 46,
+              resetAfterSeconds: 259200,
+            },
+          },
+          claudeGpt: {
+            fiveHour: {
+              remainingPercent: 100,
+              resetAfterSeconds: 18000,
+            },
+            weekly: {
+              remainingPercent: 100,
+              resetAfterSeconds: 345600,
+            },
+          },
+        },
       },
     }), {
       status: 200,
@@ -2274,16 +2296,44 @@ describe('oauth routes', { timeout: 15_000 }, () => {
       quota: expect.objectContaining({
         status: 'supported',
         source: 'official',
-        providerMessage: 'antigravity Google One AI credits loaded from loadCodeAssist',
+        providerMessage: 'antigravity quota windows loaded from loadCodeAssist',
         windows: {
           fiveHour: expect.objectContaining({
             supported: true,
-            used: 25000,
+            limit: 100,
+            remaining: 82,
           }),
           sevenDay: expect.objectContaining({
             supported: true,
-            used: 50,
+            limit: 100,
+            remaining: 46,
           }),
+        },
+        antigravity: {
+          credits: expect.objectContaining({
+            creditType: 'GOOGLE_ONE_AI',
+            creditAmount: 25000,
+            minimumCreditAmountForUsage: 50,
+            available: true,
+          }),
+          modelFamilies: {
+            gemini: expect.objectContaining({
+              label: 'Gemini 模型',
+              models: ['Gemini Flash', 'Gemini Pro'],
+              windows: {
+                fiveHour: expect.objectContaining({ limit: 100, remaining: 82 }),
+                sevenDay: expect.objectContaining({ limit: 100, remaining: 46 }),
+              },
+            }),
+            claudeGpt: expect.objectContaining({
+              label: 'Claude 和 GPT 模型',
+              models: ['Claude Opus', 'Claude Sonnet', 'GPT-OSS'],
+              windows: {
+                fiveHour: expect.objectContaining({ limit: 100, remaining: 100 }),
+                sevenDay: expect.objectContaining({ limit: 100, remaining: 100 }),
+              },
+            }),
+          },
         },
       }),
     });

@@ -441,6 +441,8 @@ function normalizeStoredQuotaSnapshot(value: unknown): OauthQuotaSnapshot | unde
     }
     : undefined;
 
+  const antigravity = normalizeStoredAntigravityQuota(raw.antigravity);
+
   return {
     status,
     source,
@@ -451,7 +453,65 @@ function normalizeStoredQuotaSnapshot(value: unknown): OauthQuotaSnapshot | unde
       ? { subscription }
       : {}),
     windows: { fiveHour, sevenDay },
+    ...(antigravity ? { antigravity } : {}),
     ...(asIsoDateTime(raw.lastLimitResetAt) ? { lastLimitResetAt: asIsoDateTime(raw.lastLimitResetAt)! } : {}),
+  };
+}
+
+function normalizeStoredWindowGroup(value: unknown): OauthQuotaSnapshot['windows'] | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const fiveHour = normalizeStoredWindow(raw.fiveHour);
+  const sevenDay = normalizeStoredWindow(raw.sevenDay);
+  if (!fiveHour || !sevenDay) return undefined;
+  return { fiveHour, sevenDay };
+}
+
+function normalizeStoredAntigravityFamily(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const windows = normalizeStoredWindowGroup(raw.windows);
+  if (!windows) return undefined;
+  const models = Array.isArray(raw.models)
+    ? raw.models.map((item) => asTrimmedString(item)).filter((item): item is string => !!item)
+    : undefined;
+  return {
+    ...(asTrimmedString(raw.label) ? { label: asTrimmedString(raw.label)! } : {}),
+    ...(models && models.length > 0 ? { models } : {}),
+    windows,
+  };
+}
+
+function normalizeStoredAntigravityQuota(value: unknown): OauthQuotaSnapshot['antigravity'] | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const creditsRaw = raw.credits && typeof raw.credits === 'object' && !Array.isArray(raw.credits)
+    ? raw.credits as Record<string, unknown>
+    : undefined;
+  const creditAmount = creditsRaw ? asFiniteNumber(creditsRaw.creditAmount) : undefined;
+  const minimumCreditAmountForUsage = creditsRaw ? asFiniteNumber(creditsRaw.minimumCreditAmountForUsage) : undefined;
+  const credits = creditsRaw
+    ? {
+      ...(asTrimmedString(creditsRaw.creditType) ? { creditType: asTrimmedString(creditsRaw.creditType)! } : {}),
+      ...(creditAmount !== undefined ? { creditAmount } : {}),
+      ...(minimumCreditAmountForUsage !== undefined ? { minimumCreditAmountForUsage } : {}),
+      ...(typeof creditsRaw.available === 'boolean' ? { available: creditsRaw.available } : {}),
+    }
+    : undefined;
+  const familiesRaw = raw.modelFamilies && typeof raw.modelFamilies === 'object' && !Array.isArray(raw.modelFamilies)
+    ? raw.modelFamilies as Record<string, unknown>
+    : undefined;
+  const gemini = normalizeStoredAntigravityFamily(familiesRaw?.gemini);
+  const claudeGpt = normalizeStoredAntigravityFamily(familiesRaw?.claudeGpt);
+  if (!credits && !gemini && !claudeGpt) return undefined;
+  return {
+    ...(credits ? { credits } : {}),
+    ...((gemini || claudeGpt) ? {
+      modelFamilies: {
+        ...(gemini ? { gemini } : {}),
+        ...(claudeGpt ? { claudeGpt } : {}),
+      },
+    } : {}),
   };
 }
 
@@ -739,6 +799,180 @@ function parseCreditAmount(value: unknown): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+function findRecordByPath(root: unknown, path: readonly string[]): Record<string, unknown> | undefined {
+  let current = root;
+  for (const segment of path) {
+    if (!current || typeof current !== 'object' || Array.isArray(current)) return undefined;
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current && typeof current === 'object' && !Array.isArray(current)
+    ? current as Record<string, unknown>
+    : undefined;
+}
+
+function pickNumber(record: Record<string, unknown>, keys: readonly string[]): number | undefined {
+  for (const key of keys) {
+    const value = asFiniteNumber(record[key]);
+    if (value !== undefined) return value;
+  }
+  return undefined;
+}
+
+function pickIsoDate(record: Record<string, unknown>, keys: readonly string[]): string | undefined {
+  for (const key of keys) {
+    const value = asIsoDateTime(record[key]);
+    if (value) return value;
+    const epoch = asFiniteNumber(record[key]);
+    if (epoch !== undefined && epoch > 0) {
+      const millis = epoch > 10_000_000_000 ? epoch : epoch * 1000;
+      const parsed = new Date(millis);
+      if (!Number.isNaN(parsed.getTime())) return parsed.toISOString();
+    }
+  }
+  return undefined;
+}
+
+function pickResetAfterSeconds(record: Record<string, unknown>): number | undefined {
+  const direct = pickNumber(record, [
+    'resetAfterSeconds',
+    'resetInSeconds',
+    'resetsInSeconds',
+    'secondsUntilReset',
+    'remainingSeconds',
+  ]);
+  if (direct !== undefined) return direct;
+  const duration = asTrimmedString(record.resetAfter || record.resetDelay || record.quotaResetDelay);
+  if (!duration) return undefined;
+  const simple = duration.match(/^(\d+(?:\.\d+)?)(ms|s|m|h|d)$/i);
+  if (!simple) return undefined;
+  const amount = Number.parseFloat(simple[1]);
+  if (!Number.isFinite(amount)) return undefined;
+  const unit = simple[2].toLowerCase();
+  if (unit === 'ms') return amount / 1000;
+  if (unit === 's') return amount;
+  if (unit === 'm') return amount * 60;
+  if (unit === 'h') return amount * 60 * 60;
+  return amount * 24 * 60 * 60;
+}
+
+function buildAntigravityWindowFromRecord(record: Record<string, unknown>, capturedAt: string): OauthQuotaWindowSnapshot | undefined {
+  const limit = pickNumber(record, ['limit', 'total', 'quota', 'capacity', 'max', 'maximum']);
+  const used = pickNumber(record, ['used', 'usage', 'usedCount', 'consumed']);
+  const remaining = pickNumber(record, ['remaining', 'remainingCount', 'available', 'availableCount']);
+  const usedPercent = pickNumber(record, ['usedPercent', 'usagePercent', 'percentUsed']);
+  const remainingPercent = pickNumber(record, ['remainingPercent', 'availablePercent', 'percentRemaining']);
+  const resetAt = pickIsoDate(record, ['resetAt', 'resetsAt', 'resetTime', 'resetTimeStamp', 'quotaResetTimeStamp'])
+    || (() => {
+      const resetAfterSeconds = pickResetAfterSeconds(record);
+      if (resetAfterSeconds === undefined) return undefined;
+      return new Date(new Date(capturedAt).getTime() + resetAfterSeconds * 1000).toISOString();
+    })();
+  const message = asTrimmedString(record.message || record.status || record.state);
+
+  if (
+    limit === undefined
+    && used === undefined
+    && remaining === undefined
+    && usedPercent === undefined
+    && remainingPercent === undefined
+    && !resetAt
+    && !message
+  ) {
+    return undefined;
+  }
+
+  const normalizedLimit = limit ?? ((usedPercent !== undefined || remainingPercent !== undefined) ? 100 : undefined);
+  const normalizedUsed = used ?? (usedPercent !== undefined
+    ? Math.max(0, Math.min(100, usedPercent))
+    : remainingPercent !== undefined
+      ? Math.max(0, Math.min(100, 100 - remainingPercent))
+      : undefined);
+  const normalizedRemaining = remaining ?? (remainingPercent !== undefined
+    ? Math.max(0, Math.min(100, remainingPercent))
+    : undefined);
+
+  return {
+    supported: true,
+    ...(normalizedLimit !== undefined ? { limit: normalizedLimit } : {}),
+    ...(normalizedUsed !== undefined ? { used: normalizedUsed } : {}),
+    ...(normalizedRemaining !== undefined ? { remaining: normalizedRemaining } : {}),
+    ...(resetAt ? { resetAt } : {}),
+    ...(message ? { message } : {}),
+  };
+}
+
+function extractAntigravityModelFamilyWindows(
+  payload: unknown,
+  capturedAt: string,
+): NonNullable<NonNullable<OauthQuotaSnapshot['antigravity']>['modelFamilies']> | undefined {
+  const familyPaths = {
+    gemini: [
+      ['usage', 'gemini'],
+      ['quota', 'gemini'],
+      ['quotas', 'gemini'],
+      ['modelFamilies', 'gemini'],
+      ['modelFamilyQuotas', 'gemini'],
+      ['paidTier', 'usage', 'gemini'],
+      ['paidTier', 'quotas', 'gemini'],
+    ],
+    claudeGpt: [
+      ['usage', 'claudeGpt'],
+      ['usage', 'claudeAndGpt'],
+      ['quota', 'claudeGpt'],
+      ['quotas', 'claudeGpt'],
+      ['modelFamilies', 'claudeGpt'],
+      ['modelFamilies', 'claudeAndGpt'],
+      ['modelFamilyQuotas', 'claudeGpt'],
+      ['paidTier', 'usage', 'claudeGpt'],
+      ['paidTier', 'quotas', 'claudeGpt'],
+    ],
+  } as const;
+
+  const buildFamily = (
+    records: readonly (readonly string[])[],
+    label: string,
+    models: string[],
+  ) => {
+    for (const path of records) {
+      const record = findRecordByPath(payload, path);
+      if (!record) continue;
+      const windowsRecord = record.windows && typeof record.windows === 'object' && !Array.isArray(record.windows)
+        ? record.windows as Record<string, unknown>
+        : record;
+      const fiveHourSource = findRecordByPath(windowsRecord, ['fiveHour'])
+        || findRecordByPath(windowsRecord, ['five_hour'])
+        || findRecordByPath(windowsRecord, ['fiveHourLimit'])
+        || findRecordByPath(windowsRecord, ['short'])
+        || findRecordByPath(windowsRecord, ['primary']);
+      const sevenDaySource = findRecordByPath(windowsRecord, ['sevenDay'])
+        || findRecordByPath(windowsRecord, ['seven_day'])
+        || findRecordByPath(windowsRecord, ['weekly'])
+        || findRecordByPath(windowsRecord, ['week'])
+        || findRecordByPath(windowsRecord, ['secondary']);
+      const fiveHour = fiveHourSource ? buildAntigravityWindowFromRecord(fiveHourSource, capturedAt) : undefined;
+      const sevenDay = sevenDaySource ? buildAntigravityWindowFromRecord(sevenDaySource, capturedAt) : undefined;
+      if (!fiveHour && !sevenDay) continue;
+      return {
+        label,
+        models,
+        windows: {
+          fiveHour: fiveHour || buildUnsupportedWindow('antigravity 5h quota window was not exposed'),
+          sevenDay: sevenDay || buildUnsupportedWindow('antigravity weekly quota window was not exposed'),
+        },
+      };
+    }
+    return undefined;
+  };
+
+  const gemini = buildFamily(familyPaths.gemini, 'Gemini 模型', ['Gemini Flash', 'Gemini Pro']);
+  const claudeGpt = buildFamily(familyPaths.claudeGpt, 'Claude 和 GPT 模型', ['Claude Opus', 'Claude Sonnet', 'GPT-OSS']);
+  if (!gemini && !claudeGpt) return undefined;
+  return {
+    ...(gemini ? { gemini } : {}),
+    ...(claudeGpt ? { claudeGpt } : {}),
+  };
+}
+
 function extractAntigravityCreditSnapshot(
   oauth: Pick<OauthInfo, 'provider' | 'planType' | 'idToken' | 'quota'>,
   payload: unknown,
@@ -771,16 +1005,11 @@ function extractAntigravityCreditSnapshot(
   const tierId = asTrimmedString(paidTierRecord.id);
   const creditType = asTrimmedString(selectedCredit.creditType) || 'GOOGLE_ONE_AI';
   const baseSnapshot = buildQuotaSnapshotFromOauthInfo(oauth);
-  const creditAmountWindow: OauthQuotaWindowSnapshot = {
-    supported: true,
-    ...(creditAmount !== undefined ? { used: creditAmount } : {}),
-    message: `antigravity ${creditType} available credits${tierId ? ` (${tierId})` : ''}`,
-  };
-  const minimumAmountWindow: OauthQuotaWindowSnapshot = {
-    supported: true,
-    ...(minimumCreditAmount !== undefined ? { used: minimumCreditAmount } : {}),
-    message: `antigravity ${creditType} minimum credit amount for usage`,
-  };
+  const modelFamilies = extractAntigravityModelFamilyWindows(payload, capturedAt);
+  const windows = modelFamilies?.gemini?.windows || modelFamilies?.claudeGpt?.windows || buildAntigravityPendingWindows();
+  const creditAvailable = creditAmount !== undefined && minimumCreditAmount !== undefined
+    ? creditAmount >= minimumCreditAmount
+    : undefined;
 
   return {
     ...baseSnapshot,
@@ -788,10 +1017,18 @@ function extractAntigravityCreditSnapshot(
     source: 'official',
     lastSyncAt: capturedAt,
     lastError: undefined,
-    providerMessage: 'antigravity Google One AI credits loaded from loadCodeAssist',
-    windows: {
-      fiveHour: creditAmountWindow,
-      sevenDay: minimumAmountWindow,
+    providerMessage: modelFamilies
+      ? 'antigravity quota windows loaded from loadCodeAssist'
+      : 'antigravity Google One AI credits loaded from loadCodeAssist',
+    windows,
+    antigravity: {
+      credits: {
+        creditType,
+        ...(creditAmount !== undefined ? { creditAmount } : {}),
+        ...(minimumCreditAmount !== undefined ? { minimumCreditAmountForUsage: minimumCreditAmount } : {}),
+        ...(creditAvailable !== undefined ? { available: creditAvailable } : {}),
+      },
+      ...(modelFamilies ? { modelFamilies } : {}),
     },
   };
 }

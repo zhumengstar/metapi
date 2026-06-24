@@ -7,6 +7,11 @@ export type OauthQuotaWindowSnapshot = {
   message?: string;
 };
 
+export type OauthQuotaWindowsSnapshot = {
+  fiveHour: OauthQuotaWindowSnapshot;
+  sevenDay: OauthQuotaWindowSnapshot;
+};
+
 export type OauthQuotaSnapshot = {
   status: 'supported' | 'unsupported' | 'error';
   source: 'official' | 'reverse_engineered';
@@ -18,9 +23,26 @@ export type OauthQuotaSnapshot = {
     activeStart?: string;
     activeUntil?: string;
   };
-  windows: {
-    fiveHour: OauthQuotaWindowSnapshot;
-    sevenDay: OauthQuotaWindowSnapshot;
+  windows: OauthQuotaWindowsSnapshot;
+  antigravity?: {
+    credits?: {
+      creditType?: string;
+      creditAmount?: number | null;
+      minimumCreditAmountForUsage?: number | null;
+      available?: boolean;
+    };
+    modelFamilies?: {
+      gemini?: {
+        label?: string;
+        models?: string[];
+        windows: OauthQuotaWindowsSnapshot;
+      };
+      claudeGpt?: {
+        label?: string;
+        models?: string[];
+        windows: OauthQuotaWindowsSnapshot;
+      };
+    };
   };
   lastLimitResetAt?: string;
 };

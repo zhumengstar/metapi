@@ -474,7 +474,7 @@ function resolveQuotaWindowSummary(window?: OAuthQuotaWindowInfo | null): string
 }
 
 function isAntigravityQuota(quota?: OAuthQuotaInfo | null): boolean {
-  return !!quota?.providerMessage?.includes('Google One AI');
+  return !!quota?.antigravity || !!quota?.providerMessage?.toLowerCase().includes('antigravity');
 }
 
 function resolveAntigravityPlan(quota: OAuthQuotaInfo): string {
@@ -487,10 +487,27 @@ function resolveAntigravityPlan(quota: OAuthQuotaInfo): string {
 
 function resolveAntigravityWindowValue(window?: OAuthQuotaWindowInfo | null): string {
   if (!window?.supported) return '不可用';
+  if (typeof window.remaining === 'number' && typeof window.limit === 'number' && window.limit > 0) {
+    return `剩余 ${Math.round((window.remaining / window.limit) * 100)}%`;
+  }
+  if (typeof window.used === 'number' && typeof window.limit === 'number' && window.limit > 0) {
+    return `已用 ${Math.round((window.used / window.limit) * 100)}%`;
+  }
   if (typeof window.remaining === 'number') return `剩余 ${window.remaining}`;
   if (typeof window.used === 'number') return `使用门槛 ${window.used}`;
   if (typeof window.limit === 'number') return `额度 ${window.limit}`;
   return '额度可用';
+}
+
+function resolveAntigravityWindowFill(window?: OAuthQuotaWindowInfo | null): number {
+  if (!window?.supported) return 0;
+  if (typeof window.remaining === 'number' && typeof window.limit === 'number' && window.limit > 0) {
+    return Math.max(0, Math.min(100, Math.round((window.remaining / window.limit) * 100)));
+  }
+  if (typeof window.used === 'number' && typeof window.limit === 'number' && window.limit > 0) {
+    return Math.max(0, Math.min(100, Math.round(100 - (window.used / window.limit) * 100)));
+  }
+  return 100;
 }
 
 function resolveAntigravityWindowRefresh(window?: OAuthQuotaWindowInfo | null, quota?: OAuthQuotaInfo): string {
@@ -624,6 +641,7 @@ function AntigravityQuotaLine({
   quota: OAuthQuotaInfo;
 }) {
   const supported = !!window?.supported;
+  const fill = resolveAntigravityWindowFill(window);
   return (
     <div className="oauth-antigravity-limit-row">
       <span className="oauth-antigravity-limit-label">{label}</span>
@@ -634,7 +652,7 @@ function AntigravityQuotaLine({
       <span className="oauth-antigravity-bar" aria-hidden="true">
         <span
           className="oauth-antigravity-bar-fill"
-          style={{ width: supported ? '100%' : '0%' }}
+          style={{ width: `${supported ? fill : 0}%` }}
         />
       </span>
     </div>
@@ -645,39 +663,51 @@ function AntigravityQuotaFamily({
   title,
   models,
   quota,
+  windows,
 }: {
   title: string;
   models: string;
   quota: OAuthQuotaInfo;
+  windows?: OAuthQuotaInfo['windows'] | null;
 }) {
+  const resolvedWindows = windows || quota.windows;
   return (
     <div className="oauth-antigravity-family">
       <div className="oauth-antigravity-title">{title}</div>
       <div className="oauth-antigravity-models">此分组包含：{models}</div>
-      <AntigravityQuotaLine label="5 小时限额" window={quota.windows?.fiveHour} quota={quota} />
-      <AntigravityQuotaLine label="周限额" window={quota.windows?.sevenDay} quota={quota} />
+      <AntigravityQuotaLine label="5 小时限额" window={resolvedWindows?.fiveHour} quota={quota} />
+      <AntigravityQuotaLine label="周限额" window={resolvedWindows?.sevenDay} quota={quota} />
     </div>
   );
 }
 
 function AntigravityQuotaPanel({ quota }: { quota: OAuthQuotaInfo }) {
   const tier = quota.providerMessage?.match(/\(([^)]+)\)/)?.[1];
+  const gemini = quota.antigravity?.modelFamilies?.gemini;
+  const claudeGpt = quota.antigravity?.modelFamilies?.claudeGpt;
+  const credits = quota.antigravity?.credits;
+  const creditLabel = credits
+    ? `${credits.creditType || 'Google One AI'} ${credits.available === false ? '余额不足' : '可用'}`
+    : '';
   return (
     <div className="oauth-antigravity-quota">
       <div className="oauth-antigravity-plan">
         <span>套餐</span>
         <strong>{resolveAntigravityPlan(quota)}</strong>
         {tier ? <span className="oauth-antigravity-tier">{tier}</span> : null}
+        {creditLabel ? <span className="oauth-antigravity-tier">{creditLabel}</span> : null}
       </div>
       <AntigravityQuotaFamily
-        title="Gemini 模型"
-        models="Gemini Flash, Gemini Pro"
+        title={gemini?.label || 'Gemini 模型'}
+        models={(gemini?.models || ['Gemini Flash', 'Gemini Pro']).join(', ')}
         quota={quota}
+        windows={gemini?.windows}
       />
       <AntigravityQuotaFamily
-        title="Claude 和 GPT 模型"
-        models="Claude Opus, Claude Sonnet, GPT-OSS"
+        title={claudeGpt?.label || 'Claude 和 GPT 模型'}
+        models={(claudeGpt?.models || ['Claude Opus', 'Claude Sonnet', 'GPT-OSS']).join(', ')}
         quota={quota}
+        windows={claudeGpt?.windows}
       />
     </div>
   );
