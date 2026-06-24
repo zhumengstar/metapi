@@ -19,6 +19,12 @@ import { useIsMobile } from '../components/useIsMobile.js';
 import DeleteConfirmModal from '../components/DeleteConfirmModal.js';
 import { clearFocusParams, readFocusTokenId } from './helpers/navigationFocus.js';
 import { shouldIgnoreRowSelectionClick } from './helpers/rowSelection.js';
+import {
+  buildModelAvailabilityTooltipRows,
+  isImageOnlySkippedAvailabilityResult,
+  type ModelAvailabilityResult,
+  type ModelAvailabilityTooltipRow,
+} from './helpers/modelAvailabilityPresentation.js';
 import { tr } from '../i18n.js';
 import { isImageGenerationModel } from '../utils/modelType.js';
 
@@ -61,26 +67,16 @@ type SyncableAccount = {
   } | null;
 };
 
-type TokenAvailabilityTestResult = {
+type TokenAvailabilityTestResult = Omit<ModelAvailabilityResult, 'message' | 'tokenId'> & {
   tokenId: number;
-  model: string;
-  available: boolean;
   message?: string;
-  responseText?: string | null;
-  httpStatus?: number | null;
-  latencyMs?: number | null;
-  checkedAt?: string | null;
 };
 
 type SkippedTokenAvailabilityTestResult = Omit<TokenAvailabilityTestResult, 'available'> & {
   available: false;
 };
 
-type AvailabilityTooltipRow = {
-  label: string;
-  value?: string | number | null;
-  tone?: 'success' | 'error' | 'warning' | 'muted';
-};
+type AvailabilityTooltipRow = ModelAvailabilityTooltipRow;
 
 type AvailabilityTooltipState = {
   rows: AvailabilityTooltipRow[];
@@ -189,6 +185,20 @@ function readStoredTokenRatioFilter() {
     return typeof value === 'string' ? value : '';
   } catch {
     return '';
+  }
+}
+
+function writeStoredTokenRatioFilter(value: string) {
+  if (typeof window === 'undefined') return;
+  try {
+    const normalized = value.trim();
+    if (normalized) {
+      window.localStorage.setItem(TOKEN_RATIO_FILTER_STORAGE_KEY, normalized);
+    } else {
+      window.localStorage.removeItem(TOKEN_RATIO_FILTER_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore storage failures; the server-side setting remains the source of truth.
   }
 }
 
@@ -367,14 +377,6 @@ const buildImageOnlySkippedResult = (token: any): SkippedTokenAvailabilityTestRe
   };
 };
 
-const isImageOnlySkippedAvailabilityResult = (result: TokenAvailabilityTestResult | null | undefined): boolean => (
-  !result?.available
-  && (
-    String(result?.message || '').trim() === IMAGE_MODEL_TEST_SKIPPED_MESSAGE
-    || String(result?.message || '').includes('图片模型不进行聊天可用性测试')
-  )
-);
-
 const resolveAccountLabel = (result: AccountTokenSyncResult | null | undefined) => {
   const name = typeof result?.accountName === 'string' ? result.accountName.trim() : '';
   if (name) return name;
@@ -443,12 +445,14 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     tokenId?: number;
     tokenName?: string;
     count?: number;
+    scope?: 'site' | 'all-sites';
   }>(null);
   const [tokenSortRules, setTokenSortRules] = useState<TokenSortRule[]>(DEFAULT_TOKEN_SORT_RULES);
   const [modelSearch, setModelSearch] = useState('');
   const [tokenStatusFilter, setTokenStatusFilter] = useState<TokenStatusFilter>('all');
   const [tokenAvailabilityFilter, setTokenAvailabilityFilter] = useState<TokenAvailabilityFilter>('all');
   const [maxGroupRatioFilter, setMaxGroupRatioFilter] = useState(readStoredTokenRatioFilter);
+  const [tokenUiSettingsLoaded, setTokenUiSettingsLoaded] = useState(false);
   const [testingModelTokens, setTestingModelTokens] = useState(false);
   const [testingAvailabilityTokenIds, setTestingAvailabilityTokenIds] = useState<number[]>([]);
   const [tokenAvailabilityById, setTokenAvailabilityById] = useState<Record<number, TokenAvailabilityTestResult>>({});
@@ -483,6 +487,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
   const rowRefs = useRef<Map<number, HTMLTableRowElement>>(new Map());
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const editingTokenIdRef = useRef<number | null>(null);
+  const lastPersistedMaxGroupRatioFilterRef = useRef<string | null>(null);
   const toast = useToast();
 
   const load = useCallback(async () => {
@@ -526,17 +531,60 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
   }, [load]);
 
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    try {
-      if (maxGroupRatioFilter.trim()) {
-        window.localStorage.setItem(TOKEN_RATIO_FILTER_STORAGE_KEY, maxGroupRatioFilter.trim());
-      } else {
-        window.localStorage.removeItem(TOKEN_RATIO_FILTER_STORAGE_KEY);
-      }
-    } catch {
-      // Ignore storage failures; the current page state still applies the filter.
-    }
-  }, [maxGroupRatioFilter]);
+    let cancelled = false;
+    api.getAccountTokenUiSettings()
+      .then((settings: any) => {
+        if (cancelled) return;
+        const serverValue = normalizeTokenRatioFilterInput(String(settings?.maxGroupRatioFilter || '').trim());
+        lastPersistedMaxGroupRatioFilterRef.current = serverValue;
+        setMaxGroupRatioFilter(serverValue);
+        writeStoredTokenRatioFilter(serverValue);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        const localValue = normalizeTokenRatioFilterInput(maxGroupRatioFilter.trim());
+        lastPersistedMaxGroupRatioFilterRef.current = localValue;
+        writeStoredTokenRatioFilter(localValue);
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setTokenUiSettingsLoaded(true);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const normalized = normalizeTokenRatioFilterInput(maxGroupRatioFilter).trim();
+    writeStoredTokenRatioFilter(normalized);
+    if (!tokenUiSettingsLoaded) return;
+    if (lastPersistedMaxGroupRatioFilterRef.current === normalized) return;
+
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      api.updateAccountTokenUiSettings({ maxGroupRatioFilter: normalized })
+        .then((settings: any) => {
+          if (cancelled) return;
+          const savedValue = normalizeTokenRatioFilterInput(String(settings?.maxGroupRatioFilter || '').trim());
+          lastPersistedMaxGroupRatioFilterRef.current = savedValue;
+          writeStoredTokenRatioFilter(savedValue);
+          if (savedValue !== normalized) {
+            setMaxGroupRatioFilter(savedValue);
+          }
+        })
+        .catch((error: any) => {
+          if (cancelled) return;
+          toast.error(error?.message || '保存倍率筛选失败');
+        });
+    }, 300);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [maxGroupRatioFilter, tokenUiSettingsLoaded, toast]);
 
   useEffect(() => {
     return () => {
@@ -1200,6 +1248,32 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     if (!target) return;
 
     setDeleteConfirm(null);
+    if (target.scope === 'site' && target.tokenId) {
+      try {
+        setBatchActionLoading(true);
+        await api.deleteSiteAllAccountTokens(target.tokenId);
+        toast.success('站点全部令牌已删除');
+        await load();
+      } catch (e: any) {
+        toast.error(e?.message || '删除站点全部令牌失败');
+      } finally {
+        setBatchActionLoading(false);
+      }
+      return;
+    }
+    if (target.scope === 'all-sites') {
+      try {
+        setBatchActionLoading(true);
+        await api.deleteAllUpstreamAccountTokens();
+        toast.success('所有站点令牌已删除');
+        await load();
+      } catch (e: any) {
+        toast.error(e?.message || '删除所有站点令牌失败');
+      } finally {
+        setBatchActionLoading(false);
+      }
+      return;
+    }
     if (target.mode === 'single' && target.tokenId) {
       try {
         await withRowLoading(`token-${target.tokenId}-delete`, async () => {
@@ -1760,25 +1834,8 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         </span>
       );
     }
-    const checkedAt = result.checkedAt ? formatDateTimeLocal(result.checkedAt) : '';
     const imageOnlySkipped = isImageOnlySkippedAvailabilityResult(result);
-    const rows: AvailabilityTooltipRow[] = [
-      { label: '模型', value: result.model || '-' },
-      {
-        label: '结果',
-        value: result.available ? '可用' : (imageOnlySkipped ? '未测试：仅图片模型' : '不可用'),
-        tone: result.available ? 'success' : (imageOnlySkipped ? 'warning' : 'error'),
-      },
-      { label: '说明', value: result.available ? result.message : '' },
-      {
-        label: imageOnlySkipped ? '说明' : '上游报错',
-        value: result.available ? '' : result.message,
-        tone: result.available ? undefined : (imageOnlySkipped ? 'warning' : 'error'),
-      },
-      { label: '模型答复', value: result.responseText || '' },
-      { label: '耗时', value: Number.isFinite(Number(result.latencyMs)) ? `${result.latencyMs}ms` : '' },
-      { label: '检测时间', value: checkedAt },
-    ];
+    const rows = buildModelAvailabilityTooltipRows(model || result.model || '-', result);
     return (
       <span
         className={`badge ${result.available ? 'badge-success' : (imageOnlySkipped ? 'badge-warning' : 'badge-info')} token-availability-badge`}
@@ -1975,22 +2032,42 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
   const handleEnsureGroupTokens = useCallback(async () => {
     setEnsuringGroupTokens(true);
     try {
-      const res = await api.ensureAllAccountGroupTokens();
+      const res = await api.createAllAccountGroupsThenSync();
       if (res?.queued) {
-        toast.info(res.message || '获取分组并补齐令牌进行中，请稍后查看日志');
+        toast.info(res.message || '创建分组并同步令牌进行中，请稍后查看日志');
         await load();
         return;
       }
 
-      const summary = res?.summary || {};
-      toast.success(`分组补齐完成：补齐 ${summary.created || 0}，禁用 ${summary.disabled || 0}，失败 ${summary.failed || 0}`);
+      const ensureSummary = res?.ensureResult?.summary || {};
+      const syncSummary = res?.syncResult?.summary || {};
+      toast.success(
+        `分组创建并同步完成：分组补齐 ${ensureSummary.created || 0}，同步成功 ${syncSummary.synced || 0}，失败 ${syncSummary.failed || 0}`,
+      );
       await load();
     } catch (e: any) {
-      toast.error(e.message || '获取分组并补齐令牌失败');
+      toast.error(e.message || '创建分组并同步令牌失败');
     } finally {
       setEnsuringGroupTokens(false);
     }
   }, [load, toast]);
+
+  const handleDeleteSiteAllTokens = useCallback(() => {
+    if (!syncingAccountId) return;
+    setDeleteConfirm({
+      mode: 'single',
+      tokenId: syncingAccountId,
+      scope: 'site',
+    });
+  }, [syncingAccountId]);
+
+  const handleDeleteAllSiteTokens = useCallback(() => {
+    setDeleteConfirm({
+      mode: 'batch',
+      count: activeAccounts.length,
+      scope: 'all-sites',
+    });
+  }, [activeAccounts.length]);
 
   const handleToggleAdd = useCallback(() => {
     setShowAdd((prev) => {
@@ -2182,7 +2259,23 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
             className="btn btn-ghost"
             style={{ border: '1px solid var(--color-border)', padding: '8px 14px' }}
           >
-            {ensuringGroupTokens ? <><span className="spinner spinner-sm" /> 获取中...</> : '获取所有账号分组'}
+            {ensuringGroupTokens ? <><span className="spinner spinner-sm" /> 处理中...</> : '创建所有账号分组'}
+          </button>
+          <button
+            onClick={handleDeleteSiteAllTokens}
+            disabled={syncing || syncingAll || ensuringGroupTokens || !syncingAccountId}
+            className="btn btn-ghost"
+            style={{ border: '1px solid var(--color-border)', padding: '8px 14px' }}
+          >
+            删除站点全部令牌
+          </button>
+          <button
+            onClick={handleDeleteAllSiteTokens}
+            disabled={syncing || syncingAll || ensuringGroupTokens || activeAccounts.length === 0}
+            className="btn btn-ghost"
+            style={{ border: '1px solid var(--color-border)', padding: '8px 14px' }}
+          >
+            删除所有站点令牌
           </button>
         </>
       )}
@@ -2245,7 +2338,23 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
               className="btn btn-ghost"
               style={{ border: '1px solid var(--color-border)' }}
             >
-              {ensuringGroupTokens ? <><span className="spinner spinner-sm" /> 获取中...</> : '获取所有账号分组'}
+              {ensuringGroupTokens ? <><span className="spinner spinner-sm" /> 处理中...</> : '创建所有账号分组'}
+            </button>
+            <button
+              onClick={handleDeleteSiteAllTokens}
+              disabled={syncing || syncingAll || ensuringGroupTokens || !syncingAccountId}
+              className="btn btn-ghost"
+              style={{ border: '1px solid var(--color-border)' }}
+            >
+              删除站点全部令牌
+            </button>
+            <button
+              onClick={handleDeleteAllSiteTokens}
+              disabled={syncing || syncingAll || ensuringGroupTokens || activeAccounts.length === 0}
+              className="btn btn-ghost"
+              style={{ border: '1px solid var(--color-border)' }}
+            >
+              删除所有站点令牌
             </button>
           </div>
         )}
@@ -2263,8 +2372,12 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         confirmText="确认删除"
         loading={batchActionLoading || (deleteConfirm?.mode === 'single' && !!rowLoading[`token-${deleteConfirm?.tokenId}-delete`])}
         description={deleteConfirm?.mode === 'single'
-          ? <>确定要删除令牌 <strong>{deleteConfirm.tokenName || `#${deleteConfirm.tokenId}`}</strong> 吗？</>
-          : <>确定要删除选中的 <strong>{deleteConfirm?.count || 0}</strong> 个令牌吗？</>}
+          ? deleteConfirm.scope === 'site'
+            ? <>确定要删除该站点的全部令牌吗？</>
+            : <>确定要删除令牌 <strong>{deleteConfirm.tokenName || `#${deleteConfirm.tokenId}`}</strong> 吗？</>
+          : deleteConfirm?.scope === 'all-sites'
+            ? <>确定要删除所有站点的全部令牌吗？</>
+            : <>确定要删除选中的 <strong>{deleteConfirm?.count || 0}</strong> 个令牌吗？</>}
       />
 
       <CenteredModal

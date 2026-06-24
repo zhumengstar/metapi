@@ -914,6 +914,23 @@ export const api = {
   refreshBalance: (id: number) =>
     request(`/api/accounts/${id}/balance`, { method: "POST" }),
   getAccountModels: (id: number) => request(`/api/accounts/${id}/models`),
+  testAccountModelAvailability: (accountId: number, model: string) =>
+    request(`/api/accounts/${accountId}/models/test`, {
+      method: "POST",
+      body: JSON.stringify({ model }),
+    }) as Promise<{
+      success: true;
+      result: {
+        accountId: number;
+        model: string;
+        available: boolean;
+        message?: string | null;
+        responseText?: string | null;
+        httpStatus?: number | null;
+        latencyMs?: number | null;
+        checkedAt?: string | null;
+      };
+    }>,
   addAccountAvailableModels: (accountId: number, models: string[]) =>
     request(`/api/accounts/${accountId}/models/manual`, {
       method: "POST",
@@ -985,13 +1002,13 @@ export const api = {
     request(`/api/account-tokens/${id}/health-check/run`, {
       method: "POST",
       body: options?.async ? JSON.stringify({ async: true }) : undefined,
-      timeoutMs: options?.async ? 30_000 : 90_000,
+      timeoutMs: 30_000,
     }),
   testAccountTokenModelAvailability: (data: { model: string; tokenIds: number[]; async?: boolean }) =>
     request("/api/account-tokens/models/test", {
       method: "POST",
       body: JSON.stringify(data),
-      timeoutMs: data.async ? 30_000 : 240_000,
+      timeoutMs: 30_000,
     }),
   saveSkippedAccountTokenModelAvailability: (data: { results: Array<{
     tokenId: number;
@@ -1016,8 +1033,25 @@ export const api = {
       body: JSON.stringify(wait ? { wait: true } : {}),
       timeoutMs: wait ? 150_000 : 30_000,
     }),
+  deleteSiteAllAccountTokens: (accountId: number) =>
+    request(`/api/account-tokens/delete-upstream/${accountId}`, {
+      method: "POST",
+      timeoutMs: 45_000,
+    }),
+  deleteAllUpstreamAccountTokens: (wait = false) =>
+    request("/api/account-tokens/delete-upstream-all", {
+      method: "POST",
+      body: JSON.stringify(wait ? { wait: true } : {}),
+      timeoutMs: wait ? 150_000 : 30_000,
+    }),
   ensureAllAccountGroupTokens: (wait = false) =>
     request("/api/account-tokens/groups/ensure-all", {
+      method: "POST",
+      body: JSON.stringify(wait ? { wait: true } : {}),
+      timeoutMs: wait ? 240_000 : 30_000,
+    }),
+  createAllAccountGroupsThenSync: (wait = false) =>
+    request("/api/account-tokens/groups/ensure-all-sync-all", {
       method: "POST",
       body: JSON.stringify(wait ? { wait: true } : {}),
       timeoutMs: wait ? 240_000 : 30_000,
@@ -1080,11 +1114,16 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(data),
     }),
+  pinStableFirstChannel: (id: number, data?: { model?: string }) =>
+    request(`/api/channels/${id}/stable-primary`, {
+      method: "POST",
+      body: JSON.stringify(data || {}),
+    }),
   testRouteChannelModelAvailability: (id: number, data: { model: string }) =>
     request(`/api/channels/${id}/model-test`, {
       method: "POST",
       body: JSON.stringify(data),
-      timeoutMs: 90_000,
+      timeoutMs: 30_000,
     }),
   batchUpdateChannels: (updates: Array<{ id: number; priority: number }>) =>
     request("/api/channels/batch", {
@@ -1382,6 +1421,12 @@ export const api = {
       body: JSON.stringify({ oldToken, newToken }),
     }),
   getRuntimeSettings: () => request("/api/settings/runtime"),
+  getAccountTokenUiSettings: () => request("/api/settings/ui/account-tokens"),
+  updateAccountTokenUiSettings: (data: { maxGroupRatioFilter?: string }) =>
+    request("/api/settings/ui/account-tokens", {
+      method: "PUT",
+      body: JSON.stringify(data),
+    }),
   getBrandList: () => request("/api/settings/brand-list"),
   updateRuntimeSettings: (data: RuntimeSettingsPayload) =>
     request("/api/settings/runtime", {

@@ -572,6 +572,126 @@ describe('account tokens sync routes with site status', () => {
     expect(fetchModelPricingCatalogMock).not.toHaveBeenCalled();
   });
 
+  it('uses stored numeric group aliases to show ratios for synced tokens', async () => {
+    const { site, account } = await seedAccount({ siteStatus: 'active' });
+    await db.insert(schema.tokenGroupPricing).values({
+      siteId: site.id,
+      accountId: account.id,
+      sourceKey: `account:${account.id}`,
+      group: '2',
+      groupName: '纯pro倍率',
+      ratio: 2.5,
+      source: 'upstream',
+      pricingAvailable: true,
+    }).run();
+    await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'team渠道',
+      token: 'sk-team-token-1234',
+      source: 'sync',
+      enabled: true,
+      isDefault: true,
+      tokenGroup: '2',
+      valueStatus: 'ready' as any,
+    }).run();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/account-tokens',
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([
+      expect.objectContaining({
+        name: 'team渠道',
+        tokenGroup: '2',
+        groupRatio: 2.5,
+        groupRatioAvailable: true,
+        tokenGroupRatioGroup: '纯pro倍率',
+      }),
+    ]);
+  });
+
+  it('matches short latin group prefixes from token names when numeric token group ids are stale', async () => {
+    const { site, account } = await seedAccount({ siteStatus: 'active' });
+    await db.insert(schema.tokenGroupPricing).values({
+      siteId: site.id,
+      accountId: account.id,
+      sourceKey: `account:${account.id}`,
+      group: 'pro',
+      groupName: 'pro',
+      ratio: 0.25,
+      source: 'upstream',
+      pricingAvailable: true,
+    }).run();
+    await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'pro包稳不可能掉',
+      token: 'sk-pro-token-1234',
+      source: 'sync',
+      enabled: true,
+      isDefault: true,
+      tokenGroup: '14',
+      valueStatus: 'ready' as any,
+    }).run();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/account-tokens',
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([
+      expect.objectContaining({
+        name: 'pro包稳不可能掉',
+        tokenGroup: '14',
+        groupRatio: 0.25,
+        groupRatioAvailable: true,
+        tokenGroupRatioGroup: 'pro',
+      }),
+    ]);
+  });
+
+  it('matches short Chinese group prefixes from token names when numeric token group ids are stale', async () => {
+    const { site, account } = await seedAccount({ siteStatus: 'active' });
+    await db.insert(schema.tokenGroupPricing).values({
+      siteId: site.id,
+      accountId: account.id,
+      sourceKey: `account:${account.id}`,
+      group: '生图',
+      groupName: '生图',
+      ratio: 0.12,
+      source: 'upstream',
+      pricingAvailable: true,
+    }).run();
+    await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: '生图-adobe原生4k',
+      token: 'sk-image-token-1234',
+      source: 'sync',
+      enabled: true,
+      isDefault: true,
+      tokenGroup: '16',
+      valueStatus: 'ready' as any,
+    }).run();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/account-tokens',
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([
+      expect.objectContaining({
+        name: '生图-adobe原生4k',
+        tokenGroup: '16',
+        groupRatio: 0.12,
+        groupRatioAvailable: true,
+        tokenGroupRatioGroup: '生图',
+      }),
+    ]);
+  });
+
   it('matches stored group ratios when the token group adds an unambiguous suffix', async () => {
     const { site, account } = await seedAccount({ siteStatus: 'active' });
     await db.insert(schema.tokenGroupPricing).values([
@@ -1219,6 +1339,48 @@ describe('account tokens sync routes with site status', () => {
     });
   });
 
+  it('deletes all upstream tokens for a single account', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    await db.insert(schema.accountTokens).values([
+      {
+        accountId: account.id,
+        name: 'token-a',
+        token: 'sk-token-a',
+        source: 'sync',
+        enabled: true,
+      },
+      {
+        accountId: account.id,
+        name: 'token-b',
+        token: 'sk-token-b',
+        source: 'sync',
+        enabled: true,
+      },
+    ]).run();
+    getApiTokensMock.mockResolvedValue([
+      { name: 'token-a', key: 'sk-token-a', enabled: true },
+      { name: 'token-b', key: 'sk-token-b', enabled: true },
+    ]);
+    deleteApiTokenMock.mockResolvedValue(true);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/account-tokens/delete-upstream/${account.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      status: 'deleted',
+      deleted: 2,
+      total: 2,
+    });
+
+    const remaining = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.accountId, account.id)).all();
+    expect(remaining).toHaveLength(0);
+    expect(deleteApiTokenMock).toHaveBeenCalledTimes(2);
+  });
+
   it('rejects non-boolean wait when syncing all account tokens', async () => {
     const response = await app.inject({
       method: 'POST',
@@ -1233,6 +1395,40 @@ describe('account tokens sync routes with site status', () => {
       success: false,
       message: 'Invalid wait. Expected boolean.',
     });
+  });
+
+  it('creates all groups then syncs all account tokens in the combined flow', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    getUserGroupsMock.mockResolvedValue(['default']);
+    getApiTokensMock.mockResolvedValue([
+      { name: 'default', key: 'sk-combined-token', enabled: true },
+    ]);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/account-tokens/groups/ensure-all-sync-all',
+      payload: { wait: true },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      ensureResult: expect.objectContaining({
+        summary: expect.objectContaining({
+          synced: 1,
+        }),
+      }),
+      syncResult: expect.objectContaining({
+        summary: expect.objectContaining({
+          synced: 1,
+        }),
+      }),
+    });
+
+    expect(getUserGroupsMock).toHaveBeenCalledTimes(1);
+    expect(getApiTokensMock).toHaveBeenCalledTimes(2);
+    const tokenRows = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.accountId, account.id)).all();
+    expect(tokenRows.some((row) => row.token === 'sk-combined-token')).toBe(true);
   });
 
   it('returns the refreshed default state after creating the first manual token', async () => {

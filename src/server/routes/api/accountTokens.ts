@@ -163,6 +163,28 @@ type AccountTokenDeleteTaskResult = {
   results: AccountTokenDeleteResult[];
 };
 
+type AccountUpstreamTokenDeleteResult = {
+  accountId: number;
+  accountName: string;
+  accountStatus: string | null;
+  siteId: number;
+  siteName: string;
+  siteStatus: string | null;
+  status: 'deleted' | 'skipped' | 'failed';
+  reason?: string;
+  message?: string;
+  total: number;
+  deleted: number;
+};
+
+type AccountUpstreamTokenDeleteTaskResult = {
+  total: number;
+  deleted: number;
+  skipped: number;
+  failed: number;
+  results: AccountUpstreamTokenDeleteResult[];
+};
+
 function buildSyncAccountLabel(item: SyncExecutionResult): string {
   const account = (item.accountName || `#${item.accountId}`).trim();
   const site = (item.siteName || 'unknown-site').trim();
@@ -654,6 +676,106 @@ async function deleteAllLocalAccountTokens(accountId: number) {
   }
   await repairDefaultToken(accountId);
   return localTokens.length;
+}
+
+async function deleteAllUpstreamAccountTokens(row: AccountWithSiteRow): Promise<AccountUpstreamTokenDeleteResult> {
+  const accountId = row.accounts.id;
+  const base = {
+    accountId,
+    accountName: row.accounts.username || `account-${accountId}`,
+    accountStatus: row.accounts.status,
+    siteId: row.sites.id,
+    siteName: row.sites.name,
+    siteStatus: row.sites.status,
+  };
+
+  if (isSiteDisabled(row.sites.status)) {
+    return { ...base, status: 'skipped', reason: 'site_disabled', message: 'site disabled', total: 0, deleted: 0 };
+  }
+  if (isApiKeyConnection(row.accounts)) {
+    return { ...base, status: 'skipped', reason: 'apikey_connection', message: 'apikey connection does not support account token deletion', total: 0, deleted: 0 };
+  }
+  if (!row.accounts.accessToken?.trim()) {
+    return { ...base, status: 'skipped', reason: 'missing_access_token', message: '账号缺少访问令牌', total: 0, deleted: 0 };
+  }
+
+  const adapter = getAdapter(row.sites.platform);
+  if (!adapter) {
+    return { ...base, status: 'failed', reason: 'unsupported_platform', message: `不支持的平台: ${row.sites.platform}`, total: 0, deleted: 0 };
+  }
+
+  try {
+    const platformUserId = resolvePlatformUserId(row.accounts.extraConfig, row.accounts.username);
+    const accountProxyUrl = getProxyUrlFromExtraConfig(row.accounts.extraConfig);
+    const upstreamTokens = await withTimeout(
+      () => withAccountProxyOverride(accountProxyUrl,
+        () => adapter.getApiTokens(row.sites.url, row.accounts.accessToken, platformUserId)),
+      TOKEN_SYNC_TIMEOUT_MS,
+      `token list timeout (${Math.round(TOKEN_SYNC_TIMEOUT_MS / 1000)}s)`,
+    );
+
+    let deleted = 0;
+    for (const token of upstreamTokens) {
+      const tokenKey = String(token.key || '').trim();
+      if (!tokenKey) continue;
+      const tokenGroup = String(token.tokenGroup || '').trim() || null;
+      const tokenName = String(token.name || '').trim() || null;
+      const removed = await withTimeout(
+        () => withAccountProxyOverride(accountProxyUrl,
+          () => adapter.deleteApiToken(
+            row.sites.url,
+            row.accounts.accessToken,
+            tokenKey,
+            platformUserId,
+            { name: tokenName, group: tokenGroup },
+          )),
+        ACCOUNT_TOKEN_DELETE_TIMEOUT_MS,
+        `upstream delete timeout (${Math.round(ACCOUNT_TOKEN_DELETE_TIMEOUT_MS / 1000)}s)`,
+      ).catch(() => false);
+      if (removed) deleted += 1;
+    }
+
+    if (deleted > 0) {
+      await removeRouteChannelsForAccountTokens(
+        (await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.accountId, accountId)).all()).map((item) => item.id),
+      );
+      await db.delete(schema.accountTokens).where(eq(schema.accountTokens.accountId, accountId)).run();
+      await repairDefaultToken(accountId);
+    }
+
+    return {
+      ...base,
+      status: 'deleted',
+      total: upstreamTokens.length,
+      deleted,
+    };
+  } catch (error: any) {
+    return {
+      ...base,
+      status: 'failed',
+      reason: 'delete_upstream_tokens_error',
+      message: error?.message || '删除上游全部令牌失败',
+      total: 0,
+      deleted: 0,
+    };
+  }
+}
+
+async function deleteAllUpstreamAccountTokensForAccounts(rows: AccountWithSiteRow[]) {
+  const results: AccountUpstreamTokenDeleteResult[] = [];
+  for (let offset = 0; offset < rows.length; offset += SYNC_ALL_BATCH_SIZE) {
+    const batch = rows.slice(offset, offset + SYNC_ALL_BATCH_SIZE);
+    const batchResults = await Promise.all(batch.map((row) => deleteAllUpstreamAccountTokens(row)));
+    results.push(...batchResults);
+  }
+
+  return {
+    total: results.length,
+    deleted: results.filter((item) => item.status === 'deleted').reduce((acc, item) => acc + item.deleted, 0),
+    skipped: results.filter((item) => item.status === 'skipped').length,
+    failed: results.filter((item) => item.status === 'failed').length,
+    results,
+  } satisfies AccountUpstreamTokenDeleteTaskResult;
 }
 
 async function deleteMissingUpstreamTokens(accountId: number, upstreamTokens: Array<{ key?: string | null; name?: string | null; tokenGroup?: string | null }>) {
@@ -2039,6 +2161,36 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     return { success: true, ...result, coverageRefresh };
   });
 
+  app.post<{ Params: { accountId: string } }>('/api/account-tokens/delete-upstream/:accountId', async (request, reply) => {
+    const accountId = Number.parseInt(request.params.accountId, 10);
+    if (Number.isNaN(accountId)) {
+      return reply.code(400).send({ success: false, message: '账号 ID 无效' });
+    }
+
+    const row = await db.select().from(schema.accounts)
+      .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+      .where(eq(schema.accounts.id, accountId))
+      .get();
+
+    if (!row) {
+      return reply.code(404).send({ success: false, message: '账号不存在' });
+    }
+
+    const result = await deleteAllUpstreamAccountTokens(row);
+    if (result.status === 'skipped' && result.reason === 'apikey_connection') {
+      return reply.code(400).send({ success: false, message: 'API Key 连接不支持删除站点令牌' });
+    }
+    if (result.status === 'failed' && result.reason === 'unsupported_platform') {
+      return reply.code(400).send({ success: false, message: result.message });
+    }
+    if (result.status === 'failed') {
+      return reply.code(502).send({ success: false, message: result.message || '删除站点全部令牌失败' });
+    }
+
+    const coverageRefresh = await refreshCoverageForAccounts([accountId]);
+    return { success: true, ...result, coverageRefresh };
+  });
+
   app.post<{ Body: unknown }>('/api/account-tokens/sync-all', async (request, reply) => {
     const parsedBody = parseAccountTokenSyncAllPayload(request.body);
     if (!parsedBody.success) {
@@ -2088,6 +2240,56 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     });
   });
 
+  app.post<{ Body: unknown }>('/api/account-tokens/delete-upstream-all', async (request, reply) => {
+    const parsedBody = parseAccountTokenSyncAllPayload(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({ success: false, message: parsedBody.error });
+    }
+
+    const rows = await db.select().from(schema.accounts)
+      .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+      .where(eq(schema.accounts.status, 'active'))
+      .all();
+
+    if (parsedBody.data.wait) {
+      const deleteResult = await deleteAllUpstreamAccountTokensForAccounts(rows);
+      return { success: true, ...deleteResult };
+    }
+
+    const { task, reused } = startBackgroundTask(
+      {
+        type: 'token',
+        title: '删除全部上游账号令牌',
+        dedupeKey: 'delete-all-upstream-account-tokens',
+        notifyOnFailure: true,
+        successTitle: (currentTask) => {
+          const summary = (currentTask.result as any)?.summary;
+          if (!summary) return '删除全部上游账号令牌已完成';
+          return `删除全部上游账号令牌已完成（删除${summary.deleted}/跳过${summary.skipped}/失败${summary.failed}）`;
+        },
+        failureTitle: () => '删除全部上游账号令牌失败',
+        successMessage: (currentTask) => {
+          const result = currentTask.result as AccountUpstreamTokenDeleteTaskResult | null;
+          if (!result) return '全部上游账号令牌删除任务已完成';
+          return `全部上游账号令牌删除完成：删除 ${result.deleted}，跳过 ${result.skipped}，失败 ${result.failed}`;
+        },
+        failureMessage: (currentTask) => `全部上游账号令牌删除失败：${currentTask.error || 'unknown error'}`,
+      },
+      async () => deleteAllUpstreamAccountTokensForAccounts(rows),
+    );
+
+    return reply.code(202).send({
+      success: true,
+      queued: true,
+      reused,
+      jobId: task.id,
+      status: task.status,
+      message: reused
+        ? '删除全部上游账号令牌任务执行中，请稍后查看程序日志'
+        : '删除全部上游账号令牌进行中，请稍后查看程序日志',
+    });
+  });
+
   app.post<{ Body: unknown }>('/api/account-tokens/groups/ensure-all', async (request, reply) => {
     const parsedBody = parseAccountTokenSyncAllPayload(request.body);
     if (!parsedBody.success) {
@@ -2130,6 +2332,66 @@ export async function accountTokensRoutes(app: FastifyInstance) {
       message: reused
         ? '账号分组补齐任务执行中，请稍后查看程序日志'
         : '获取全部账号分组并补齐令牌进行中，请稍后查看程序日志',
+    });
+  });
+
+  app.post<{ Body: unknown }>('/api/account-tokens/groups/ensure-all-sync-all', async (request, reply) => {
+    const parsedBody = parseAccountTokenSyncAllPayload(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({ success: false, message: parsedBody.error });
+    }
+
+    const runCombinedFlow = async () => {
+      const ensureResult = await executeEnsureGroupTokensAllAccounts();
+      const syncResult = await executeSyncAllAccountTokens();
+      return { ensureResult, syncResult };
+    };
+
+    if (parsedBody.data.wait) {
+      const combined = await runCombinedFlow();
+      return { success: true, ...combined };
+    }
+
+    const { task, reused } = startBackgroundTask(
+      {
+        type: 'token',
+        title: '创建全部账号分组并同步全部账号令牌',
+        dedupeKey: 'ensure-all-account-group-tokens-then-sync-all',
+        notifyOnFailure: true,
+        successTitle: (currentTask) => {
+          const result = currentTask.result as { ensureResult?: { summary?: any }; syncResult?: { summary?: any } } | null;
+          const ensureSummary = result?.ensureResult?.summary;
+          const syncSummary = result?.syncResult?.summary;
+          if (!ensureSummary || !syncSummary) return '创建全部账号分组并同步全部账号令牌已完成';
+          return `创建全部账号分组并同步全部账号令牌已完成（分组补齐${ensureSummary.created}/同步${syncSummary.synced}）`;
+        },
+        failureTitle: () => '创建全部账号分组并同步全部账号令牌失败',
+        successMessage: (currentTask) => {
+          const result = currentTask.result as { ensureResult?: { summary?: any }; syncResult?: { summary?: any } } | null;
+          if (!result?.ensureResult?.summary || !result?.syncResult?.summary) {
+            return '创建全部账号分组并同步全部账号令牌任务已完成';
+          }
+          const ensureSummary = result.ensureResult.summary;
+          const syncSummary = result.syncResult.summary;
+          return [
+            `分组补齐完成：成功 ${ensureSummary.synced}，跳过 ${ensureSummary.skipped}，失败 ${ensureSummary.failed}，补齐 ${ensureSummary.created}，禁用 ${ensureSummary.disabled}`,
+            `全部同步完成：成功 ${syncSummary.synced}，跳过 ${syncSummary.skipped}，失败 ${syncSummary.failed}`,
+          ].join('\n');
+        },
+        failureMessage: (currentTask) => `创建全部账号分组并同步全部账号令牌失败：${currentTask.error || 'unknown error'}`,
+      },
+      async () => runCombinedFlow(),
+    );
+
+    return reply.code(202).send({
+      success: true,
+      queued: true,
+      reused,
+      jobId: task.id,
+      status: task.status,
+      message: reused
+        ? '创建全部账号分组并同步全部账号令牌任务执行中，请稍后查看程序日志'
+        : '创建全部账号分组并同步全部账号令牌进行中，请稍后查看程序日志',
     });
   });
 
