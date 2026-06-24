@@ -246,6 +246,69 @@ describe('rebuildTokenRoutesFromAvailability', () => {
     expect(route).toBeUndefined();
   });
 
+  it('routes enabled account token models when the token has any successful model health check', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'managed-token-health-site',
+      url: 'https://managed-token-health.example.com',
+      platform: 'new-api',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'managed-token-health-user',
+      accessToken: 'session-token',
+      status: 'active',
+      extraConfig: JSON.stringify({ credentialMode: 'session' }),
+    }).returning().get();
+
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'managed-token-health-token',
+      token: 'sk-managed-token-health-token',
+      source: 'synced',
+      enabled: true,
+      isDefault: true,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+
+    await db.insert(schema.tokenModelAvailability).values([
+      {
+        tokenId: token.id,
+        modelName: 'gpt-5.5',
+        available: true,
+        routeEnabled: true,
+        message: '请求成功',
+        httpStatus: 200,
+      },
+      {
+        tokenId: token.id,
+        modelName: 'gpt-5.4',
+        available: null,
+        routeEnabled: true,
+        message: null,
+        httpStatus: null,
+      },
+    ]).run();
+
+    const rebuild = await rebuildTokenRoutesFromAvailability();
+
+    expect(rebuild.models).toBe(2);
+    const route = await db.select().from(schema.tokenRoutes)
+      .where(eq(schema.tokenRoutes.modelPattern, 'gpt-5.4'))
+      .get();
+    expect(route).toBeDefined();
+
+    const channels = await db.select().from(schema.routeChannels)
+      .where(and(
+        eq(schema.routeChannels.routeId, route!.id),
+        eq(schema.routeChannels.accountId, account.id),
+      ))
+      .all();
+
+    expect(channels).toHaveLength(1);
+    expect(channels[0]?.tokenId).toBe(token.id);
+  });
+
   it('routes image account token models when route-enabled even without a chat availability success', async () => {
     const site = await db.insert(schema.sites).values({
       name: 'managed-image-site',

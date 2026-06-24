@@ -5,6 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 const fetchMock = vi.fn();
 const selectChannelMock = vi.fn();
 const selectNextChannelMock = vi.fn();
+const selectPreferredChannelMock = vi.fn();
 const recordSuccessMock = vi.fn();
 const recordFailureMock = vi.fn();
 const refreshModelsAndRebuildRoutesMock = vi.fn();
@@ -29,6 +30,7 @@ vi.mock('../../services/tokenRouter.js', () => ({
   tokenRouter: {
     selectChannel: (...args: unknown[]) => selectChannelMock(...args),
     selectNextChannel: (...args: unknown[]) => selectNextChannelMock(...args),
+    selectPreferredChannel: (...args: unknown[]) => selectPreferredChannelMock(...args),
     recordSuccess: (...args: unknown[]) => recordSuccessMock(...args),
     recordFailure: (...args: unknown[]) => recordFailureMock(...args),
   },
@@ -120,6 +122,7 @@ describe('/v1/images/edits route', () => {
     fetchMock.mockReset();
     selectChannelMock.mockReset();
     selectNextChannelMock.mockReset();
+    selectPreferredChannelMock.mockReset();
     recordSuccessMock.mockReset();
     recordFailureMock.mockReset();
     refreshModelsAndRebuildRoutesMock.mockReset();
@@ -137,6 +140,7 @@ describe('/v1/images/edits route', () => {
       actualModel: 'upstream-gpt-image',
     });
     selectNextChannelMock.mockReturnValue(null);
+    selectPreferredChannelMock.mockReturnValue(null);
   });
 
   afterAll(async () => {
@@ -287,6 +291,133 @@ describe('/v1/images/edits route', () => {
     });
   });
 
+  it('routes Antigravity image edits through internal Gemini runtime with inline image data', async () => {
+    selectChannelMock.mockReturnValue({
+      channel: { id: 42, routeId: 22 },
+      site: {
+        id: 79,
+        name: 'antigravity-site',
+        url: 'https://cloudcode-pa.googleapis.com',
+        platform: 'antigravity',
+      },
+      account: {
+        id: 39,
+        username: 'antigravity-user@example.com',
+        extraConfig: JSON.stringify({
+          oauth: {
+            provider: 'antigravity',
+            email: 'antigravity-user@example.com',
+            projectId: 'project-demo',
+          },
+        }),
+      },
+      tokenName: 'default',
+      tokenValue: 'antigravity-access-token',
+      actualModel: 'gemini-3.1-flash-image',
+    });
+    fetchMock.mockResolvedValue(new Response([
+      'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"inlineData":{"mimeType":"image/png","data":"ZWRpdGVk"}}]},"finishReason":"STOP","index":0}]}}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n'), {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    }));
+
+    const boundary = 'metapi-gemini-edit-boundary';
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/images/edits',
+      headers: {
+        authorization: 'Bearer sk-demo',
+        'content-type': `multipart/form-data; boundary=${boundary}`,
+      },
+      payload: buildMultipartBody(boundary),
+    });
+
+    expect(response.statusCode).toBe(200);
+    const [targetUrl, requestInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(targetUrl).toBe('https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse');
+    expect(JSON.parse(String(requestInit.body))).toMatchObject({
+      model: 'gemini-3.1-flash-image',
+      requestType: 'image_gen',
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: 'edit this' },
+            { inlineData: { mimeType: 'image/png', data: Buffer.from('pngdata').toString('base64') } },
+          ],
+        },
+      ],
+      generationConfig: {
+        responseModalities: ['TEXT', 'IMAGE'],
+        imageConfig: { aspectRatio: '1:1' },
+      },
+    });
+    expect(response.json()).toMatchObject({
+      data: [
+        {
+          b64_json: 'ZWRpdGVk',
+          mime_type: 'image/png',
+        },
+      ],
+    });
+  });
+
+  it('passes Gemini native 4K image size for image generation requests', async () => {
+    selectChannelMock.mockReturnValue({
+      channel: { id: 43, routeId: 22 },
+      site: {
+        id: 79,
+        name: 'antigravity-site',
+        url: 'https://cloudcode-pa.googleapis.com',
+        platform: 'antigravity',
+      },
+      account: {
+        id: 39,
+        username: 'antigravity-user@example.com',
+        extraConfig: JSON.stringify({ oauth: { provider: 'antigravity', projectId: 'project-demo' } }),
+      },
+      tokenName: 'default',
+      tokenValue: 'antigravity-access-token',
+      actualModel: 'gemini-3.1-flash-image',
+    });
+    fetchMock.mockResolvedValue(new Response([
+      'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"inlineData":{"mimeType":"image/png","data":"aW1hZ2U="}}]},"finishReason":"STOP","index":0}]}}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n'), {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/images/generations',
+      headers: { authorization: 'Bearer sk-demo' },
+      payload: {
+        model: 'gemini-3.1-flash-image',
+        prompt: 'a 4k landscape',
+        size: '4096x2304',
+        image_config: { image_size: '4k' },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const [, requestInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(requestInit.body))).toMatchObject({
+      generationConfig: {
+        imageConfig: {
+          aspectRatio: '16:9',
+          imageSize: '4K',
+        },
+      },
+    });
+  });
+
   it('keeps image generation size unchanged when channel image upscale is disabled', async () => {
     fetchMock.mockResolvedValue(new Response(JSON.stringify({
       created: 1,
@@ -416,6 +547,60 @@ describe('/v1/images/edits route', () => {
     await expect(sharp(output).metadata()).resolves.toMatchObject({
       width: 2048,
       height: 2048,
+    });
+  });
+
+  it('upscales to 4k output when a 4k size is requested', async () => {
+    const onePixelPng = await sharp({
+      create: {
+        width: 1,
+        height: 1,
+        channels: 4,
+        background: { r: 255, g: 255, b: 255, alpha: 1 },
+      },
+    }).png().toBuffer();
+    selectChannelMock.mockReturnValueOnce({
+      channel: { id: 11, routeId: 22, imageUpscaleEnabled: true },
+      site: { id: 44, name: 'demo-site', url: 'https://upstream.example.com', platform: 'openai' },
+      account: { id: 33, username: 'demo-user' },
+      tokenName: 'default',
+      tokenValue: 'sk-demo',
+      actualModel: 'upstream-gpt-image',
+    });
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      created: 1,
+      data: [{ b64_json: onePixelPng.toString('base64') }],
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/images/generations',
+      headers: {
+        authorization: 'Bearer sk-demo',
+      },
+      payload: {
+        model: 'gpt-image-1',
+        prompt: 'draw a poster',
+        size: '4096x4096',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const [, requestInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(requestInit.body));
+    expect(body).toMatchObject({
+      model: 'upstream-gpt-image',
+      size: '1024x1024',
+      response_format: 'b64_json',
+    });
+    const responseBody = response.json();
+    const output = Buffer.from(responseBody.data[0].b64_json, 'base64');
+    await expect(sharp(output).metadata()).resolves.toMatchObject({
+      width: 4096,
+      height: 4096,
     });
   });
 

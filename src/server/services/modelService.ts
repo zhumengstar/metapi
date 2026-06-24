@@ -1,4 +1,4 @@
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { db, schema } from '../db/index.js';
 import { getInsertedRowId } from '../db/insertHelpers.js';
 import { getAdapter } from './platforms/index.js';
@@ -1235,12 +1235,28 @@ export async function rebuildTokenRoutesFromAvailability() {
       ),
     )
     .all();
+  const routeEnabledTokenIds: number[] = Array.from(new Set(tokenRows
+    .map((row) => Number(row.account_tokens.id))
+    .filter((id): id is number => Number.isFinite(id) && id > 0)));
+  const tokenModelRowsForRouteEnabledTokens = routeEnabledTokenIds.length > 0
+    ? await db.select().from(schema.tokenModelAvailability)
+      .where(inArray(schema.tokenModelAvailability.tokenId, routeEnabledTokenIds))
+      .all()
+    : [];
+  const tokensWithSuccessfulModelTest = new Set<number>();
+  for (const row of tokenModelRowsForRouteEnabledTokens) {
+    if (isSuccessfulManualTokenModelTest(row)) {
+      tokensWithSuccessfulModelTest.add(row.tokenId);
+    }
+  }
   const usableTokenRows = tokenRows.filter((row) => (
     isUsableAccountToken(row.account_tokens)
     && requiresManagedAccountTokens(row.accounts)
     && (
       isImageGenerationModel(row.token_model_availability.modelName)
       || isSuccessfulManualTokenModelTest(row.token_model_availability)
+      || row.account_tokens.healthCheckLastAvailable === true
+      || tokensWithSuccessfulModelTest.has(Number(row.account_tokens.id))
     )
   ));
 

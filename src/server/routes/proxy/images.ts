@@ -381,30 +381,15 @@ export async function imagesProxyRoute(app: FastifyInstance) {
       try {
         const { upstream, text, firstByteLatencyMs } = await runWithSiteApiEndpointPool(selected.site, async (target) => {
           const attemptStartedAtMs = Date.now();
-          const targetUrl = buildUpstreamUrl(target.baseUrl, '/v1/images/edits');
-          const requestInit = multipartForm
-            ? withSiteRecordProxyRequestInit(selected.site, {
-              method: 'POST',
-              headers: {
-                Authorization: `Bearer ${selected.tokenValue}`,
-              },
-              body: cloneFormDataWithOverrides(multipartForm, imageEditOverrides) as any,
-            }, getProxyUrlFromExtraConfig(selected.account.extraConfig))
-            : withSiteRecordProxyRequestInit(selected.site, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${selected.tokenValue}`,
-              },
-              body: JSON.stringify({
-                ...(jsonBody || {}),
-                ...imageEditOverrides,
-              }),
-            }, getProxyUrlFromExtraConfig(selected.account.extraConfig));
           const response = await fetchWithObservedFirstByte(
-            async (signal) => fetch(targetUrl, {
-              ...requestInit,
+            async (signal) => dispatchImageEditRequest({
+              selected,
+              targetBaseUrl: target.baseUrl,
+              multipartForm,
+              jsonBody: jsonBody || {},
+              overrides: imageEditOverrides,
               signal,
+              downstreamHeaders: request.headers as Record<string, unknown>,
             }),
             {
               firstByteTimeoutMs,
@@ -665,6 +650,44 @@ async function dispatchImageGenerationRequest(input: {
   }, getProxyUrlFromExtraConfig(input.selected.account.extraConfig)));
 }
 
+async function dispatchImageEditRequest(input: {
+  selected: any;
+  targetBaseUrl: string;
+  multipartForm: FormData | null;
+  jsonBody: Record<string, unknown>;
+  overrides: Record<string, string>;
+  signal?: AbortSignal;
+  downstreamHeaders: Record<string, unknown>;
+}) {
+  if (isInternalGeminiImagePlatform(input.selected.site?.platform)) {
+    return dispatchInternalGeminiImageEdit(input);
+  }
+
+  const targetUrl = buildUpstreamUrl(input.targetBaseUrl, '/v1/images/edits');
+  const requestInit = input.multipartForm
+    ? withSiteRecordProxyRequestInit(input.selected.site, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${input.selected.tokenValue}`,
+      },
+      body: cloneFormDataWithOverrides(input.multipartForm, input.overrides) as any,
+      signal: input.signal,
+    }, getProxyUrlFromExtraConfig(input.selected.account.extraConfig))
+    : withSiteRecordProxyRequestInit(input.selected.site, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${input.selected.tokenValue}`,
+      },
+      body: JSON.stringify({
+        ...(input.jsonBody || {}),
+        ...input.overrides,
+      }),
+      signal: input.signal,
+    }, getProxyUrlFromExtraConfig(input.selected.account.extraConfig));
+  return fetch(targetUrl, requestInit);
+}
+
 async function dispatchInternalGeminiImageGeneration(input: {
   selected: any;
   body: Record<string, unknown>;
@@ -727,6 +750,77 @@ async function dispatchInternalGeminiImageGeneration(input: {
   });
 }
 
+async function dispatchInternalGeminiImageEdit(input: {
+  selected: any;
+  multipartForm: FormData | null;
+  jsonBody: Record<string, unknown>;
+  overrides: Record<string, string>;
+  signal?: AbortSignal;
+  downstreamHeaders: Record<string, unknown>;
+}) {
+  const selected = input.selected;
+  const body = {
+    ...(input.jsonBody || {}),
+    ...input.overrides,
+  };
+  const modelName = String(body.model || selected.actualModel || '').trim();
+  const platform = String(selected.site?.platform || '').trim().toLowerCase();
+  const isGeminiCli = platform === 'gemini-cli';
+  const action = isGeminiCli
+    ? 'generateContent'
+    : resolveAntigravityProviderAction('generateContent', false, modelName);
+  const upstreamPath = action === 'streamGenerateContent'
+    ? '/v1internal:streamGenerateContent?alt=sse'
+    : '/v1internal:generateContent';
+  const requestBody = await buildGeminiImageEditBody({
+    multipartForm: input.multipartForm,
+    jsonBody: body,
+  });
+  const oauth = getOauthInfoFromAccount(selected.account);
+  const requestHeaders = {
+    'Content-Type': 'application/json',
+    ...(action === 'streamGenerateContent' ? { Accept: 'text/event-stream' } : {}),
+    Authorization: `Bearer ${selected.tokenValue}`,
+    ...buildOauthProviderHeaders({
+      account: selected.account,
+      downstreamHeaders: input.downstreamHeaders,
+    }),
+  };
+
+  const upstream = await dispatchRuntimeRequest({
+    siteUrl: selected.site.url,
+    targetUrl: `${selected.site.url}${upstreamPath}`,
+    signal: input.signal,
+    request: {
+      endpoint: 'chat',
+      path: upstreamPath,
+      headers: requestHeaders,
+      body: requestBody,
+      runtime: {
+        executor: isGeminiCli ? 'gemini-cli' : 'antigravity',
+        modelName,
+        stream: false,
+        oauthProjectId: oauth?.projectId || null,
+        action,
+      },
+    },
+    buildInit: async (_requestUrl, requestForFetch) => withSiteRecordProxyRequestInit(selected.site, {
+      method: 'POST',
+      headers: requestForFetch.headers,
+      body: JSON.stringify(requestForFetch.body),
+    }, getProxyUrlFromExtraConfig(selected.account.extraConfig)),
+  });
+
+  if (!upstream.ok) return upstream;
+
+  const responseText = await readRuntimeResponseText(upstream);
+  const converted = convertGeminiImageResponseToOpenAi(responseText);
+  return new Response(JSON.stringify(converted.value), {
+    status: converted.ok ? upstream.status : 502,
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+  });
+}
+
 function isInternalGeminiImagePlatform(platform: unknown): boolean {
   const normalized = String(platform || '').trim().toLowerCase();
   return normalized === 'antigravity' || normalized === 'gemini-cli';
@@ -735,6 +829,7 @@ function isInternalGeminiImagePlatform(platform: unknown): boolean {
 function buildGeminiImageGenerationBody(body: Record<string, unknown>): Record<string, unknown> {
   const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
   const aspectRatio = resolveGeminiImageAspectRatio(body.size);
+  const imageSize = resolveGeminiImageSize(body);
   return {
     contents: [
       {
@@ -744,8 +839,119 @@ function buildGeminiImageGenerationBody(body: Record<string, unknown>): Record<s
     ],
     generationConfig: {
       responseModalities: ['TEXT', 'IMAGE'],
-      imageConfig: { aspectRatio },
+      imageConfig: {
+        aspectRatio,
+        ...(imageSize ? { imageSize } : {}),
+      },
     },
+  };
+}
+
+async function buildGeminiImageEditBody(input: {
+  multipartForm: FormData | null;
+  jsonBody: Record<string, unknown>;
+}): Promise<Record<string, unknown>> {
+  const prompt = readImageEditPrompt(input.multipartForm, input.jsonBody);
+  const parts: Array<Record<string, unknown>> = [{ text: prompt || 'Edit this image.' }];
+  const imageParts = input.multipartForm
+    ? await readGeminiInlineImagePartsFromFormData(input.multipartForm)
+    : readGeminiInlineImagePartsFromJson(input.jsonBody);
+  parts.push(...imageParts);
+  const aspectRatio = resolveGeminiImageAspectRatio(readImageEditSize(input.multipartForm, input.jsonBody));
+  const imageSize = resolveGeminiImageSize(input.jsonBody);
+  return {
+    contents: [
+      {
+        role: 'user',
+        parts,
+      },
+    ],
+    generationConfig: {
+      responseModalities: ['TEXT', 'IMAGE'],
+      imageConfig: {
+        aspectRatio,
+        ...(imageSize ? { imageSize } : {}),
+      },
+    },
+  };
+}
+
+function readImageEditPrompt(formData: FormData | null, jsonBody: Record<string, unknown>): string {
+  const formPrompt = formData?.get('prompt');
+  if (typeof formPrompt === 'string' && formPrompt.trim()) return formPrompt.trim();
+  const jsonPrompt = jsonBody.prompt;
+  return typeof jsonPrompt === 'string' ? jsonPrompt.trim() : '';
+}
+
+function readImageEditSize(formData: FormData | null, jsonBody: Record<string, unknown>): unknown {
+  return formData?.get('size') ?? jsonBody.size;
+}
+
+async function readGeminiInlineImagePartsFromFormData(formData: FormData): Promise<Array<Record<string, unknown>>> {
+  const parts: Array<Record<string, unknown>> = [];
+  for (const [key, value] of formData.entries()) {
+    if (typeof value === 'string') continue;
+    if (key !== 'image' && key !== 'mask') continue;
+    const file = value as File;
+    const bytes = Buffer.from(await file.arrayBuffer());
+    if (bytes.length === 0) continue;
+    parts.push({
+      inlineData: {
+        mimeType: file.type || 'application/octet-stream',
+        data: bytes.toString('base64'),
+      },
+    });
+  }
+  if (parts.length === 0) {
+    throw new Error('Gemini image edit requires at least one image file');
+  }
+  return parts;
+}
+
+function readGeminiInlineImagePartsFromJson(jsonBody: Record<string, unknown>): Array<Record<string, unknown>> {
+  const rawImages = Array.isArray(jsonBody.image)
+    ? jsonBody.image
+    : (Array.isArray(jsonBody.images) ? jsonBody.images : [jsonBody.image].filter(Boolean));
+  const parts: Array<Record<string, unknown>> = [];
+  for (const raw of rawImages) {
+    const image = normalizeJsonImageInput(raw);
+    if (!image) continue;
+    parts.push({
+      inlineData: {
+        mimeType: image.mimeType,
+        data: image.data,
+      },
+    });
+  }
+  if (parts.length === 0) {
+    throw new Error('Gemini image edit requires at least one image');
+  }
+  return parts;
+}
+
+function normalizeJsonImageInput(value: unknown): { data: string; mimeType: string } | null {
+  if (typeof value === 'string') {
+    const parsed = parseDataUrlImage(value) || { data: value.trim(), mimeType: 'image/png' };
+    return parsed.data ? parsed : null;
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const data = typeof record.b64_json === 'string'
+    ? record.b64_json.trim()
+    : (typeof record.data === 'string' ? record.data.trim() : '');
+  if (!data) return null;
+  const mimeType = typeof record.mime_type === 'string'
+    ? record.mime_type
+    : (typeof record.mimeType === 'string' ? record.mimeType : 'image/png');
+  return { data, mimeType };
+}
+
+function parseDataUrlImage(value: string): { data: string; mimeType: string } | null {
+  const match = value.trim().match(/^data:([^;,]+);base64,(.+)$/i);
+  if (!match) return null;
+  return {
+    mimeType: match[1] || 'image/png',
+    data: match[2] || '',
   };
 }
 
@@ -754,6 +960,31 @@ function resolveGeminiImageAspectRatio(size: unknown): string {
   if (!parsed) return '1:1';
   if (parsed.width === parsed.height) return '1:1';
   return parsed.width > parsed.height ? '16:9' : '9:16';
+}
+
+function resolveGeminiImageSize(body: Record<string, unknown>): string | null {
+  const directImageConfig = body.image_config;
+  if (directImageConfig && typeof directImageConfig === 'object' && !Array.isArray(directImageConfig)) {
+    const value = (directImageConfig as Record<string, unknown>).image_size
+      ?? (directImageConfig as Record<string, unknown>).imageSize;
+    if (typeof value === 'string' && value.trim()) return normalizeGeminiImageSize(value);
+  }
+  const generationConfig = body.generationConfig;
+  if (generationConfig && typeof generationConfig === 'object' && !Array.isArray(generationConfig)) {
+    const imageConfig = (generationConfig as Record<string, unknown>).imageConfig;
+    if (imageConfig && typeof imageConfig === 'object' && !Array.isArray(imageConfig)) {
+      const value = (imageConfig as Record<string, unknown>).imageSize;
+      if (typeof value === 'string' && value.trim()) return normalizeGeminiImageSize(value);
+    }
+  }
+  const flatValue = body['generationConfig.imageConfig.imageSize'];
+  if (typeof flatValue === 'string' && flatValue.trim()) return normalizeGeminiImageSize(flatValue);
+  return null;
+}
+
+function normalizeGeminiImageSize(value: string): string {
+  const normalized = value.trim();
+  return normalized.toLowerCase() === '4k' ? '4K' : normalized;
 }
 
 function convertGeminiImageResponseToOpenAi(text: string): { ok: true; value: any } | { ok: false; value: any } {
@@ -848,6 +1079,7 @@ const IMAGE_UPSCALE_NATIVE_SIZES: ParsedImageSize[] = [
   { width: 1536, height: 1024, value: '1536x1024' },
   { width: 1024, height: 1536, value: '1024x1536' },
 ];
+const IMAGE_UPSCALE_MAX_NATIVE_EDGE = 4096;
 const IMAGE_UPSCALE_TIMEOUT_MS = 110_000;
 const IMAGE_UPSCALE_CACHE_TTL_MS = 10 * 60 * 1000;
 const IMAGE_UPSCALE_CACHE_MAX_ENTRIES = 64;
@@ -882,6 +1114,12 @@ function parseImageSize(value: unknown): ParsedImageSize | null {
   return { width, height, value: `${width}x${height}` };
 }
 
+function clampImageSize(size: ParsedImageSize, maxEdge: number): ParsedImageSize {
+  const width = Math.min(size.width, maxEdge);
+  const height = Math.min(size.height, maxEdge);
+  return { width, height, value: `${width}x${height}` };
+}
+
 function resolveNativeImageSizeForTarget(target: ParsedImageSize): ParsedImageSize {
   if (target.width === target.height) return IMAGE_UPSCALE_NATIVE_SIZES[0];
   return target.width > target.height
@@ -899,13 +1137,15 @@ function resolveImageUpscalePlan({
   if (!enabled) return { shouldUpscale: false };
   const requestedSize = parseImageSize(size);
   if (!requestedSize) return { shouldUpscale: false };
-  const upstreamSize = resolveNativeImageSizeForTarget(requestedSize);
-  if (requestedSize.width <= upstreamSize.width && requestedSize.height <= upstreamSize.height) {
+  const clampedRequestedSize = clampImageSize(requestedSize, IMAGE_UPSCALE_MAX_NATIVE_EDGE);
+  if (clampedRequestedSize.value !== requestedSize.value) return { shouldUpscale: false };
+  const upstreamSize = resolveNativeImageSizeForTarget(clampedRequestedSize);
+  if (clampedRequestedSize.width <= upstreamSize.width && clampedRequestedSize.height <= upstreamSize.height) {
     return { shouldUpscale: false };
   }
   return {
     shouldUpscale: true,
-    requestedSize,
+    requestedSize: clampedRequestedSize,
     upstreamSize,
   };
 }

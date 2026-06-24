@@ -4140,6 +4140,7 @@ export class TokenRouter {
       candidate.channel.tokenId
       && !isImageGenerationModel(candidate.channel.sourceModel)
       && !isSuccessfulManualTokenModelTest(candidate.tokenModelAvailability)
+      && candidate.token?.healthCheckLastAvailable !== true
     ) {
       reasonParts.push('模型测试不可用');
     }
