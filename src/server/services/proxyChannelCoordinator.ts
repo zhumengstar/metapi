@@ -71,6 +71,16 @@ function cleanupExpiredStickyBindings(nowMs = Date.now()): void {
   }
 }
 
+function normalizeStickyModelKey(modelName?: string | null): string {
+  const normalized = String(modelName || "").trim().toLowerCase();
+  if (!normalized) return "";
+  const slashIndex = normalized.lastIndexOf("/");
+  if (slashIndex >= 0 && slashIndex < normalized.length - 1) {
+    return normalized.slice(slashIndex + 1);
+  }
+  return normalized;
+}
+
 function getSessionScopedExtraConfig(input?: SessionScopedChannelInput): string | null | undefined {
   if (typeof input === 'string' || input == null) return input;
   return input.extraConfig;
@@ -191,6 +201,34 @@ class ProxyChannelCoordinator {
       return;
     }
     stickySessionBindings.delete(normalizedKey);
+  }
+
+  clearStickyBindingsForModel(requestedModel?: string | null): number {
+    const normalizedModel = normalizeStickyModelKey(requestedModel);
+    if (!normalizedModel) return 0;
+    cleanupExpiredStickyBindings();
+    let cleared = 0;
+    for (const key of stickySessionBindings.keys()) {
+      const keyModel = normalizeStickyModelKey(key.split('|')[3] || '');
+      if (keyModel !== normalizedModel) continue;
+      stickySessionBindings.delete(key);
+      cleared += 1;
+    }
+    return cleared;
+  }
+
+  clearStickyBindingsForModels(requestedModels: Array<string | null | undefined>): number {
+    const normalizedModels = Array.from(new Set(requestedModels.map((model) => normalizeStickyModelKey(model)).filter(Boolean)));
+    if (normalizedModels.length === 0) return 0;
+    cleanupExpiredStickyBindings();
+    let cleared = 0;
+    for (const key of stickySessionBindings.keys()) {
+      const keyModel = normalizeStickyModelKey(key.split('|')[3] || '');
+      if (!normalizedModels.includes(keyModel)) continue;
+      stickySessionBindings.delete(key);
+      cleared += 1;
+    }
+    return cleared;
   }
 
   getActiveChannelIds(): number[] {

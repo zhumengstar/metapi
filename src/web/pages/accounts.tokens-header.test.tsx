@@ -11,6 +11,8 @@ const { apiMock } = vi.hoisted(() => ({
     getAccountsSnapshot: vi.fn(),
     getSites: vi.fn(),
     getAccountTokens: vi.fn(),
+    getAccountTokenUiSettings: vi.fn(),
+    updateAccountTokenUiSettings: vi.fn(),
   },
 }));
 
@@ -39,6 +41,8 @@ describe('Accounts tokens embedded header', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     installAccountsSnapshotCompat(apiMock);
+    apiMock.getAccountTokenUiSettings.mockResolvedValue({ maxGroupRatioFilter: '' });
+    apiMock.updateAccountTokenUiSettings.mockImplementation(async (data: any) => ({ maxGroupRatioFilter: data?.maxGroupRatioFilter || '' }));
   });
 
   afterEach(() => {

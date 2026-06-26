@@ -9,7 +9,7 @@ import { isImageGenerationModel } from './modelType.js';
 import { scheduleRoutesOnlyRebuild } from './routeRefreshWorkflow.js';
 import { invalidateTokenRouterCache } from './tokenRouter.js';
 
-const TOKEN_MODEL_TEST_TIMEOUT_MS = 60_000;
+const TOKEN_MODEL_TEST_TIMEOUT_MS = 30_000;
 const TOKEN_MODEL_TEST_CONCURRENCY = 12;
 
 type AccountTokenAvailabilityRow = {

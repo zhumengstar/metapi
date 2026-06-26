@@ -694,6 +694,7 @@ export async function handleChatSurfaceRequest(
             bindSurfaceStickyChannel({
               stickySessionKey,
               selected,
+            retryCount,
             });
             return;
           }
@@ -794,6 +795,7 @@ export async function handleChatSurfaceRequest(
           bindSurfaceStickyChannel({
             stickySessionKey,
             selected,
+          retryCount,
           });
           return;
         } else {
@@ -880,6 +882,7 @@ export async function handleChatSurfaceRequest(
         bindSurfaceStickyChannel({
           stickySessionKey,
           selected,
+        retryCount,
         });
         return;
       }
@@ -988,6 +991,7 @@ export async function handleChatSurfaceRequest(
       bindSurfaceStickyChannel({
         stickySessionKey,
         selected,
+      retryCount,
       });
 
       return reply.send(downstreamResponse);
@@ -1416,7 +1420,7 @@ export async function handleClaudeCountTokensSurfaceRequest(
         latency,
       } = countTokensResult;
 
-      tokenRouter.recordSuccess(selected.channel.id, latency, 0, modelName, undefined, 0);
+      tokenRouter.recordSuccess(selected.channel.id, latency, 0, modelName, undefined, 0, { retryCount });
       recordDownstreamCostUsage(request, 0);
       await failureToolkit.log({
         selected,
@@ -1431,6 +1435,7 @@ export async function handleClaudeCountTokensSurfaceRequest(
       bindSurfaceStickyChannel({
         stickySessionKey,
         selected,
+      retryCount,
       });
       await finalizeDebugSuccess(
         upstream.status,

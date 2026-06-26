@@ -62,6 +62,8 @@ import {
   parseBatchApiKeys,
 } from "../../services/apiKeyBatch.js";
 import { createManualAccount } from "../../services/manualAccountCreationService.js";
+import { config } from "../../config.js";
+import { probeRuntimeModel } from "../../services/runtimeModelProbe.js";
 
 type AccountWithSiteRow = {
   accounts: typeof schema.accounts.$inferSelect;
@@ -1851,6 +1853,9 @@ export async function accountsRoutes(app: FastifyInstance) {
             .set({ status: nextStatus, updatedAt: new Date().toISOString() })
             .where(eq(schema.accounts.id, id))
             .run();
+          if ((existing.status || "active") !== nextStatus) {
+            shouldRebuildRoutes = true;
+          }
         }
 
         successIds.push(id);
@@ -2010,9 +2015,9 @@ export async function accountsRoutes(app: FastifyInstance) {
       const disabledSet = new Set(disabledRows.map((r) => r.modelName));
 
       const models = modelRows
-        .filter((r) => r.available)
         .map((r) => ({
           name: r.modelName,
+          available: r.available === true,
           latencyMs: r.latencyMs,
           disabled: disabledSet.has(r.modelName),
           isManual: !!r.isManual,
@@ -2025,6 +2030,77 @@ export async function accountsRoutes(app: FastifyInstance) {
         models,
         totalCount: models.length,
         disabledCount: models.filter((m) => m.disabled).length,
+      };
+    },
+  );
+
+  app.post<{ Params: { id: string }; Body: unknown }>(
+    "/api/accounts/:id/models/test",
+    async (request, reply) => {
+      const accountId = parseInt(request.params.id, 10);
+      if (!Number.isFinite(accountId) || accountId <= 0) {
+        return reply.code(400).send({ message: "账号 ID 无效" });
+      }
+      const body = (request.body || {}) as Record<string, unknown>;
+      const model = typeof body.model === "string" ? body.model.trim() : "";
+      if (!model) {
+        return reply.code(400).send({ message: "模型名称不能为空" });
+      }
+
+      const row = await db
+        .select()
+        .from(schema.accounts)
+        .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+        .where(eq(schema.accounts.id, accountId))
+        .get();
+      if (!row) {
+        return reply.code(404).send({ message: "账号不存在" });
+      }
+
+      const checkedAt = new Date().toISOString();
+      const probe = await probeRuntimeModel({
+        site: row.sites,
+        account: row.accounts,
+        modelName: model,
+        timeoutMs: config.modelAvailabilityProbeTimeoutMs,
+      });
+      const available = probe.status === "supported";
+      const message = available ? "请求成功" : probe.reason;
+
+      await db.insert(schema.modelAvailability)
+        .values({
+          accountId,
+          modelName: model,
+          available,
+          latencyMs: probe.latencyMs,
+          checkedAt,
+        })
+        .onConflictDoUpdate({
+          target: [schema.modelAvailability.accountId, schema.modelAvailability.modelName],
+          set: {
+            available,
+            latencyMs: probe.latencyMs,
+            checkedAt,
+          },
+        })
+        .run();
+
+      if (available) {
+        await rebuildRoutesBestEffort();
+      }
+
+      return {
+        success: true,
+        result: {
+          accountId,
+          model,
+          available,
+          message,
+          responseText: probe.responseText ?? null,
+          httpStatus: probe.httpStatus ?? null,
+          latencyMs: probe.latencyMs,
+          checkedAt,
+        },
       };
     },
   );

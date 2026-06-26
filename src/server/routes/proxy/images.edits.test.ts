@@ -270,15 +270,17 @@ describe('/v1/images/edits route', () => {
     expect(JSON.parse(String(requestInit.body))).toMatchObject({
       model: 'gemini-3.1-flash-image',
       requestType: 'image_gen',
-      contents: [
-        {
-          role: 'user',
-          parts: [{ text: 'a small cat' }],
+      request: {
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: 'a small cat' }],
+          },
+        ],
+        generationConfig: {
+          responseModalities: ['TEXT', 'IMAGE'],
+          imageConfig: { aspectRatio: '1:1' },
         },
-      ],
-      generationConfig: {
-        responseModalities: ['TEXT', 'IMAGE'],
-        imageConfig: { aspectRatio: '1:1' },
       },
     });
     expect(JSON.parse(response.body)).toMatchObject({
@@ -342,18 +344,20 @@ describe('/v1/images/edits route', () => {
     expect(JSON.parse(String(requestInit.body))).toMatchObject({
       model: 'gemini-3.1-flash-image',
       requestType: 'image_gen',
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            { text: 'edit this' },
-            { inlineData: { mimeType: 'image/png', data: Buffer.from('pngdata').toString('base64') } },
-          ],
+      request: {
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: 'edit this' },
+              { inlineData: { mimeType: 'image/png', data: Buffer.from('pngdata').toString('base64') } },
+            ],
+          },
+        ],
+        generationConfig: {
+          responseModalities: ['TEXT', 'IMAGE'],
+          imageConfig: { aspectRatio: '1:1' },
         },
-      ],
-      generationConfig: {
-        responseModalities: ['TEXT', 'IMAGE'],
-        imageConfig: { aspectRatio: '1:1' },
       },
     });
     expect(response.json()).toMatchObject({
@@ -409,10 +413,12 @@ describe('/v1/images/edits route', () => {
     expect(response.statusCode).toBe(200);
     const [, requestInit] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(String(requestInit.body))).toMatchObject({
-      generationConfig: {
-        imageConfig: {
-          aspectRatio: '16:9',
-          imageSize: '4K',
+      request: {
+        generationConfig: {
+          imageConfig: {
+            aspectRatio: '16:9',
+            imageSize: '4K',
+          },
         },
       },
     });

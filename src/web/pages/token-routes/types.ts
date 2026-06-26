@@ -46,6 +46,7 @@ export type RouteChannel = {
   actualTotalCost?: number | null;
   totalInputTokens?: number | null;
   inputCostPerMillion?: number | null;
+  pureInputCostPerMillion?: number | null;
   cooldownUntil?: string | null;
   account?: {
     username: string | null;
@@ -56,6 +57,7 @@ export type RouteChannel = {
   site?: {
     id: number;
     name: string | null;
+    url?: string | null;
     platform: string | null;
   };
   token?: {
@@ -167,6 +169,8 @@ export type SortableChannelRowProps = {
   dragHandleProps?: ButtonHTMLAttributes<HTMLButtonElement>;
   dragHandleRef?: RefCallback<HTMLButtonElement>;
   decisionCandidate?: RouteDecisionCandidate;
+  isSelectedStableFirstChannel?: boolean;
+  isManualStableFirstChannel?: boolean;
   isExactRoute: boolean;
   loadingDecision: boolean;
   isSavingPriority: boolean;
@@ -186,6 +190,7 @@ export type SortableChannelRowProps = {
   onToggleEnabled: (enabled: boolean) => void;
   onToggleImageUpscale?: (enabled: boolean) => void;
   onTestModel?: () => void;
+  onPinStableFirstChannel?: () => void;
   onSiteBlockModel?: () => void;
 };
 

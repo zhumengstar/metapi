@@ -386,8 +386,68 @@ function buildGroupAliases(details: GroupDetail[]): Record<string, string[]> {
   return aliases;
 }
 
+function buildGroupAliasRows(
+  rows: TokenGroupPricingOverviewGroupRow[],
+  details: GroupDetail[],
+  catalog: ModelPricingCatalog | null,
+  localTokenGroups: string[] = [],
+): TokenGroupPricingOverviewGroupRow[] {
+  const detailByGroup = new Map(details.map((item) => [normalizeGroup(item.group), item]));
+  const aliasRows: TokenGroupPricingOverviewGroupRow[] = [];
+  const rowByRatio = new Map<number, TokenGroupPricingOverviewGroupRow[]>();
+  for (const row of rows) {
+    const ratio = Number(row.ratio);
+    if (!Number.isFinite(ratio) || ratio <= 0) continue;
+    const list = rowByRatio.get(ratio) || [];
+    list.push(row);
+    rowByRatio.set(ratio, list);
+  }
+  for (const row of rows) {
+    const detail = detailByGroup.get(row.group);
+    const aliases = [
+      detail?.groupKey,
+      detail?.name,
+    ]
+      .map((value) => normalizeGroup(value))
+      .filter((value) => value && value !== row.group);
+    for (const alias of Array.from(new Set(aliases))) {
+      aliasRows.push({
+        ...row,
+        id: `${row.site.id}:${row.account?.id || 'site'}:${alias}`,
+        group: alias,
+        groupName: row.groupName || row.group,
+        description: row.description || `Alias for ${row.group}`,
+        tokens: [],
+      });
+    }
+  }
+  for (const group of uniqueGroups(localTokenGroups)) {
+    if (rows.some((row) => row.group === group) || aliasRows.some((row) => row.group === group)) continue;
+    const ratio = Number(catalog?.groupRatio?.[group]);
+    if (!Number.isFinite(ratio) || ratio <= 0) continue;
+    const targets = rowByRatio.get(ratio) || [];
+    if (targets.length !== 1) continue;
+    const row = targets[0];
+    aliasRows.push({
+      ...row,
+      id: `${row.site.id}:${row.account?.id || 'site'}:${group}`,
+      group,
+      groupName: row.groupName || row.group,
+      description: row.description || `Alias for ${row.group}`,
+      tokens: [],
+    });
+  }
+  return aliasRows;
+}
+
 function normalizeStoredSource(value?: string | null): TokenGroupPricingOverviewAccount['groupSource'] {
   return value === 'local' || value === 'default' ? value : 'upstream';
+}
+
+function isStoredGroupAlias(row: { group?: string | null; groupName?: string | null }): boolean {
+  const group = normalizeGroup(row.group);
+  const groupName = normalizeGroup(row.groupName);
+  return !!group && !!groupName && group !== groupName;
 }
 
 function isStoredPricingAvailable(value: unknown): boolean {
@@ -683,7 +743,8 @@ async function loadStoredGroupRows(
     };
     return attachTokensToGroupRow(groupRow, tokensByAccountId);
   })
-    .filter((row) => !(row.site.platform === 'sub2api' && row.group === 'default'));
+    .filter((row) => !(row.site.platform === 'sub2api' && row.group === 'default'))
+    .filter((row) => !isStoredGroupAlias(row));
 }
 
 function mergeGroupRows(
@@ -847,7 +908,8 @@ export async function buildTokenGroupPricingOverview(options: TokenGroupPricingO
 
   const { tokenRows, tokensByAccountId } = await loadTokenGroupsContext();
 
-  const catalogBySiteId = new Map<number, ModelPricingCatalog | null>();
+  const catalogByAccountId = new Map<number, ModelPricingCatalog | null>();
+  const publicCatalogBySiteId = new Map<number, ModelPricingCatalog | null>();
   const accounts: TokenGroupPricingOverviewAccount[] = [];
   const groupRows: TokenGroupPricingOverviewGroupRow[] = [];
   const siteIdsWithAccounts = new Set<number>();
@@ -867,7 +929,7 @@ export async function buildTokenGroupPricingOverview(options: TokenGroupPricingO
     );
     const groupDetailsByGroup = new Map(groupResult.details.map((item) => [normalizeGroup(item.group), item]));
 
-    let catalog = catalogBySiteId.get(row.sites.id);
+    let catalog = catalogByAccountId.get(row.accounts.id);
     if (catalog === undefined) {
       try {
         const input = {
@@ -888,7 +950,7 @@ export async function buildTokenGroupPricingOverview(options: TokenGroupPricingO
       } catch {
         catalog = null;
       }
-      catalogBySiteId.set(row.sites.id, catalog);
+      catalogByAccountId.set(row.accounts.id, catalog);
     }
 
     const accountOverview = {
@@ -926,13 +988,19 @@ export async function buildTokenGroupPricingOverview(options: TokenGroupPricingO
     });
     groupRows.push(...accountGroupRows);
     if (refresh && groupResult.source === 'upstream') {
+      const aliasGroupRows = buildGroupAliasRows(
+        accountGroupRows,
+        groupResult.details,
+        catalog || null,
+        accountTokens.map((token) => token.group),
+      );
       await deleteStoredRowsMissingFromUpstream({
         siteId: row.sites.id,
         accountId: row.accounts.id,
         sourceKey: `account:${row.accounts.id}`,
-        groups: upstreamGroups,
+        groups: [...upstreamGroups, ...aliasGroupRows.map((item) => item.group)],
       });
-      await Promise.all(accountGroupRows.map((item) => upsertStoredGroupRow({
+      await Promise.all([...accountGroupRows, ...aliasGroupRows].map((item) => upsertStoredGroupRow({
         row: item,
         sourceKey: `account:${row.accounts.id}`,
       })));
@@ -941,12 +1009,35 @@ export async function buildTokenGroupPricingOverview(options: TokenGroupPricingO
 
   for (const site of siteRows) {
     if (siteIdsWithAccounts.has(site.id)) continue;
+    let catalog = publicCatalogBySiteId.get(site.id);
+    if (catalog === undefined) {
+      try {
+        const input = {
+          site: {
+            id: site.id,
+            url: site.url,
+            platform: site.platform,
+            apiKey: site.apiKey,
+          },
+          account: {
+            id: 0,
+            accessToken: null,
+            apiToken: null,
+          },
+          modelName: '',
+        };
+        catalog = refresh ? await refreshModelPricingCatalog(input) : await fetchModelPricingCatalog(input);
+      } catch {
+        catalog = null;
+      }
+      publicCatalogBySiteId.set(site.id, catalog);
+    }
     const groupResult = refresh ? await fetchPublicSiteGroups(site) : { groups: [], ratio: {}, source: 'default' as const };
     const siteGroupRows = createGroupRowsFromSite({
       site,
       groupResult,
-      catalog: catalogBySiteId.get(site.id) || null,
-    }).map((item) => withCatalogGroupModels(item, catalogBySiteId.get(site.id) || null));
+      catalog: catalog || null,
+    }).map((item) => withCatalogGroupModels(item, catalog || null));
     groupRows.push(...siteGroupRows);
     if (refresh && groupResult.source === 'upstream') {
       await deleteStoredRowsMissingFromUpstream({

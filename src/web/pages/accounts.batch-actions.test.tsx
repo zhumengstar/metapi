@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, create } from 'react-test-renderer';
+import { act, create, type ReactTestInstance } from 'react-test-renderer';
 import { MemoryRouter } from 'react-router-dom';
 import { ToastProvider } from '../components/Toast.js';
 import Accounts from './Accounts.js';
@@ -11,6 +11,7 @@ const { apiMock } = vi.hoisted(() => ({
     getAccountsSnapshot: vi.fn(),
     getSites: vi.fn(),
     batchUpdateAccounts: vi.fn(),
+    updateAccount: vi.fn(),
     refreshAccountHealth: vi.fn(),
   },
 }));
@@ -24,6 +25,13 @@ async function flushMicrotasks() {
     await Promise.resolve();
     await Promise.resolve();
   });
+}
+
+function collectText(node: ReactTestInstance): string {
+  return (node.children || []).map((child) => {
+    if (typeof child === 'string') return child;
+    return collectText(child);
+  }).join('');
 }
 
 describe('Accounts batch actions', () => {
@@ -56,6 +64,7 @@ describe('Accounts batch actions', () => {
       successIds: [1, 2],
       failedItems: [],
     });
+    apiMock.updateAccount.mockResolvedValue({ success: true });
     apiMock.refreshAccountHealth.mockResolvedValue({ success: true });
   });
 
@@ -171,6 +180,46 @@ describe('Accounts batch actions', () => {
 
       const checkbox = root.root.find((node) => node.props['data-testid'] === 'account-select-2');
       expect(checkbox.props.checked).toBe(true);
+    } finally {
+      root?.unmount();
+    }
+  });
+
+  it('supports disabling a single apikey connection from the row actions', async () => {
+    apiMock.getAccounts.mockResolvedValue([
+      {
+        id: 2,
+        siteId: 1,
+        username: '',
+        accessToken: '',
+        apiToken: 'sk-apikey',
+        credentialMode: 'apikey',
+        status: 'active',
+        site: { id: 1, name: 'Site A', status: 'active', platform: 'new-api' },
+      },
+    ]);
+
+    let root!: WebTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <MemoryRouter initialEntries={['/accounts?segment=apikey']}>
+            <ToastProvider>
+              <Accounts />
+            </ToastProvider>
+          </MemoryRouter>,
+        );
+      });
+      await flushMicrotasks();
+
+      const row = root.root.find((node) => node.props['data-testid'] === 'account-row-2');
+      const disableButton = row.findAll((node) => node.type === 'button' && collectText(node).trim() === '禁用')[0];
+      await act(async () => {
+        disableButton.props.onClick();
+      });
+      await flushMicrotasks();
+
+      expect(apiMock.updateAccount).toHaveBeenCalledWith(2, { status: 'disabled' });
     } finally {
       root?.unmount();
     }

@@ -109,6 +109,31 @@ describe('probeRuntimeModel', () => {
     expect(dispatchRuntimeRequestMock).not.toHaveBeenCalled();
   });
 
+  it('returns the upstream model reply for successful probes', async () => {
+    resolveUpstreamEndpointCandidatesMock.mockResolvedValue(['chat']);
+    dispatchRuntimeRequestMock.mockResolvedValue(new Response(JSON.stringify({
+      choices: [
+        {
+          message: {
+            content: '我是一个用于测试的模型。',
+          },
+        },
+      ],
+    }), { status: 200 }));
+
+    const { probeRuntimeModel } = await import('./runtimeModelProbe.js');
+    const result = await probeRuntimeModel({
+      site,
+      account,
+      modelName: 'gpt-5.4',
+      timeoutMs: 100,
+    });
+
+    expect(result.status).toBe('supported');
+    expect(result.httpStatus).toBe(200);
+    expect(result.responseText).toBe('我是一个用于测试的模型。');
+  });
+
   it('uses the remaining timeout budget for the runtime request phase', async () => {
     resolveUpstreamEndpointCandidatesMock.mockImplementation(async () => {
       await new Promise((resolve) => setTimeout(resolve, 15));

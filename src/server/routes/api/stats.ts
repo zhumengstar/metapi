@@ -690,6 +690,7 @@ function mapProxyLogRow(
 
   return {
     ...proxyLogFields,
+    promptTokens: billablePromptTokens,
     rawEstimatedCost: row.proxy_logs.estimatedCost,
     estimatedCost: actualEstimatedCost,
     rechargeRatio,

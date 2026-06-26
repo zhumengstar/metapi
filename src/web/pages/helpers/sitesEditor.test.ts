@@ -26,6 +26,7 @@ describe('buildSiteSaveAction', () => {
         customHeaders: '{"x-site-token":"alpha"}',
         useSystemProxy: false,
         globalWeight: 1.2,
+        rechargeRatio: 2.5,
         postRefreshProbeEnabled: true,
         postRefreshProbeModel: 'gpt-4o',
         postRefreshProbeScope: 'single',
@@ -48,6 +49,7 @@ describe('buildSiteSaveAction', () => {
         customHeaders: '{"x-site-token":"alpha"}',
         useSystemProxy: false,
         globalWeight: 1.2,
+        rechargeRatio: 2.5,
         postRefreshProbeEnabled: true,
         postRefreshProbeModel: 'gpt-4o',
         postRefreshProbeScope: 'single',
@@ -69,6 +71,7 @@ describe('buildSiteSaveAction', () => {
         apiEndpoints: [],
         customHeaders: '',
         globalWeight: 0.8,
+        rechargeRatio: 1,
       },
     );
 
@@ -85,6 +88,7 @@ describe('buildSiteSaveAction', () => {
         apiEndpoints: [],
         customHeaders: '',
         globalWeight: 0.8,
+        rechargeRatio: 1,
       },
     });
   });
@@ -103,6 +107,7 @@ describe('buildSiteSaveAction', () => {
           apiEndpoints: [],
           customHeaders: '',
           globalWeight: 1,
+          rechargeRatio: 1,
         },
       ),
     ).toThrow('editingSiteId is required in edit mode');

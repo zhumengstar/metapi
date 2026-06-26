@@ -33,6 +33,8 @@ function buildAccountProbeResult(input: {
   model: string;
   available: boolean;
   message: string;
+  responseText?: string | null;
+  httpStatus?: number | null;
   latencyMs: number | null;
   checkedAt: string;
 }): RouteChannelModelTestResult {
@@ -43,8 +45,8 @@ function buildAccountProbeResult(input: {
     model: input.model,
     available: input.available,
     message: input.message,
-    responseText: null,
-    httpStatus: null,
+    responseText: input.responseText ?? null,
+    httpStatus: input.httpStatus ?? null,
     latencyMs: input.latencyMs,
     checkedAt: input.checkedAt,
   };
@@ -150,6 +152,8 @@ export async function testRouteChannelModelAvailability(input: {
     model,
     available,
     message,
+    responseText: probe.responseText ?? null,
+    httpStatus: probe.httpStatus ?? null,
     latencyMs: probe.latencyMs,
     checkedAt,
   });

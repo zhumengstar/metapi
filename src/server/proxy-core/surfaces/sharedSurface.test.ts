@@ -163,8 +163,54 @@ describe('selectSurfaceChannelForAttempt', () => {
     expect(refreshModelsAndRebuildRoutesMock).toHaveBeenCalledTimes(1);
   });
 
-  it('uses selectNextChannel on retry attempts without refreshing models', async () => {
+  it('uses selectNextChannel after the same-channel retry attempt without refreshing models', async () => {
     const selected = { channel: { id: 22 } };
+    selectNextChannelMock.mockResolvedValueOnce(selected);
+
+    const { selectSurfaceChannelForAttempt } = await import('./sharedSurface.js');
+    const result = await selectSurfaceChannelForAttempt({
+      requestedModel: 'gpt-5.2',
+      downstreamPolicy: EMPTY_DOWNSTREAM_ROUTING_POLICY,
+      excludeChannelIds: [11],
+      retryCount: 2,
+    });
+
+    expect(result).toBe(selected);
+    expect(selectChannelMock).not.toHaveBeenCalled();
+    expect(selectNextChannelMock).toHaveBeenCalledWith(
+      'gpt-5.2',
+      [11],
+      EMPTY_DOWNSTREAM_ROUTING_POLICY,
+    );
+    expect(refreshModelsAndRebuildRoutesMock).not.toHaveBeenCalled();
+  });
+
+  it('retries the previous channel once before trying backup channels', async () => {
+    const selected = { channel: { id: 11 } };
+    selectPreferredChannelMock.mockResolvedValueOnce(selected);
+
+    const { selectSurfaceChannelForAttempt } = await import('./sharedSurface.js');
+    const result = await selectSurfaceChannelForAttempt({
+      requestedModel: 'gpt-5.2',
+      downstreamPolicy: EMPTY_DOWNSTREAM_ROUTING_POLICY,
+      excludeChannelIds: [11],
+      retryCount: 1,
+    });
+
+    expect(result).toBe(selected);
+    expect(selectPreferredChannelMock).toHaveBeenCalledWith(
+      'gpt-5.2',
+      11,
+      EMPTY_DOWNSTREAM_ROUTING_POLICY,
+      [],
+    );
+    expect(selectNextChannelMock).not.toHaveBeenCalled();
+    expect(refreshModelsAndRebuildRoutesMock).not.toHaveBeenCalled();
+  });
+
+  it('falls back to backup channels when the same-channel retry is unavailable', async () => {
+    const selected = { channel: { id: 22 } };
+    selectPreferredChannelMock.mockResolvedValueOnce(null);
     selectNextChannelMock.mockResolvedValueOnce(selected);
 
     const { selectSurfaceChannelForAttempt } = await import('./sharedSurface.js');
@@ -176,7 +222,12 @@ describe('selectSurfaceChannelForAttempt', () => {
     });
 
     expect(result).toBe(selected);
-    expect(selectChannelMock).not.toHaveBeenCalled();
+    expect(selectPreferredChannelMock).toHaveBeenCalledWith(
+      'gpt-5.2',
+      11,
+      EMPTY_DOWNSTREAM_ROUTING_POLICY,
+      [],
+    );
     expect(selectNextChannelMock).toHaveBeenCalledWith(
       'gpt-5.2',
       [11],
@@ -494,6 +545,7 @@ describe('selectSurfaceChannelForAttempt', () => {
       status: 429,
       errorText: '{"error":"quota exceeded"}',
       modelName: 'upstream-model',
+      retryCount: 0,
     });
     expect(recordOauthQuotaResetHintMock).toHaveBeenCalledWith({
       accountId: 33,
@@ -698,6 +750,7 @@ describe('selectSurfaceChannelForAttempt', () => {
       status: 500,
       errorText: 'upstream failure',
       modelName: 'upstream-model',
+      retryCount: 2,
     });
     expect(reportProxyAllFailedMock).toHaveBeenCalledWith({
       model: 'gpt-5.2',
@@ -747,6 +800,7 @@ describe('selectSurfaceChannelForAttempt', () => {
     expect(recordFailureMock).toHaveBeenCalledWith(11, {
       errorText: 'socket hang up',
       modelName: 'upstream-model',
+      retryCount: 2,
     });
     expect(reportProxyAllFailedMock).toHaveBeenCalledWith({
       model: 'gpt-5.2',
@@ -785,6 +839,7 @@ describe('selectSurfaceChannelForAttempt', () => {
     expect(recordFailureMock).toHaveBeenCalledWith(11, {
       errorText: 'stream exploded',
       modelName: 'upstream-model',
+      retryCount: 1,
     });
   });
 
@@ -986,7 +1041,9 @@ describe('selectSurfaceChannelForAttempt', () => {
         usageSource: 'self-log',
       },
     });
-    expect(recordSuccessMock).toHaveBeenCalledWith(11, 250, 0.42, 'upstream-model');
+    expect(recordSuccessMock).toHaveBeenCalledWith(11, 250, 0.42, 'upstream-model', undefined, 20, {
+      retryCount: 1,
+    });
     expect(recordDownstreamCost).toHaveBeenCalledWith(0.42);
     expect(logSuccess).toHaveBeenCalledWith({
       selected: {
@@ -1169,7 +1226,9 @@ describe('selectSurfaceChannelForAttempt', () => {
       '[proxy/chat] failed to record success metrics',
       expect.any(Error),
     );
-    expect(recordSuccessMock).toHaveBeenCalledWith(11, 250, 0, 'upstream-model');
+    expect(recordSuccessMock).toHaveBeenCalledWith(11, 250, 0, 'upstream-model', undefined, 10, {
+      retryCount: 1,
+    });
     expect(recordDownstreamCost).toHaveBeenCalledWith(0);
     expect(logSuccess).toHaveBeenCalledWith(expect.objectContaining({
       promptTokens: 10,

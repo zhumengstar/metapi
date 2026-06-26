@@ -153,6 +153,9 @@ describe('TokenRouter selection scoring', () => {
       'gpt-5.5-group-pricing',
       'gpt-5.5-input-cost',
       'gpt-5.5-input-stats',
+      'gpt-5.5-manual-cache',
+      'gpt-5.5-manual-primary',
+      'gpt-5.5-retry-sticky',
       'gpt-5.5-slightly-cheaper',
       'claude-4-sonnet',
       'claude-haiku-4-5-20251001',
@@ -1875,10 +1878,183 @@ describe('TokenRouter selection scoring', () => {
     expect(second?.channel.id).toBe(channelA.id);
     expect(third?.channel.id).toBe(channelA.id);
     expect(fourth?.channel.id).toBe(channelA.id);
-    expect(decision.summary.join(' ')).toContain('稳定成功 50 次再重新评估低价');
+    expect(decision.summary.join(' ')).toContain('命中后持续使用');
   });
 
-  it('stable_first immediately switches sticky traffic to a lower-cost channel', async () => {
+  it('stable_first does not let retry fallback successes replace the sticky primary channel', async () => {
+    config.routingWeights = {
+      baseWeightFactor: 1,
+      valueScoreFactor: 0,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+    };
+
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.5-retry-sticky',
+      routingStrategy: 'stable_first',
+      enabled: true,
+    }).returning().get();
+
+    const primarySite = await createSite('twskyhope');
+    const primaryAccount = await createAccount(primarySite.id, 'twskyhope-user');
+    const primaryToken = await createToken(primaryAccount.id, 'twskyhope-token', { tokenGroup: 'low-cost-0.045x' });
+    const primaryChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: primaryAccount.id,
+      tokenId: primaryToken.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+
+    const fallbackSite = await createSite('xiaobaishu');
+    const fallbackAccount = await createAccount(fallbackSite.id, 'xiaobaishu-user');
+    const fallbackToken = await createToken(fallbackAccount.id, 'xiaobaishu-token', { tokenGroup: 'fallback-1x' });
+    const fallbackChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: fallbackAccount.id,
+      tokenId: fallbackToken.id,
+      priority: 1,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+
+    await db.insert(schema.tokenGroupPricing).values([
+      {
+        siteId: primarySite.id,
+        accountId: primaryAccount.id,
+        sourceKey: `account:${primaryAccount.id}`,
+        group: 'low-cost-0.045x',
+        groupName: 'low-cost-0.045x',
+        ratio: 0.045,
+        source: 'upstream',
+        pricingAvailable: true,
+        modelCount: 1,
+      },
+      {
+        siteId: fallbackSite.id,
+        accountId: fallbackAccount.id,
+        sourceKey: `account:${fallbackAccount.id}`,
+        group: 'fallback-1x',
+        groupName: 'fallback-1x',
+        ratio: 1,
+        source: 'upstream',
+        pricingAvailable: true,
+        modelCount: 1,
+      },
+    ]).run();
+
+    const router = new TokenRouter();
+    expect((await router.selectChannel('gpt-5.5-retry-sticky'))?.channel.id).toBe(primaryChannel.id);
+
+    for (let index = 0; index < 60; index += 1) {
+      await router.recordSuccess(fallbackChannel.id, 300, 1, 'gpt-5.5-retry-sticky', undefined, 0, {
+        retryCount: 2,
+      });
+    }
+
+    expect((await router.selectChannel('gpt-5.5-retry-sticky'))?.channel.id).toBe(primaryChannel.id);
+    expect((await router.explainSelection('gpt-5.5-retry-sticky')).selectedChannelId).toBe(primaryChannel.id);
+  });
+
+  it('stable_first does not let retry fallback selection replace the sticky primary channel', async () => {
+    config.routingWeights = {
+      baseWeightFactor: 1,
+      valueScoreFactor: 0,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+    };
+
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.5-retry-sticky',
+      routingStrategy: 'stable_first',
+      enabled: true,
+    }).returning().get();
+
+    const primarySite = await createSite('retry-selection-primary');
+    const primaryAccount = await createAccount(primarySite.id, 'retry-selection-primary-user');
+    const primaryToken = await createToken(primaryAccount.id, 'retry-selection-primary-token', { tokenGroup: 'primary-0.045x' });
+    const primaryChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: primaryAccount.id,
+      tokenId: primaryToken.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+
+    const fallbackSite = await createSite('retry-selection-fallback');
+    const fallbackAccount = await createAccount(fallbackSite.id, 'retry-selection-fallback-user');
+    const fallbackToken = await createToken(fallbackAccount.id, 'retry-selection-fallback-token', { tokenGroup: 'fallback-1x' });
+    const fallbackChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: fallbackAccount.id,
+      tokenId: fallbackToken.id,
+      priority: 1,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+
+    const router = new TokenRouter();
+    expect((await router.selectChannel('gpt-5.5-retry-sticky'))?.channel.id).toBe(primaryChannel.id);
+    expect((await router.selectNextChannel('gpt-5.5-retry-sticky', [primaryChannel.id]))?.channel.id).toBe(fallbackChannel.id);
+    expect((await router.selectChannel('gpt-5.5-retry-sticky'))?.channel.id).toBe(primaryChannel.id);
+
+    const stickyState = tokenRouterTestUtils.getStableFirstStickyChannelForKey(`${route.id}:gpt-5.5-retry-sticky`);
+    expect(stickyState).toMatchObject({
+      channelId: primaryChannel.id,
+    });
+  });
+
+  it('stable_first keeps a manually pinned primary channel ahead of another preferred channel', async () => {
+    config.routingWeights = {
+      baseWeightFactor: 1,
+      valueScoreFactor: 0,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+    };
+
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.5-manual-primary',
+      routingStrategy: 'stable_first',
+      enabled: true,
+    }).returning().get();
+
+    const manualSite = await createSite('manual-preferred-primary');
+    const manualAccount = await createAccount(manualSite.id, 'manual-preferred-primary-user');
+    const manualToken = await createToken(manualAccount.id, 'manual-preferred-primary-token');
+    const manualChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: manualAccount.id,
+      tokenId: manualToken.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+
+    const otherSite = await createSite('manual-preferred-other');
+    const otherAccount = await createAccount(otherSite.id, 'manual-preferred-other-user');
+    const otherToken = await createToken(otherAccount.id, 'manual-preferred-other-token');
+    const otherChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: otherAccount.id,
+      tokenId: otherToken.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+
+    const router = new TokenRouter();
+    await router.pinStableFirstChannel(manualChannel.id, 'gpt-5.5-manual-primary');
+
+    await expect(router.selectPreferredChannel('gpt-5.5-manual-primary', otherChannel.id)).resolves.toBeNull();
+    await expect(router.selectChannel('gpt-5.5-manual-primary')).resolves.toMatchObject({ channel: { id: manualChannel.id } });
+  });
+
+  it('stable_first keeps sticky traffic on the current channel before the low-cost switch protection is satisfied', async () => {
     config.routingWeights = {
       baseWeightFactor: 1,
       valueScoreFactor: 0,
@@ -1960,17 +2136,302 @@ describe('TokenRouter selection scoring', () => {
     const decision = await router.explainSelection('gpt-5.5-input-cost');
 
     const stickyState = tokenRouterTestUtils.getStableFirstStickyChannelForKey(`${route.id}:gpt-5.5-input-cost`);
-    expect(selected?.channel.id).toBe(lowCostChannel.id);
-    expect(decision.selectedChannelId).toBe(lowCostChannel.id);
+    expect(selected?.channel.id).toBe(oldChannel.id);
+    expect(decision.selectedChannelId).toBe(oldChannel.id);
     expect(stickyState).toMatchObject({
-      channelId: lowCostChannel.id,
-      mode: 'low_cost_trial',
-      successThreshold: 100,
+      channelId: oldChannel.id,
+      mode: 'normal',
     });
-    expect(decision.summary.join(' ')).toContain('优先试跑 100 次');
+    expect(decision.summary.join(' ')).toContain('低价优先，命中后持续使用');
   });
 
-  it('stable_first tries a slightly lower-cost channel even before sticky reevaluation', async () => {
+  it('stable_first keeps a manually pinned primary channel until it reaches the failure threshold', async () => {
+    config.routingWeights = {
+      baseWeightFactor: 1,
+      valueScoreFactor: 0,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+    };
+
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.5-input-cost',
+      routingStrategy: 'stable_first',
+      enabled: true,
+    }).returning().get();
+
+    const manualSite = await createSite('manual-primary');
+    const manualAccount = await createAccount(manualSite.id, 'manual-primary-user');
+    const manualToken = await createToken(manualAccount.id, 'manual-primary-token', { tokenGroup: 'manual-1x' });
+    const manualChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: manualAccount.id,
+      tokenId: manualToken.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+      successCount: 10,
+      failCount: 0,
+      totalInputTokens: 1_000_000,
+      totalCost: 1,
+    }).returning().get();
+
+    const lowCostSite = await createSite('manual-low-cost');
+    const lowCostAccount = await createAccount(lowCostSite.id, 'manual-low-cost-user');
+    const lowCostToken = await createToken(lowCostAccount.id, 'manual-low-cost-token', { tokenGroup: 'low-cost-0.045x' });
+    const lowCostChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: lowCostAccount.id,
+      tokenId: lowCostToken.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+      successCount: 10,
+      failCount: 0,
+      totalInputTokens: 1_000_000,
+      totalCost: 0.045,
+    }).returning().get();
+
+    await db.insert(schema.tokenGroupPricing).values([
+      {
+        siteId: manualSite.id,
+        accountId: manualAccount.id,
+        sourceKey: `account:${manualAccount.id}`,
+        group: 'manual-1x',
+        groupName: 'manual-1x',
+        ratio: 1,
+        source: 'upstream',
+        pricingAvailable: true,
+        modelCount: 1,
+      },
+      {
+        siteId: lowCostSite.id,
+        accountId: lowCostAccount.id,
+        sourceKey: `account:${lowCostAccount.id}`,
+        group: 'low-cost-0.045x',
+        groupName: 'low-cost-0.045x',
+        ratio: 0.045,
+        source: 'upstream',
+        pricingAvailable: true,
+        modelCount: 1,
+      },
+    ]).run();
+
+    const router = new TokenRouter();
+    const pinResult = await router.pinStableFirstChannel(manualChannel.id, 'gpt-5.5-input-cost');
+    const selected = await router.selectChannel('gpt-5.5-input-cost');
+    const decision = await router.explainSelection('gpt-5.5-input-cost');
+    const stickyState = tokenRouterTestUtils.getStableFirstStickyChannelForKey(`${route.id}:gpt-5.5-input-cost`);
+
+    expect(pinResult?.channelId).toBe(manualChannel.id);
+    expect(selected?.channel.id).toBe(manualChannel.id);
+    expect(decision.selectedChannelId).toBe(manualChannel.id);
+    expect(stickyState).toMatchObject({
+      channelId: manualChannel.id,
+      mode: 'manual',
+    });
+    expect((decision.candidates.find((candidate) => candidate.channelId === lowCostChannel.id)?.probability || 0)).toBeGreaterThan(0);
+    expect(decision.candidates.find((candidate) => candidate.channelId === manualChannel.id)?.reason || '').toContain('手动主通道');
+  });
+
+  it('stable_first keeps a manually pinned primary channel after route cache invalidation', async () => {
+    config.routingWeights = {
+      baseWeightFactor: 1,
+      valueScoreFactor: 0,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+    };
+
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.5-manual-cache',
+      routingStrategy: 'stable_first',
+      enabled: true,
+    }).returning().get();
+
+    const manualSite = await createSite('manual-cache-primary');
+    const manualAccount = await createAccount(manualSite.id, 'manual-cache-primary-user');
+    const manualToken = await createToken(manualAccount.id, 'manual-cache-primary-token', { tokenGroup: 'manual-1x' });
+    const manualChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: manualAccount.id,
+      tokenId: manualToken.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+      successCount: 1,
+      failCount: 0,
+    }).returning().get();
+
+    const lowCostSite = await createSite('manual-cache-low-cost');
+    const lowCostAccount = await createAccount(lowCostSite.id, 'manual-cache-low-cost-user');
+    const lowCostToken = await createToken(lowCostAccount.id, 'manual-cache-low-cost-token', { tokenGroup: 'low-cost-0.045x' });
+    await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: lowCostAccount.id,
+      tokenId: lowCostToken.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+      successCount: 100,
+      failCount: 0,
+    }).returning().get();
+
+    const router = new TokenRouter();
+    const pinResult = await router.pinStableFirstChannel(manualChannel.id, 'gpt-5.5-manual-cache');
+    invalidateTokenRouterCache();
+
+    const selected = await router.selectChannel('gpt-5.5-manual-cache');
+    const decision = await router.explainSelection('gpt-5.5-manual-cache');
+    const stickyState = tokenRouterTestUtils.getStableFirstStickyChannelForKey(`${route.id}:gpt-5.5-manual-cache`);
+
+    expect(pinResult?.channelId).toBe(manualChannel.id);
+    expect(selected?.channel.id).toBe(manualChannel.id);
+    expect(decision.selectedChannelId).toBe(manualChannel.id);
+    expect(stickyState).toMatchObject({
+      channelId: manualChannel.id,
+      mode: 'manual',
+    });
+  });
+
+  it('stable_first clears existing session sticky bindings when a channel is manually pinned primary', async () => {
+    config.routingWeights = {
+      baseWeightFactor: 1,
+      valueScoreFactor: 0,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+    };
+
+    const originalStickyEnabled = config.proxyStickySessionEnabled;
+    config.proxyStickySessionEnabled = true;
+    try {
+      const route = await db.insert(schema.tokenRoutes).values({
+        modelPattern: 'gpt-5.5-manual-primary',
+        routingStrategy: 'stable_first',
+        enabled: true,
+      }).returning().get();
+
+      const oldSite = await createSite('manual-sticky-old');
+      const oldAccount = await createAccount(oldSite.id, 'manual-sticky-old-user');
+      const oldToken = await createToken(oldAccount.id, 'manual-sticky-old-token', { tokenGroup: 'old-1x' });
+      const oldChannel = await db.insert(schema.routeChannels).values({
+        routeId: route.id,
+        accountId: oldAccount.id,
+        tokenId: oldToken.id,
+        priority: 0,
+        weight: 10,
+        enabled: true,
+      }).returning().get();
+
+      const manualSite = await createSite('manual-sticky-new');
+      const manualAccount = await createAccount(manualSite.id, 'manual-sticky-new-user');
+      const manualToken = await createToken(manualAccount.id, 'manual-sticky-new-token', { tokenGroup: 'manual-0.045x' });
+      const manualChannel = await db.insert(schema.routeChannels).values({
+        routeId: route.id,
+        accountId: manualAccount.id,
+        tokenId: manualToken.id,
+        priority: 0,
+        weight: 10,
+        enabled: true,
+      }).returning().get();
+
+      const stickyKey = proxyChannelCoordinator.buildStickySessionKey({
+        clientKind: 'codex',
+        sessionId: 'turn-manual-primary',
+        requestedModel: 'gpt-5.5-manual-primary',
+        downstreamPath: '/v1/responses',
+        downstreamApiKeyId: 9,
+      });
+      proxyChannelCoordinator.bindStickyChannel(stickyKey, oldChannel.id, JSON.stringify({ credentialMode: 'session' }));
+      expect(proxyChannelCoordinator.getStickyChannelId(stickyKey)).toBe(oldChannel.id);
+
+      const router = new TokenRouter();
+      const pinResult = await router.pinStableFirstChannel(manualChannel.id, 'gpt-5.5-manual-primary');
+      const selected = await router.selectChannel('gpt-5.5-manual-primary');
+
+      expect(pinResult?.channelId).toBe(manualChannel.id);
+      expect(pinResult?.clearedStickyBindings).toBe(1);
+      expect(proxyChannelCoordinator.getStickyChannelId(stickyKey)).toBeNull();
+      expect(selected?.channel.id).toBe(manualChannel.id);
+    } finally {
+      config.proxyStickySessionEnabled = originalStickyEnabled;
+    }
+  });
+
+  it('stable_first clears sticky bindings for model aliases when a channel is manually pinned primary', async () => {
+    config.routingWeights = {
+      baseWeightFactor: 1,
+      valueScoreFactor: 0,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+    };
+
+    const originalStickyEnabled = config.proxyStickySessionEnabled;
+    config.proxyStickySessionEnabled = true;
+    try {
+      const route = await db.insert(schema.tokenRoutes).values({
+        modelPattern: 'gpt-5.5',
+        routingStrategy: 'stable_first',
+        enabled: true,
+      }).returning().get();
+
+      const oldSite = await createSite('manual-alias-old');
+      const oldAccount = await createAccount(oldSite.id, 'manual-alias-old-user');
+      const oldToken = await createToken(oldAccount.id, 'manual-alias-old-token', { tokenGroup: 'old-1x' });
+      const oldChannel = await db.insert(schema.routeChannels).values({
+        routeId: route.id,
+        accountId: oldAccount.id,
+        tokenId: oldToken.id,
+        priority: 0,
+        weight: 10,
+        enabled: true,
+      }).returning().get();
+
+      const manualSite = await createSite('manual-alias-new');
+      const manualAccount = await createAccount(manualSite.id, 'manual-alias-new-user');
+      const manualToken = await createToken(manualAccount.id, 'manual-alias-new-token', { tokenGroup: 'manual-0.045x' });
+      const manualChannel = await db.insert(schema.routeChannels).values({
+        routeId: route.id,
+        accountId: manualAccount.id,
+        tokenId: manualToken.id,
+        priority: 0,
+        weight: 10,
+        enabled: true,
+      }).returning().get();
+
+      const exactStickyKey = proxyChannelCoordinator.buildStickySessionKey({
+        clientKind: 'codex',
+        sessionId: 'turn-manual-alias-exact',
+        requestedModel: 'gpt-5.5',
+        downstreamPath: '/v1/responses',
+        downstreamApiKeyId: 9,
+      });
+      const aliasStickyKey = proxyChannelCoordinator.buildStickySessionKey({
+        clientKind: 'codex',
+        sessionId: 'turn-manual-alias-openai',
+        requestedModel: 'openai/gpt-5.5',
+        downstreamPath: '/v1/responses',
+        downstreamApiKeyId: 9,
+      });
+      proxyChannelCoordinator.bindStickyChannel(exactStickyKey, oldChannel.id, JSON.stringify({ credentialMode: 'session' }));
+      proxyChannelCoordinator.bindStickyChannel(aliasStickyKey, oldChannel.id, JSON.stringify({ credentialMode: 'session' }));
+      expect(proxyChannelCoordinator.getStickyChannelId(exactStickyKey)).toBe(oldChannel.id);
+      expect(proxyChannelCoordinator.getStickyChannelId(aliasStickyKey)).toBe(oldChannel.id);
+
+      const router = new TokenRouter();
+      const pinResult = await router.pinStableFirstChannel(manualChannel.id, 'openai/gpt-5.5');
+      expect(pinResult?.channelId).toBe(manualChannel.id);
+      expect(pinResult?.clearedStickyBindings).toBe(2);
+      expect(proxyChannelCoordinator.getStickyChannelId(exactStickyKey)).toBeNull();
+      expect(proxyChannelCoordinator.getStickyChannelId(aliasStickyKey)).toBeNull();
+    } finally {
+      config.proxyStickySessionEnabled = originalStickyEnabled;
+    }
+  });
+
+  it('stable_first does not switch sticky traffic for a slightly lower-cost channel', async () => {
     config.routingWeights = {
       baseWeightFactor: 1,
       valueScoreFactor: 0,
@@ -2051,15 +2512,14 @@ describe('TokenRouter selection scoring', () => {
     const selected = await router.selectChannel('gpt-5.5-slightly-cheaper');
     const stickyState = tokenRouterTestUtils.getStableFirstStickyChannelForKey(`${route.id}:gpt-5.5-slightly-cheaper`);
 
-    expect(selected?.channel.id).toBe(lowCostChannel.id);
+    expect(selected?.channel.id).toBe(oldChannel.id);
     expect(stickyState).toMatchObject({
-      channelId: lowCostChannel.id,
-      mode: 'low_cost_trial',
-      successThreshold: 100,
+      channelId: oldChannel.id,
+      mode: 'normal',
     });
   });
 
-  it('stable_first switches after five consecutive failures and immediately returns to recovered lower cost', async () => {
+  it('stable_first switches after five consecutive failures and keeps the fallback sticky until it stabilizes', async () => {
     config.routingWeights = {
       baseWeightFactor: 1,
       valueScoreFactor: 0,
@@ -2144,18 +2604,238 @@ describe('TokenRouter selection scoring', () => {
     expect((await router.selectChannel('gpt-5.4-sticky-failover'))?.channel.id).toBe(fallbackChannel.id);
 
     await router.recordProbeSuccess(cheapChannel.id, 320, 'gpt-5.4-sticky-failover');
-    expect((await router.selectChannel('gpt-5.4-sticky-failover'))?.channel.id).toBe(cheapChannel.id);
+    expect((await router.selectChannel('gpt-5.4-sticky-failover'))?.channel.id).toBe(fallbackChannel.id);
 
-    for (let index = 0; index < 49; index += 1) {
+    for (let index = 0; index < 99; index += 1) {
       await router.recordSuccess(fallbackChannel.id, 300, 1, 'gpt-5.4-sticky-failover');
     }
-    expect((await router.selectChannel('gpt-5.4-sticky-failover'))?.channel.id).toBe(cheapChannel.id);
+    expect((await router.selectChannel('gpt-5.4-sticky-failover'))?.channel.id).toBe(fallbackChannel.id);
 
     await router.recordSuccess(fallbackChannel.id, 300, 1, 'gpt-5.4-sticky-failover');
     const decision = await router.explainSelection('gpt-5.4-sticky-failover');
 
-    expect(decision.selectedChannelId).toBe(cheapChannel.id);
-    expect(decision.summary.join(' ')).toContain('优先试跑 100 次');
+    expect(decision.selectedChannelId).toBe(fallbackChannel.id);
+    expect(decision.summary.join(' ')).toContain('低价优先，命中后持续使用');
+  });
+
+  it('stable_first allows a significantly lower-cost stable channel to take over after the sticky protection window', async () => {
+    config.routingWeights = {
+      baseWeightFactor: 1,
+      valueScoreFactor: 0,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+    };
+
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.5-input-cost',
+      routingStrategy: 'stable_first',
+      enabled: true,
+    }).returning().get();
+
+    const currentSite = await createSite('sticky-stable-current');
+    const currentAccount = await createAccount(currentSite.id, 'sticky-stable-current-user');
+    const currentToken = await createToken(currentAccount.id, 'sticky-stable-current-token', { tokenGroup: 'current-1x' });
+    const currentChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: currentAccount.id,
+      tokenId: currentToken.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+      successCount: 120,
+      failCount: 0,
+      totalInputTokens: 1_000_000,
+      totalCost: 1,
+    }).returning().get();
+
+    const lowerCostSite = await createSite('sticky-stable-low');
+    const lowerCostAccount = await createAccount(lowerCostSite.id, 'sticky-stable-low-user');
+    const lowerCostToken = await createToken(lowerCostAccount.id, 'sticky-stable-low-token', { tokenGroup: 'stable-low-0.25x' });
+    const lowerCostChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: lowerCostAccount.id,
+      tokenId: lowerCostToken.id,
+      priority: 1,
+      weight: 10,
+      enabled: true,
+      successCount: 10,
+      failCount: 0,
+      totalInputTokens: 1_000_000,
+      totalCost: 0.25,
+    }).returning().get();
+
+    await db.insert(schema.tokenGroupPricing).values([
+      {
+        siteId: currentSite.id,
+        accountId: currentAccount.id,
+        sourceKey: `account:${currentAccount.id}`,
+        group: 'current-1x',
+        groupName: 'current-1x',
+        ratio: 1,
+        source: 'upstream',
+        pricingAvailable: true,
+        modelCount: 1,
+      },
+      {
+        siteId: lowerCostSite.id,
+        accountId: lowerCostAccount.id,
+        sourceKey: `account:${lowerCostAccount.id}`,
+        group: 'stable-low-0.25x',
+        groupName: 'stable-low-0.25x',
+        ratio: 0.25,
+        source: 'upstream',
+        pricingAvailable: true,
+        modelCount: 1,
+      },
+    ]).run();
+
+    tokenRouterTestUtils.rememberStableFirstStickyChannelForKey(
+      `${route.id}:gpt-5.5-input-cost`,
+      currentChannel.id,
+    );
+
+    const router = new TokenRouter();
+    const selected = await router.selectChannel('gpt-5.5-input-cost');
+    const stickyState = tokenRouterTestUtils.getStableFirstStickyChannelForKey(`${route.id}:gpt-5.5-input-cost`);
+
+    expect(selected?.channel.id).toBe(lowerCostChannel.id);
+    expect(stickyState).toMatchObject({
+      channelId: lowerCostChannel.id,
+      mode: 'normal',
+    });
+  });
+
+  it('stable_first counts a failure only after the same-channel retry also fails', async () => {
+    config.routingWeights = {
+      baseWeightFactor: 1,
+      valueScoreFactor: 0,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+    };
+
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.4-sticky-failover',
+      routingStrategy: 'stable_first',
+      enabled: true,
+    }).returning().get();
+
+    const cheapSite = await createSite('first-attempt-cheap');
+    const cheapAccount = await createAccount(cheapSite.id, 'first-attempt-user-cheap');
+    const cheapToken = await createToken(cheapAccount.id, 'first-attempt-token-cheap', { tokenGroup: 'cheap-0.25x' });
+    const cheapChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: cheapAccount.id,
+      tokenId: cheapToken.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+      failCount: 0,
+    }).returning().get();
+
+    const fallbackSite = await createSite('first-attempt-fallback');
+    const fallbackAccount = await createAccount(fallbackSite.id, 'first-attempt-user-fallback');
+    const fallbackToken = await createToken(fallbackAccount.id, 'first-attempt-token-fallback', { tokenGroup: 'fallback-1x' });
+    const fallbackChannel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: fallbackAccount.id,
+      tokenId: fallbackToken.id,
+      priority: 1,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+
+    await db.insert(schema.tokenGroupPricing).values([
+      {
+        siteId: cheapSite.id,
+        accountId: cheapAccount.id,
+        sourceKey: `account:${cheapAccount.id}`,
+        group: 'cheap-0.25x',
+        groupName: 'cheap-0.25x',
+        ratio: 0.25,
+        source: 'upstream',
+        pricingAvailable: true,
+        modelCount: 1,
+      },
+      {
+        siteId: fallbackSite.id,
+        accountId: fallbackAccount.id,
+        sourceKey: `account:${fallbackAccount.id}`,
+        group: 'fallback-1x',
+        groupName: 'fallback-1x',
+        ratio: 1,
+        source: 'upstream',
+        pricingAvailable: true,
+        modelCount: 1,
+      },
+    ]).run();
+
+    const router = new TokenRouter();
+    expect((await router.selectChannel('gpt-5.4-sticky-failover'))?.channel.id).toBe(cheapChannel.id);
+
+    for (let index = 0; index < 4; index += 1) {
+      await router.recordFailure(cheapChannel.id, {
+        status: 500,
+        errorText: 'first attempt failed',
+        modelName: 'gpt-5.4-sticky-failover',
+        retryCount: 0,
+      });
+      let afterFirstAttemptFailure = await db.select()
+        .from(schema.routeChannels)
+        .where(eq(schema.routeChannels.id, cheapChannel.id))
+        .get();
+      expect(afterFirstAttemptFailure?.consecutiveFailCount).toBe(index);
+
+      await router.recordFailure(cheapChannel.id, {
+        status: 500,
+        errorText: 'same channel retry failed',
+        modelName: 'gpt-5.4-sticky-failover',
+        retryCount: 1,
+      });
+      afterFirstAttemptFailure = await db.select()
+        .from(schema.routeChannels)
+        .where(eq(schema.routeChannels.id, cheapChannel.id))
+        .get();
+      expect(afterFirstAttemptFailure?.consecutiveFailCount).toBe(index + 1);
+    }
+
+    const afterRetryFailure = await db.select()
+      .from(schema.routeChannels)
+      .where(eq(schema.routeChannels.id, cheapChannel.id))
+      .get();
+    expect(afterRetryFailure?.consecutiveFailCount).toBe(4);
+    expect(afterRetryFailure?.cooldownUntil).toBeNull();
+    expect((await router.selectChannel('gpt-5.4-sticky-failover'))?.channel.id).toBe(cheapChannel.id);
+
+    await router.recordFailure(cheapChannel.id, {
+      status: 500,
+      errorText: 'fifth first attempt failed',
+      modelName: 'gpt-5.4-sticky-failover',
+      retryCount: 0,
+    });
+    const afterFifthFirstAttemptOnly = await db.select()
+      .from(schema.routeChannels)
+      .where(eq(schema.routeChannels.id, cheapChannel.id))
+      .get();
+    expect(afterFifthFirstAttemptOnly?.consecutiveFailCount).toBe(4);
+    expect(afterFifthFirstAttemptOnly?.cooldownUntil).toBeNull();
+    expect((await router.selectChannel('gpt-5.4-sticky-failover'))?.channel.id).toBe(cheapChannel.id);
+
+    await router.recordFailure(cheapChannel.id, {
+      status: 500,
+      errorText: 'fifth same channel retry failed',
+      modelName: 'gpt-5.4-sticky-failover',
+      retryCount: 1,
+    });
+
+    const afterFifthRetryFailure = await db.select()
+      .from(schema.routeChannels)
+      .where(eq(schema.routeChannels.id, cheapChannel.id))
+      .get();
+    expect(afterFifthRetryFailure?.consecutiveFailCount).toBe(0);
+    expect(afterFifthRetryFailure?.cooldownUntil).toEqual(expect.any(String));
+    expect((await router.selectChannel('gpt-5.4-sticky-failover'))?.channel.id).toBe(fallbackChannel.id);
   });
 
   it('caps the stable_first rotation cache size', () => {

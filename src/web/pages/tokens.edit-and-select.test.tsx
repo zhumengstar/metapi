@@ -17,6 +17,8 @@ const { apiMock } = vi.hoisted(() => ({
     getAccountTokenGroups: vi.fn(),
     syncAccountTokens: vi.fn(),
     updateAccountToken: vi.fn(),
+    getAccountTokenUiSettings: vi.fn(),
+    updateAccountTokenUiSettings: vi.fn(),
   },
 }));
 
@@ -85,6 +87,8 @@ describe('Tokens edit modal and row selection', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     installAccountsSnapshotCompat(apiMock);
+    apiMock.getAccountTokenUiSettings.mockResolvedValue({ maxGroupRatioFilter: '' });
+    apiMock.updateAccountTokenUiSettings.mockImplementation(async (data: any) => ({ maxGroupRatioFilter: data?.maxGroupRatioFilter || '' }));
     Object.defineProperty(globalThis, 'navigator', {
       value: {
         clipboard: {
@@ -116,6 +120,7 @@ describe('Tokens edit modal and row selection', () => {
         valueStatus: 'ready',
         enabled: true,
         isDefault: false,
+        tokenGroup: 'default',
         updatedAt: '2026-03-07 10:00:00',
         accountId: 1,
         account: { username: 'session-user' },
@@ -207,21 +212,11 @@ describe('Tokens edit modal and row selection', () => {
         return collectText(node).includes('focus-token');
       })[0];
       expect(tokenRow).toBeTruthy();
-      expect(collectText(root.root)).toContain('已选 1 项');
+      expect(collectText(root.root)).toContain('未选择令牌');
 
+      const checkbox = root.root.find((node) => node.props['data-testid'] === 'token-select-22');
       await act(async () => {
-        tokenRow.props.onClick({
-          target: { closest: () => null },
-        });
-      });
-      await flushMicrotasks();
-
-      expect(collectText(root.root)).not.toContain('已选 1 项');
-
-      await act(async () => {
-        tokenRow.props.onClick({
-          target: { closest: () => null },
-        });
+        checkbox.props.onChange({ target: { checked: true } });
       });
       await flushMicrotasks();
 

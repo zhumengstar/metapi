@@ -28,6 +28,7 @@ function buildChannel(overrides: Partial<RouteChannel> = {}): RouteChannel {
     site: {
       id: 99,
       name: 'codelab',
+      url: 'https://codelab.example.com',
       platform: 'openai',
     },
     token: null,
@@ -36,6 +37,50 @@ function buildChannel(overrides: Partial<RouteChannel> = {}): RouteChannel {
 }
 
 describe('SortableChannelRow layering', () => {
+  it('renders channel site badge as an external link when site url is available', () => {
+    const channel = buildChannel({
+      site: {
+        id: 99,
+        name: 'codelab',
+        url: 'https://codelab.example.com',
+        platform: 'openai',
+      },
+    });
+    const root = create(
+      <DndContext>
+        <SortableContext items={[channel.id]} strategy={verticalListSortingStrategy}>
+          <SortableChannelRow
+            channel={channel}
+            decisionCandidate={undefined}
+            isExactRoute
+            loadingDecision={false}
+            isSavingPriority={false}
+            tokenOptions={[
+              {
+                id: 501,
+                name: 'shared-token',
+                isDefault: true,
+              },
+            ]}
+            activeTokenId={0}
+            isUpdatingToken={false}
+            onTokenDraftChange={vi.fn()}
+            onSaveToken={vi.fn()}
+            onDeleteChannel={vi.fn()}
+            onToggleEnabled={vi.fn()}
+            onSiteBlockModel={vi.fn()}
+          />
+        </SortableContext>
+      </DndContext>,
+    );
+
+    const link = root.root.find((node) => node.type === 'a' && node.props.href === 'https://codelab.example.com/');
+    expect(link.props.target).toBe('_blank');
+    expect(link.props.rel).toBe('noopener noreferrer');
+    expect(String(link.props.className || '')).toContain('badge-link');
+    expect(link.children.some((child) => typeof child !== 'string' && child.children.includes('codelab'))).toBe(true);
+  });
+
   it('does not force a base z-index on desktop rows when they are not being dragged', () => {
     const channel = buildChannel();
     const root = create(

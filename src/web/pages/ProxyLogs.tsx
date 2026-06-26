@@ -351,7 +351,12 @@ function formatBillingFormulaLine(
 function formatBillingDetailSummary(log: ProxyLogRenderItem) {
   const detail = log.billingDetails;
   if (!detail) return null;
-  return `模型倍率 ${formatCompactNumber(toFiniteNumber(detail.pricing?.modelRatio))}，输出倍率 ${formatCompactNumber(toFiniteNumber(detail.pricing?.completionRatio))}，缓存倍率 ${formatCompactNumber(toFiniteNumber(detail.pricing?.cacheRatio))}，缓存创建倍率 ${formatCompactNumber(toFiniteNumber(detail.pricing?.cacheCreationRatio))}，分组倍率 ${formatCompactNumber(toFiniteNumber(detail.pricing?.groupRatio))}`;
+  const currentGroupRatio = formatCompactNumber(toFiniteNumber(log.tokenGroupRatio));
+  const billedGroupRatio = formatCompactNumber(toFiniteNumber(detail.pricing?.groupRatio));
+  const groupRatioText = currentGroupRatio === billedGroupRatio
+    ? `分组倍率 ${currentGroupRatio}`
+    : `分组倍率 当前 ${currentGroupRatio}，请求时 ${billedGroupRatio}`;
+  return `模型倍率 ${formatCompactNumber(toFiniteNumber(detail.pricing?.modelRatio))}，输出倍率 ${formatCompactNumber(toFiniteNumber(detail.pricing?.completionRatio))}，缓存倍率 ${formatCompactNumber(toFiniteNumber(detail.pricing?.cacheRatio))}，缓存创建倍率 ${formatCompactNumber(toFiniteNumber(detail.pricing?.cacheCreationRatio))}，${groupRatioText}`;
 }
 
 function formatProxyLogUsageSource(

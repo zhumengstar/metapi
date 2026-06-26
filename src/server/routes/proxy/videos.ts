@@ -159,7 +159,7 @@ export async function videosProxyRoute(app: FastifyInstance) {
           totalTokens: 0,
         });
         await recordTokenRouterEventBestEffort('record channel success', () => (
-          tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel, undefined, 0)
+          tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel, undefined, 0, { retryCount })
         ));
         recordDownstreamCostUsage(request, estimatedCost);
         return reply.code(upstream.status).send(rewriteVideoResponsePublicId(data, mapping.publicId));
@@ -170,6 +170,7 @@ export async function videosProxyRoute(app: FastifyInstance) {
           status,
           errorText,
           modelName: upstreamModel,
+          retryCount,
         }));
         if (status > 0 && isTokenExpiredError({ status, message: errorText })) {
           await reportTokenExpired({

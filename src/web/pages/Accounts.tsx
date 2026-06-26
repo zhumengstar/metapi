@@ -362,6 +362,13 @@ export default function Accounts() {
       .join(","),
     [visibleAccounts],
   );
+  const accountIdSignature = useMemo(
+    () => accounts
+      .map((account) => Number(account?.id))
+      .filter((id) => Number.isInteger(id) && id > 0)
+      .join(","),
+    [accounts],
+  );
   const allVisibleAccountsSelected =
     visibleAccounts.length > 0 &&
     visibleAccounts.every((account) => selectedAccountIds.includes(account.id));
@@ -369,16 +376,17 @@ export default function Accounts() {
   const addAccountPrereqHint = buildAddAccountPrereqHint(verifyResult);
 
   useEffect(() => {
-    if (activeSegment === "tokens") return;
-    const visibleIds = visibleAccountIdSignature
-      ? visibleAccountIdSignature.split(",").map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0)
+    const accountIds = accountIdSignature
+      ? accountIdSignature.split(",").map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0)
       : [];
+    const accountIdSet = new Set(accountIds);
 
     setSelectedAccountIds((current) => {
-      if (current.length === visibleIds.length && current.every((id, index) => id === visibleIds[index])) return current;
-      return visibleIds;
+      const next = current.filter((id) => accountIdSet.has(id));
+      if (next.length === current.length) return current;
+      return next;
     });
-  }, [activeSegment, visibleAccountIdSignature]);
+  }, [accountIdSignature]);
 
   const setSegment = (nextSegment: ConnectionsSegment) => {
     const params = new URLSearchParams(location.search);
@@ -1273,6 +1281,16 @@ export default function Accounts() {
     } finally {
       setBatchActionLoading(false);
     }
+  };
+
+  const toggleAccountStatus = async (account: any) => {
+    const currentStatus = String(account?.status || "active");
+    const nextStatus = currentStatus === "disabled" ? "active" : "disabled";
+    await withLoading(
+      `status-${account.id}`,
+      () => api.updateAccount(account.id, { status: nextStatus }),
+      nextStatus === "disabled" ? "连接已禁用" : "连接已启用",
+    );
   };
 
   const confirmDelete = async () => {
@@ -3029,6 +3047,19 @@ export default function Accounts() {
                             >
                               模型
                             </button>
+                            <button
+                              onClick={() => void toggleAccountStatus(a)}
+                              disabled={!!actionLoading[`status-${a.id}`]}
+                              className={`btn btn-link ${a.status === "disabled" ? "btn-link-primary" : "btn-link-warning"}`}
+                            >
+                              {actionLoading[`status-${a.id}`] ? (
+                                <span className="spinner spinner-sm" />
+                              ) : a.status === "disabled" ? (
+                                "启用"
+                              ) : (
+                                "禁用"
+                              )}
+                            </button>
                           </>
                         }
                       >
@@ -3608,6 +3639,19 @@ export default function Accounts() {
                                 className="btn btn-link btn-link-info"
                               >
                                 模型
+                              </button>
+                              <button
+                                onClick={() => void toggleAccountStatus(a)}
+                                disabled={!!actionLoading[`status-${a.id}`]}
+                                className={`btn btn-link ${a.status === "disabled" ? "btn-link-primary" : "btn-link-warning"}`}
+                              >
+                                {actionLoading[`status-${a.id}`] ? (
+                                  <span className="spinner spinner-sm" />
+                                ) : a.status === "disabled" ? (
+                                  "启用"
+                                ) : (
+                                  "禁用"
+                                )}
                               </button>
                               {capabilities.canCheckin && (
                                 <button

@@ -101,6 +101,12 @@ type SiteRuntimeFailureContext = {
   status?: number | null;
   errorText?: string | null;
   modelName?: string | null;
+  retryCount?: number | null;
+  countsTowardRouteFailure?: boolean | null;
+};
+
+type SiteRuntimeSuccessContext = {
+  retryCount?: number | null;
 };
 
 type SiteRuntimeHealthState = {
@@ -126,14 +132,15 @@ const MIN_EFFECTIVE_UNIT_COST = 1e-6;
 const ROUND_ROBIN_FAILURE_THRESHOLD = 3;
 const STABLE_FIRST_FAILURE_THRESHOLD = 5;
 const CHANNEL_MODEL_AVAILABILITY_FAILURE_THRESHOLD = 3;
-const STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD = 50;
-const STABLE_FIRST_LOW_COST_TRIAL_SUCCESS_THRESHOLD = 100;
-const STABLE_FIRST_LOW_COST_SWITCH_RATIO = 1;
 const STABLE_FIRST_COST_WEIGHT = 0.6;
 const STABLE_FIRST_SUCCESS_WEIGHT = 0.15;
 const STABLE_FIRST_INPUT_COST_WEIGHT = 0.1;
 const STABLE_FIRST_CACHE_HIT_WEIGHT = 0.05;
 const STABLE_FIRST_FIRST_BYTE_WEIGHT = 0.1;
+const STABLE_FIRST_STICKY_MIN_SUCCESS_BEFORE_COST_SWITCH = 100;
+const STABLE_FIRST_LOW_COST_SWITCH_RATIO = 0.85;
+const STABLE_FIRST_LOW_COST_SWITCH_MIN_SAMPLE_COUNT = 5;
+const STABLE_FIRST_LOW_COST_SWITCH_MIN_SUCCESS_RATE = 0.9;
 const ROUND_ROBIN_COOLDOWN_LEVELS_SEC = [0, 10 * 60, 60 * 60, 24 * 60 * 60] as const;
 const STAGED_FAILURE_COOLDOWN_STRATEGIES = new Set<RouteRoutingStrategy>(['round_robin', 'stable_first']);
 const STABLE_FIRST_SITE_SCORE_RATIO = 0.92;
@@ -512,9 +519,9 @@ function buildStableFirstScoreBreakdown(params: {
     {
       metric: '失败/粘性',
       value: `失败 ${params.consecutiveFailText}`,
-      formula: '连续失败 5 次后切换；普通粘性 50 次重评；更低价通道成功时优先试跑 100 次',
+      formula: `主通道持续命中；单次失败仅本次请求临时重试备选；连续失败 5 次后正式切换；低价通道需先稳定 ${STABLE_FIRST_STICKY_MIN_SUCCESS_BEFORE_COST_SWITCH} 次后才允许接管`,
       weight: '稳定保护',
-      contribution: `粘性 ${params.stickyProgressText}`,
+      contribution: params.stickyProgressText,
       tone: params.consecutiveFailText.startsWith('0/') ? 'positive' : 'warning',
     },
     {
@@ -544,7 +551,7 @@ function buildStableFirstScoreBreakdown(params: {
 
   return {
     strategy: 'stable_first',
-    formula: '主评分 = 低倍率成本*60% + 请求成功率*15% + 输入/M成本*10% + 缓存命中率*5% + 平均首字延迟*10%；贡献 = 主评分 x 运行健康 x 会话负载 / sqrt(同站点通道数)；连续失败 5 次切换，更低价通道成功时优先试跑 100 次',
+    formula: `主评分 = 低倍率成本*60% + 请求成功率*15% + 输入/M成本*10% + 缓存命中率*5% + 平均首字延迟*10%；贡献 = 主评分 x 运行健康 x 会话负载 / sqrt(同站点通道数)；主通道持续命中，连续失败 5 次才正式切换；低价通道需先稳定 ${STABLE_FIRST_STICKY_MIN_SUCCESS_BEFORE_COST_SWITCH} 次后才允许接管，且必须明显更低价`,
     contribution: params.contribution,
     totalContribution: params.totalContribution,
     probability: params.probability,
@@ -602,7 +609,7 @@ type StableFirstStickyChannelState = {
   channelId: number;
   successCount: number;
   updatedAtMs: number;
-  mode?: 'normal' | 'low_cost_trial';
+  mode?: 'normal' | 'manual';
   successThreshold?: number;
 };
 
@@ -684,21 +691,21 @@ function recordStableFirstStickySuccess(channelId: number, nowMs = Date.now()): 
   }
 }
 
-function getStableFirstStickySuccessThreshold(state: StableFirstStickyChannelState | undefined): number {
-  if (!state) return STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD;
-  const threshold = Number(state.successThreshold);
-  if (Number.isFinite(threshold) && threshold > 0) return Math.trunc(threshold);
-  return state.mode === 'low_cost_trial'
-    ? STABLE_FIRST_LOW_COST_TRIAL_SUCCESS_THRESHOLD
-    : STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD;
-}
-
 function forgetStableFirstStickyChannel(channelId: number): void {
   if (!Number.isFinite(channelId) || channelId <= 0) return;
   for (const [key, state] of stableFirstStickyChannelByKey.entries()) {
     if (state.channelId === channelId) {
       stableFirstStickyChannelByKey.delete(key);
     }
+  }
+}
+
+function clearStableFirstStickyChannels(options: { routeId?: number; preserveManual?: boolean } = {}): void {
+  const routePrefix = options.routeId != null ? `${options.routeId}:` : null;
+  for (const [key, state] of stableFirstStickyChannelByKey.entries()) {
+    if (routePrefix && !key.startsWith(routePrefix)) continue;
+    if (options.preserveManual && state.mode === 'manual') continue;
+    stableFirstStickyChannelByKey.delete(key);
   }
 }
 
@@ -1689,6 +1696,41 @@ function filterSiteRuntimeBrokenCandidatesByModel(
     };
 }
 
+function restoreStableFirstStickyCandidateAfterBreaker(
+  filtered: {
+    candidates: RouteChannelCandidate[];
+    avoided: Array<{ candidate: RouteChannelCandidate; reason: string }>;
+  },
+  rotationKey: string,
+  nowIso: string,
+): {
+  candidates: RouteChannelCandidate[];
+  avoided: Array<{ candidate: RouteChannelCandidate; reason: string }>;
+} {
+  const stickyState = stableFirstStickyChannelByKey.get(rotationKey);
+  if (!stickyState) return filtered;
+  if (filtered.candidates.some((candidate) => candidate.channel.id === stickyState.channelId)) {
+    return filtered;
+  }
+
+  const avoidedIndex = filtered.avoided.findIndex((item) => item.candidate.channel.id === stickyState.channelId);
+  if (avoidedIndex < 0) return filtered;
+
+  const avoided = filtered.avoided[avoidedIndex]!;
+  const consecutiveFailCount = Math.max(0, avoided.candidate.channel.consecutiveFailCount ?? 0);
+  if (
+    consecutiveFailCount >= STABLE_FIRST_FAILURE_THRESHOLD
+    || isRouteChannelCoolingDown(avoided.candidate.channel, nowIso)
+  ) {
+    return filtered;
+  }
+
+  return {
+    candidates: [avoided.candidate, ...filtered.candidates],
+    avoided: filtered.avoided.filter((_, index) => index !== avoidedIndex),
+  };
+}
+
 type RouteRow = typeof schema.tokenRoutes.$inferSelect & {
   routeMode: RouteMode;
   sourceRouteIds: number[];
@@ -1912,11 +1954,7 @@ function clearStableFirstCachesForRoute(routeId: number): void {
       stableFirstLastSelectedSiteByKey.delete(key);
     }
   }
-  for (const key of stableFirstStickyChannelByKey.keys()) {
-    if (key.startsWith(routePrefix)) {
-      stableFirstStickyChannelByKey.delete(key);
-    }
-  }
+  clearStableFirstStickyChannels({ routeId, preserveManual: true });
   for (const key of stableFirstObservationProgressByKey.keys()) {
     if (key.startsWith(routePrefix)) {
       stableFirstObservationProgressByKey.delete(key);
@@ -1942,7 +1980,7 @@ export function invalidateTokenRouterCache(): void {
   };
   routeMatchCache.clear();
   stableFirstLastSelectedSiteByKey.clear();
-  stableFirstStickyChannelByKey.clear();
+  clearStableFirstStickyChannels({ preserveManual: true });
   stableFirstObservationProgressByKey.clear();
   stableFirstObservationSiteCooldownByKey.clear();
 }
@@ -2291,24 +2329,14 @@ function isOauthRouteUnitMemberCoolingDown(
   member: typeof schema.oauthRouteUnitMembers.$inferSelect,
   nowIso: string,
 ): boolean {
-  return !!member.cooldownUntil
-    && member.cooldownUntil > nowIso
-    && (
-      (member.consecutiveFailCount ?? 0) > 0
-      || (member.cooldownLevel ?? 0) > 0
-    );
+  return !!member.cooldownUntil && member.cooldownUntil > nowIso;
 }
 
 function isRouteChannelCoolingDown(
   channel: typeof schema.routeChannels.$inferSelect,
   nowIso: string,
 ): boolean {
-  return !!channel.cooldownUntil
-    && channel.cooldownUntil > nowIso
-    && (
-      (channel.consecutiveFailCount ?? 0) > 0
-      || (channel.cooldownLevel ?? 0) > 0
-    );
+  return !!channel.cooldownUntil && channel.cooldownUntil > nowIso;
 }
 
 function compareStableFirstCandidateOrder(left: RouteChannelCandidate, right: RouteChannelCandidate): number {
@@ -2452,6 +2480,48 @@ function resolveStableFirstSelectionCostSource(
   return '无分组倍率';
 }
 
+function resolveStableFirstChannelSuccessMetrics(candidate?: RouteChannelCandidate): RouteChannelSuccessMetrics {
+  const successCount = Math.max(0, candidate?.channel.successCount ?? 0);
+  const failCount = Math.max(0, candidate?.channel.failCount ?? 0);
+  const sampleCount = successCount + failCount;
+  if (sampleCount <= 0) {
+    return { sampleCount: 0, successRate: null };
+  }
+  return {
+    sampleCount,
+    successRate: clampNumber(successCount / sampleCount, 0, 1),
+  };
+}
+
+function canStableFirstCandidateTakeOverSticky(
+  stickyCandidate: RouteChannelCandidate,
+  lowerCostCandidate: RouteChannelCandidate,
+  stickyCost: number,
+  lowerCost: number,
+  stickySuccessCount: number,
+): boolean {
+  const stickyMetrics = resolveStableFirstChannelSuccessMetrics(stickyCandidate);
+  const stableSuccessCount = Math.max(stickySuccessCount, stickyMetrics.sampleCount);
+  if (stableSuccessCount < STABLE_FIRST_STICKY_MIN_SUCCESS_BEFORE_COST_SWITCH) {
+    return false;
+  }
+
+  if (lowerCost >= (stickyCost * STABLE_FIRST_LOW_COST_SWITCH_RATIO)) {
+    return false;
+  }
+
+  const candidateMetrics = resolveStableFirstChannelSuccessMetrics(lowerCostCandidate);
+  if (candidateMetrics.sampleCount < STABLE_FIRST_LOW_COST_SWITCH_MIN_SAMPLE_COUNT) {
+    return false;
+  }
+
+  if (candidateMetrics.successRate != null && candidateMetrics.successRate < STABLE_FIRST_LOW_COST_SWITCH_MIN_SUCCESS_RATE) {
+    return false;
+  }
+
+  return true;
+}
+
 function resolveStableFirstCacheHitRate(cacheStats: RouteChannelCacheStats): number | null {
   const cacheReadTokens = Math.max(0, cacheStats.cacheReadTokens || 0);
   const promptTokens = Math.max(0, cacheStats.promptTokens || 0);
@@ -2476,6 +2546,11 @@ type SiteHistoricalHealthMetrics = {
   totalCalls: number;
   successRate: number | null;
   avgLatencyMs: number | null;
+};
+
+type RouteChannelSuccessMetrics = {
+  sampleCount: number;
+  successRate: number | null;
 };
 
 function buildSiteHistoricalHealthMetrics(candidates: RouteChannelCandidate[]): Map<number, SiteHistoricalHealthMetrics> {
@@ -2745,6 +2820,7 @@ export class TokenRouter {
     preferredChannelId: number,
     downstreamPolicy: DownstreamRoutingPolicy = DEFAULT_DOWNSTREAM_POLICY,
     excludeChannelIds: number[] = [],
+    options: { allowManualStableFirstOverride?: boolean } = {},
   ): Promise<SelectedChannel | null> {
     if (!isModelAllowedByDownstreamPolicy(requestedModel, downstreamPolicy)) return null;
     const normalizedPreferredChannelId = Math.trunc(preferredChannelId || 0);
@@ -2759,7 +2835,71 @@ export class TokenRouter {
       normalizedPreferredChannelId,
       downstreamPolicy,
       excludeChannelIds,
+      true,
+      options,
     );
+  }
+
+  async pinStableFirstChannel(
+    channelId: number,
+    requestedModel?: string | null,
+    downstreamPolicy: DownstreamRoutingPolicy = DEFAULT_DOWNSTREAM_POLICY,
+  ): Promise<{ routeId: number; channelId: number; modelName: string; rotationKey: string; clearedStickyBindings: number } | null> {
+    const normalizedChannelId = Math.trunc(channelId || 0);
+    if (normalizedChannelId <= 0) return null;
+    await ensureSiteRuntimeHealthStateLoaded();
+
+    const row = await db.select({
+      routeId: schema.tokenRoutes.id,
+      modelPattern: schema.tokenRoutes.modelPattern,
+      channelId: schema.routeChannels.id,
+      sourceModel: schema.routeChannels.sourceModel,
+      routeStrategy: schema.tokenRoutes.routingStrategy,
+    }).from(schema.routeChannels)
+      .innerJoin(schema.tokenRoutes, eq(schema.routeChannels.routeId, schema.tokenRoutes.id))
+      .where(eq(schema.routeChannels.id, normalizedChannelId))
+      .get();
+
+    if (!row) return null;
+    if (downstreamPolicy.allowedRouteIds.length > 0 && !downstreamPolicy.allowedRouteIds.includes(row.routeId)) {
+      return null;
+    }
+
+    const route = {
+      id: row.routeId,
+      modelPattern: row.modelPattern,
+      routingStrategy: row.routeStrategy,
+    } as RouteRow;
+    if (resolveRouteStrategy(route) !== 'stable_first') {
+      throw new Error('只有稳定优先路由支持手动主通道');
+    }
+
+    const modelCandidates = Array.from(new Set([
+      String(requestedModel || '').trim(),
+      String(row.sourceModel || '').trim(),
+      String(row.modelPattern || '').trim(),
+      normalizeModelAlias(String(requestedModel || '')),
+      normalizeModelAlias(String(row.sourceModel || '')),
+      normalizeModelAlias(String(row.modelPattern || '')),
+    ].filter(Boolean)));
+    const modelName = modelCandidates[0] || String(row.modelPattern || '').trim();
+    const rotationKey = this.buildStableFirstRotationKey(row.routeId, modelName || row.modelPattern || String(row.routeId));
+    for (const modelCandidate of modelCandidates) {
+      rememberStableFirstStickyChannelForKey(
+        this.buildStableFirstRotationKey(row.routeId, modelCandidate),
+        normalizedChannelId,
+        Date.now(),
+        { mode: 'manual' },
+      );
+    }
+    const clearedStickyBindings = proxyChannelCoordinator.clearStickyBindingsForModels(modelCandidates);
+    return {
+      routeId: row.routeId,
+      channelId: normalizedChannelId,
+      modelName: modelName || row.modelPattern,
+      rotationKey,
+      clearedStickyBindings,
+    };
   }
 
   async explainSelection(
@@ -2990,7 +3130,12 @@ export class TokenRouter {
     }
 
     if (routeStrategy === 'stable_first') {
-      const breakerFiltered = filterSiteRuntimeBrokenCandidatesByModel(available, runtimeModelResolver, nowMs);
+      const rotationKey = this.buildStableFirstRotationKey(match.route.id, requestedModel);
+      const breakerFiltered = restoreStableFirstStickyCandidateAfterBreaker(
+        filterSiteRuntimeBrokenCandidatesByModel(available, runtimeModelResolver, nowMs),
+        rotationKey,
+        nowIso,
+      );
       if (breakerFiltered.avoided.length > 0) {
         for (const item of breakerFiltered.avoided) {
           const target = candidateMap.get(item.candidate.channel.id);
@@ -2999,7 +3144,6 @@ export class TokenRouter {
         }
       }
 
-      const rotationKey = this.buildStableFirstRotationKey(match.route.id, requestedModel);
       const weighted = this.calculateWeightedSelection(
         breakerFiltered.candidates,
         useChannelSourceModelForCost ? runtimeModelResolver : mappedModel,
@@ -3033,8 +3177,8 @@ export class TokenRouter {
       }
 
       const summaryParts = [`稳定优先：可用 ${available.length}`];
-      summaryParts.push(`低价优先，连续失败 ${STABLE_FIRST_FAILURE_THRESHOLD} 次后切换`);
-      summaryParts.push(`普通切换后稳定成功 ${STABLE_FIRST_REEVALUATE_SUCCESS_THRESHOLD} 次再重新评估低价，更低价通道成功时优先试跑 ${STABLE_FIRST_LOW_COST_TRIAL_SUCCESS_THRESHOLD} 次`);
+      summaryParts.push(`低价优先，命中后持续使用，连续失败 ${STABLE_FIRST_FAILURE_THRESHOLD} 次后切换备选`);
+      summaryParts.push('更低倍率通道进入时立即接管；单次失败只在本次请求链路临时重试备选');
       if (breakerFiltered.avoided.length > 0) {
         const breakerSummaryLabel = breakerFiltered.avoided.some((item) => item.reason.includes('模型熔断'))
           ? '运行时熔断避让'
@@ -3232,6 +3376,7 @@ export class TokenRouter {
     modelName?: string | null,
     actualAccountId?: number,
     inputTokens = 0,
+    context: SiteRuntimeSuccessContext = {},
   ) {
     await ensureSiteRuntimeHealthStateLoaded();
     const row = await db.select()
@@ -3310,7 +3455,12 @@ export class TokenRouter {
       channel.consecutiveFailCount = 0;
       channel.cooldownLevel = 0;
     });
-    recordStableFirstStickySuccess(channelId);
+    const normalizedRetryCount = typeof context.retryCount === 'number'
+      ? context.retryCount
+      : Number(context.retryCount);
+    if (!Number.isFinite(normalizedRetryCount) || normalizedRetryCount <= 0) {
+      recordStableFirstStickySuccess(channelId);
+    }
   }
 
   async recordProbeSuccess(
@@ -3508,6 +3658,17 @@ export class TokenRouter {
 	    });
 	    const failureMessage = String(normalizedContext.errorText || '').trim()
 	      || `连续 ${CHANNEL_MODEL_AVAILABILITY_FAILURE_THRESHOLD} 次请求失败`;
+    const normalizedRetryCount = typeof normalizedContext.retryCount === 'number'
+      ? normalizedContext.retryCount
+      : Number(normalizedContext.retryCount);
+    const hasRetryCount = Number.isFinite(normalizedRetryCount);
+    const routeStrategy = resolveRouteStrategy(route);
+    const countsTowardRouteFailure = typeof normalizedContext.countsTowardRouteFailure === 'boolean'
+      ? normalizedContext.countsTowardRouteFailure
+      : (
+        !hasRetryCount
+        || (routeStrategy === 'stable_first' ? normalizedRetryCount >= 1 : normalizedRetryCount <= 0)
+      );
 	    if (typeof ch.oauthRouteUnitId === 'number' && ch.oauthRouteUnitId > 0) {
       const targetAccountId = Number.isFinite(actualAccountId) && (actualAccountId ?? 0) > 0
         ? Math.trunc(actualAccountId!)
@@ -3531,7 +3692,9 @@ export class TokenRouter {
           ? 'stick_until_unavailable'
           : 'round_robin';
 	        let cooldownUntil: string | null = null;
-	        let consecutiveFailCount = Math.max(0, memberRow.member.consecutiveFailCount ?? 0) + 1;
+          const previousConsecutiveFailCount = Math.max(0, memberRow.member.consecutiveFailCount ?? 0);
+          const countsTowardStagedFailure = countsTowardRouteFailure;
+	        let consecutiveFailCount = previousConsecutiveFailCount + (countsTowardStagedFailure ? 1 : 0);
 	        const nextConsecutiveFailCountBeforeCooldown = consecutiveFailCount;
 	        let cooldownLevel = Math.max(0, memberRow.member.cooldownLevel ?? 0);
 
@@ -3548,7 +3711,7 @@ export class TokenRouter {
               : null;
             consecutiveFailCount = 0;
           }
-        } else {
+        } else if (countsTowardStagedFailure) {
           cooldownUntil = new Date(nowMs + resolveEffectiveFailureCooldownMs(failCount)).toISOString();
           consecutiveFailCount = 0;
           cooldownLevel = 0;
@@ -3562,7 +3725,7 @@ export class TokenRouter {
           cooldownUntil,
           updatedAt: nowIso,
 	        }).where(eq(schema.oauthRouteUnitMembers.id, memberRow.member.id)).run();
-	        if (nextConsecutiveFailCountBeforeCooldown >= CHANNEL_MODEL_AVAILABILITY_FAILURE_THRESHOLD && failedModelName) {
+	        if (countsTowardStagedFailure && nextConsecutiveFailCountBeforeCooldown >= CHANNEL_MODEL_AVAILABILITY_FAILURE_THRESHOLD && failedModelName) {
 	          await markRouteChannelModelAvailabilityUnavailable({
 	            channel: ch,
 	            accountId: memberRow.account.id,
@@ -3581,12 +3744,15 @@ export class TokenRouter {
 
     const shortWindowLimitCooldownUntil = resolveShortWindowLimitCooldown(account, normalizedContext, nowMs);
     const failCount = shortWindowLimitCooldownUntil ? 0 : ((ch.failCount ?? 0) + 1);
-    const routeStrategy = resolveRouteStrategy(route);
     const affectedChannelIds = shortWindowLimitCooldownUntil
       ? await loadCredentialScopedChannelIds(ch, account.id)
       : [channelId];
     let cooldownUntil: string | null = null;
-    let consecutiveFailCount = Math.max(0, ch.consecutiveFailCount ?? 0) + 1;
+    const previousConsecutiveFailCount = Math.max(0, ch.consecutiveFailCount ?? 0);
+    const countsTowardStagedFailure = usesStagedFailureCooldown(routeStrategy)
+      ? countsTowardRouteFailure
+      : true;
+    let consecutiveFailCount = previousConsecutiveFailCount + (countsTowardStagedFailure ? 1 : 0);
     let cooldownLevel = Math.max(0, ch.cooldownLevel ?? 0);
 
     if (shortWindowLimitCooldownUntil) {
@@ -3628,7 +3794,7 @@ export class TokenRouter {
         channel.cooldownLevel = cooldownLevel;
 	      });
 	    }
-	    if (Math.max(0, ch.consecutiveFailCount ?? 0) + 1 >= CHANNEL_MODEL_AVAILABILITY_FAILURE_THRESHOLD && failedModelName) {
+	    if (countsTowardStagedFailure && previousConsecutiveFailCount + 1 >= CHANNEL_MODEL_AVAILABILITY_FAILURE_THRESHOLD && failedModelName) {
 	      await markRouteChannelModelAvailabilityUnavailable({
 	        channel: ch,
 	        accountId: account.id,
@@ -3706,15 +3872,20 @@ export class TokenRouter {
     }
 
     if (routeStrategy === 'stable_first') {
-      const breakerFiltered = filterSiteRuntimeBrokenCandidatesByModel(available, runtimeModelResolver, nowMs);
-      const candidates = breakerFiltered.candidates;
       const rotationKey = this.buildStableFirstRotationKey(match.route.id, requestedModel);
+      const allowStableFirstStickyUpdate = excludeChannelIds.length === 0;
+      const breakerFiltered = restoreStableFirstStickyCandidateAfterBreaker(
+        filterSiteRuntimeBrokenCandidatesByModel(available, runtimeModelResolver, nowMs),
+        rotationKey,
+        nowIso,
+      );
+      const candidates = breakerFiltered.candidates;
       const selected = this.stableFirstSelect(
         candidates,
         requestedByDisplayName ? runtimeModelResolver : mappedModel,
         downstreamPolicy,
         nowMs,
-        rotationKey,
+        allowStableFirstStickyUpdate ? rotationKey : undefined,
       );
       if (!selected) return null;
       return await this.finalizeSelectedCandidateForDispatch(
@@ -3726,7 +3897,7 @@ export class TokenRouter {
         recordSelection,
         nowIso,
         nowMs,
-        rotationKey,
+        allowStableFirstStickyUpdate ? rotationKey : undefined,
         undefined,
         false,
         excludeChannelIds,
@@ -3779,6 +3950,7 @@ export class TokenRouter {
     downstreamPolicy: DownstreamRoutingPolicy,
     excludeChannelIds: number[] = [],
     recordSelection = true,
+    options: { allowManualStableFirstOverride?: boolean } = {},
   ): Promise<SelectedChannel | null> {
     const mappedModel = resolveMappedModel(requestedModel, match.route.modelMapping);
     const requestedByDisplayName = isRouteDisplayNameMatch(requestedModel, match.route.displayName);
@@ -3802,6 +3974,19 @@ export class TokenRouter {
 
     const preferred = available.find((candidate) => candidate.channel.id === preferredChannelId);
     if (!preferred) return null;
+    const stableFirstRotationKey = routeStrategy === 'stable_first'
+      ? this.buildStableFirstRotationKey(match.route.id, requestedModel)
+      : undefined;
+    const stickyState = stableFirstRotationKey
+      ? stableFirstStickyChannelByKey.get(stableFirstRotationKey)
+      : undefined;
+    if (
+      stickyState?.mode === 'manual'
+      && stickyState.channelId !== preferredChannelId
+      && !options.allowManualStableFirstOverride
+    ) {
+      return null;
+    }
 
     const breakerFiltered = filterSiteRuntimeBrokenCandidatesByModel([preferred], runtimeModelResolver, nowMs);
     if (breakerFiltered.candidates.length <= 0) return null;
@@ -3820,8 +4005,8 @@ export class TokenRouter {
       recordSelection && (routeStrategy === 'round_robin' || routeStrategy === 'stable_first'),
       nowIso,
       nowMs,
-      routeStrategy === 'stable_first' ? this.buildStableFirstRotationKey(match.route.id, requestedModel) : undefined,
-      routeStrategy === 'stable_first' ? `${this.buildStableFirstRotationKey(match.route.id, requestedModel)}:observe` : undefined,
+      stableFirstRotationKey,
+      stableFirstRotationKey ? `${stableFirstRotationKey}:observe` : undefined,
       false,
       excludeChannelIds,
     );
@@ -4593,11 +4778,9 @@ export class TokenRouter {
       const stableFirstSuccessRateText = `${(stableFirstSuccessRate * 100).toFixed(1)}%`;
       const stableFirstScore = stableFirstScores[i];
       const stickyState = stableFirstRotationKey ? stableFirstStickyChannelByKey.get(stableFirstRotationKey) : undefined;
-      const stickyThreshold = getStableFirstStickySuccessThreshold(stickyState);
-      const stickyModeText = stickyState?.mode === 'low_cost_trial' ? ' 低成本试跑' : '';
       const stickyProgressText = stickyState?.channelId === candidate.channel.id
-        ? `${Math.min(stickyState.successCount, stickyThreshold)}/${stickyThreshold}${stickyModeText}`
-        : `0/${stickyThreshold}`;
+        ? `${stickyState.mode === 'manual' ? '手动主通道' : '当前主通道'}，已连续成功 ${Math.max(0, stickyState.successCount)} 次`
+        : '非当前主通道';
 	      const consecutiveFailText = `${Math.max(0, candidate.channel.consecutiveFailCount ?? 0)}/${STABLE_FIRST_FAILURE_THRESHOLD}`;
 	      const fallbackPenalty = cost?.source === 'fallback'
 	        ? 1 / Math.max(1, cost?.unitCost || 1)
@@ -4759,33 +4942,49 @@ export class TokenRouter {
     const bestCandidate = candidates[bestIndex] ?? null;
     if (stableFirstRotationKey) {
       const stickyState = stableFirstStickyChannelByKey.get(stableFirstRotationKey);
-      const stickyThreshold = getStableFirstStickySuccessThreshold(stickyState);
-      if (stickyState && stickyState.successCount < stickyThreshold) {
+      if (stickyState) {
         const stickyIndex = candidates.findIndex((candidate) => candidate.channel.id === stickyState.channelId);
         const stickyCandidate = stickyIndex >= 0 ? candidates[stickyIndex] : undefined;
-	        if (stickyCandidate) {
-	          const bestCost = resolveStableFirstSelectionCost(effectiveCosts[bestIndex], bestCandidate);
-	          const stickyCost = resolveStableFirstSelectionCost(effectiveCosts[stickyIndex], stickyCandidate);
-	          const bestContribution = contributions[bestIndex] ?? 0;
-	          if (
-	            bestCandidate
-	            && bestCandidate.channel.id !== stickyCandidate.channel.id
-	            && bestCost < stickyCost * STABLE_FIRST_LOW_COST_SWITCH_RATIO
-	            && bestContribution > 0
-	          ) {
+        if (stickyCandidate) {
+          if (stickyState.mode === 'manual') {
+            return stickyCandidate;
+          }
+          const stickyCost = resolveStableFirstSelectionCost(effectiveCosts[stickyIndex], stickyCandidate);
+          let lowerCostIndex = -1;
+          let lowerCost = stickyCost;
+          for (const index of rankedIndices) {
+            const candidate = candidates[index];
+            if (!candidate || candidate.channel.id === stickyCandidate.channel.id) continue;
+            if ((contributions[index] ?? 0) <= 0) continue;
+            const candidateCost = resolveStableFirstSelectionCost(effectiveCosts[index], candidate);
+            if (canStableFirstCandidateTakeOverSticky(
+              stickyCandidate,
+              candidate,
+              stickyCost,
+              candidateCost,
+              Math.max(0, stickyState.successCount ?? 0),
+            )) {
+              lowerCost = candidateCost;
+              lowerCostIndex = index;
+            }
+          }
+
+          const lowerCostCandidate = lowerCostIndex >= 0 ? candidates[lowerCostIndex] : undefined;
+          if (lowerCostCandidate) {
             rememberStableFirstStickyChannelForKey(
               stableFirstRotationKey,
-              bestCandidate.channel.id,
+              lowerCostCandidate.channel.id,
               nowMs,
-              {
-                mode: 'low_cost_trial',
-                successThreshold: STABLE_FIRST_LOW_COST_TRIAL_SUCCESS_THRESHOLD,
-              },
             );
-            return bestCandidate;
+            return lowerCostCandidate;
           }
+
           return stickyCandidate;
         }
+      }
+
+      if (bestCandidate) {
+        rememberStableFirstStickyChannelForKey(stableFirstRotationKey, bestCandidate.channel.id, nowMs);
       }
     }
 

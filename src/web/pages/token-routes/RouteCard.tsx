@@ -92,6 +92,7 @@ type RouteCardProps = {
   onToggleChannelEnabled: (channelId: number, routeId: number, enabled: boolean) => void;
   onToggleChannelImageUpscale?: (channelId: number, routeId: number, enabled: boolean) => void;
   onTestChannelModel?: (routeId: number, channelId: number) => void;
+  onPinStableFirstChannel?: (routeId: number, channelId: number) => void;
   onChannelDragEnd: (routeId: number, event: DragEndEvent) => void;
   // Missing token hints
   missingTokenSiteItems: MissingTokenRouteSiteActionItem[];
@@ -380,6 +381,7 @@ type SortableChannelShellProps = {
   channelModelTestResults?: Record<number, RouteChannelModelTestResult | undefined>;
   activeDragChannelId: number | null;
   decisionMap: Map<number, RouteDecisionCandidate>;
+  selectedStableFirstChannelId?: number | null;
   exactRoute: boolean;
   loadingDecision: boolean;
   channelManagementDisabled: boolean;
@@ -390,6 +392,7 @@ type SortableChannelShellProps = {
   onToggleChannelEnabled: (channelId: number, routeId: number, enabled: boolean) => void;
   onToggleChannelImageUpscale?: (channelId: number, routeId: number, enabled: boolean) => void;
   onTestChannelModel?: (routeId: number, channelId: number) => void;
+  onPinStableFirstChannel?: (routeId: number, channelId: number) => void;
   onSiteBlockModel: (channelId: number, routeId: number) => void;
   railLabel: string;
   mobileRailLabel: string;
@@ -414,6 +417,7 @@ function SortableChannelShell({
   channelModelTestResults,
   activeDragChannelId,
   decisionMap,
+  selectedStableFirstChannelId,
   exactRoute,
   loadingDecision,
   channelManagementDisabled,
@@ -424,6 +428,7 @@ function SortableChannelShell({
   onToggleChannelEnabled,
   onToggleChannelImageUpscale,
   onTestChannelModel,
+  onPinStableFirstChannel,
   onSiteBlockModel,
   railLabel,
   mobileRailLabel,
@@ -446,6 +451,10 @@ function SortableChannelShell({
 
   const tokenOptions = candidateView.tokenOptionsByAccountId[channel.accountId] || [];
   const activeTokenId = channelTokenDraft[channel.id] ?? channel.tokenId ?? 0;
+  const decisionCandidate = decisionMap.get(channel.id);
+  const isSelectedStableFirstChannel = selectedStableFirstChannelId === channel.id;
+  const isManualStableFirstChannel = isSelectedStableFirstChannel
+    && String(decisionCandidate?.reason || '').includes('手动主通道');
   const showDesktopRailHeader = !compact && channelIndex === 0;
   const showDesktopRailLine = !compact
     && (bucketIndex < totalBucketCount - 1 || channelIndex < bucketChannelCount - 1);
@@ -534,7 +543,9 @@ function SortableChannelShell({
         dragHandleProps={{ ...attributes, ...listeners }}
         dragHandleRef={setActivatorNodeRef}
         dragInProgress={activeDragChannelId != null}
-        decisionCandidate={decisionMap.get(channel.id)}
+        decisionCandidate={decisionCandidate}
+        isSelectedStableFirstChannel={isSelectedStableFirstChannel}
+        isManualStableFirstChannel={isManualStableFirstChannel}
         isExactRoute={exactRoute}
         loadingDecision={loadingDecision}
         isSavingPriority={savingPriority}
@@ -553,6 +564,7 @@ function SortableChannelShell({
         onToggleEnabled={(enabled) => onToggleChannelEnabled(channel.id, routeId, enabled)}
         onToggleImageUpscale={onToggleChannelImageUpscale ? (enabled) => onToggleChannelImageUpscale(channel.id, routeId, enabled) : undefined}
         onTestModel={onTestChannelModel ? () => onTestChannelModel(routeId, channel.id) : undefined}
+        onPinStableFirstChannel={onPinStableFirstChannel ? () => onPinStableFirstChannel(routeId, channel.id) : undefined}
         onSiteBlockModel={channelManagementDisabled ? undefined : () => onSiteBlockModel(channel.id, routeId)}
       />
     </div>
@@ -587,10 +599,11 @@ function RouteCardInner({
   onTokenDraftChange,
   onSaveToken,
 	  onDeleteChannel,
-	  onToggleChannelEnabled,
-	  onToggleChannelImageUpscale,
-	  onTestChannelModel,
-	  onChannelDragEnd,
+		  onToggleChannelEnabled,
+		  onToggleChannelImageUpscale,
+		  onTestChannelModel,
+		  onPinStableFirstChannel,
+		  onChannelDragEnd,
   missingTokenSiteItems,
   missingTokenGroupItems,
   onCreateTokenForMissing,
@@ -652,6 +665,7 @@ function RouteCardInner({
   const priorityBuckets = buildPriorityBuckets(channels || [], {
     probabilityByChannelId,
     sortWithinBucketByProbability: shouldSortStableFirstBucketsByProbability,
+    pinnedChannelId: shouldSortStableFirstBucketsByProbability ? routeDecision?.selectedChannelId ?? null : null,
   });
   const priorityRailSections = buildPriorityRailSections(channels || []);
   const useDragOverlay = compact && detailPanel;
@@ -1263,6 +1277,7 @@ function RouteCardInner({
                             channelModelTestResults={channelModelTestResults}
                             activeDragChannelId={activeDragChannelId}
                             decisionMap={decisionMap}
+                            selectedStableFirstChannelId={routeDecision?.selectedChannelId ?? null}
                             exactRoute={exactRoute}
                             loadingDecision={loadingDecision}
                             channelManagementDisabled={channelManagementDisabled}
@@ -1270,10 +1285,11 @@ function RouteCardInner({
                             onTokenDraftChange={onTokenDraftChange}
                             onSaveToken={onSaveToken}
                             onDeleteChannel={onDeleteChannel}
-                            onToggleChannelEnabled={onToggleChannelEnabled}
-                            onToggleChannelImageUpscale={onToggleChannelImageUpscale}
-                            onTestChannelModel={onTestChannelModel}
-                            onSiteBlockModel={onSiteBlockModel}
+	                            onToggleChannelEnabled={onToggleChannelEnabled}
+	                            onToggleChannelImageUpscale={onToggleChannelImageUpscale}
+	                            onTestChannelModel={onTestChannelModel}
+	                            onPinStableFirstChannel={routingStrategy === 'stable_first' ? onPinStableFirstChannel : undefined}
+	                            onSiteBlockModel={onSiteBlockModel}
                             railLabel={railSection ? `P${bucketIndex} · ${railSection.channelCount}` : railLabel}
                             mobileRailLabel={mobileRailLabel}
                             railNodeStyle={railNodeStyle}
@@ -1356,6 +1372,7 @@ function areRouteCardPropsEqual(prev: RouteCardProps, next: RouteCardProps): boo
     || prev.onDeleteChannel !== next.onDeleteChannel
 	    || prev.onToggleChannelEnabled !== next.onToggleChannelEnabled
 	    || prev.onTestChannelModel !== next.onTestChannelModel
+	    || prev.onPinStableFirstChannel !== next.onPinStableFirstChannel
 	    || prev.onChannelDragEnd !== next.onChannelDragEnd
     || prev.onCreateTokenForMissing !== next.onCreateTokenForMissing
     || prev.onAddChannel !== next.onAddChannel

@@ -24,6 +24,7 @@ export type PriorityBucketEditorItem = PriorityBucketEditorChannelItem | Priorit
 export type BuildPriorityBucketsOptions = {
   probabilityByChannelId?: Map<number, number>;
   sortWithinBucketByProbability?: boolean;
+  pinnedChannelId?: number | null;
 };
 
 export function createPriorityBucketSeparatorId(index: number): string {
@@ -39,7 +40,15 @@ export function buildPriorityBuckets(
   options: BuildPriorityBucketsOptions = {},
 ): PriorityBucket[] {
   const grouped = new Map<number, RouteChannel[]>();
-  for (const channel of normalizeChannels(channels || [])) {
+  const pinnedChannelId = Number(options.pinnedChannelId || 0);
+  const orderedChannels = normalizeChannels(channels || []).sort((left, right) => {
+    if (pinnedChannelId > 0) {
+      if (left.id === pinnedChannelId) return -1;
+      if (right.id === pinnedChannelId) return 1;
+    }
+    return 0;
+  });
+  for (const channel of orderedChannels) {
     const priority = channel.priority ?? 0;
     if (!grouped.has(priority)) grouped.set(priority, []);
     grouped.get(priority)!.push(channel);
@@ -48,6 +57,10 @@ export function buildPriorityBuckets(
     priority,
     channels: options.sortWithinBucketByProbability
       ? [...bucketChannels].sort((left, right) => {
+        if (pinnedChannelId > 0) {
+          if (left.id === pinnedChannelId) return -1;
+          if (right.id === pinnedChannelId) return 1;
+        }
         const probabilityDiff = (options.probabilityByChannelId?.get(right.id) ?? 0)
           - (options.probabilityByChannelId?.get(left.id) ?? 0);
         if (Math.abs(probabilityDiff) > 1e-9) return probabilityDiff > 0 ? 1 : -1;

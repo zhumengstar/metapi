@@ -16,6 +16,8 @@ export type RuntimeModelProbeResult = {
   status: RuntimeModelProbeStatus;
   latencyMs: number | null;
   reason: string;
+  responseText?: string | null;
+  httpStatus?: number | null;
 };
 
 const NON_CONVERSATION_MODEL_PATTERNS = [
@@ -75,6 +77,50 @@ function buildProbeBody(modelName: string): Record<string, unknown> {
     max_tokens: 8,
     stream: false,
   };
+}
+
+function extractProbeResponseText(payload: any, text: string): string | null {
+  const candidates = [
+    payload?.choices?.[0]?.message?.content,
+    payload?.choices?.[0]?.text,
+    payload?.output_text,
+    payload?.message,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim().slice(0, 500);
+    }
+  }
+
+  const output = payload?.output;
+  if (Array.isArray(output)) {
+    const parts: string[] = [];
+    for (const item of output) {
+      const content = item?.content;
+      if (!Array.isArray(content)) continue;
+      for (const block of content) {
+        const value = block?.text || block?.content;
+        if (typeof value === 'string' && value.trim()) {
+          parts.push(value.trim());
+        }
+      }
+    }
+    const joined = parts.join('\n').trim();
+    if (joined) return joined.slice(0, 500);
+  }
+
+  const trimmed = String(text || '').trim();
+  return trimmed ? trimmed.slice(0, 500) : null;
+}
+
+async function readProbeResponse(response: { text: () => Promise<string> }): Promise<{ text: string; payload: any }> {
+  const text = await response.text().catch(() => '');
+  if (!text) return { text: '', payload: null };
+  try {
+    return { text, payload: JSON.parse(text) };
+  } catch {
+    return { text, payload: null };
+  }
 }
 
 async function withTimeout<T>(fn: () => Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
@@ -231,11 +277,13 @@ export async function probeRuntimeModel(input: {
     const latencyMs = Date.now() - startedAt;
 
     if (result.ok) {
-      await result.upstream.text().catch(() => undefined);
+      const { text, payload } = await readProbeResponse(result.upstream);
       return {
         status: 'supported',
         latencyMs,
         reason: 'probe succeeded',
+        responseText: extractProbeResponseText(payload, text),
+        httpStatus: result.upstream.status,
       };
     }
 
@@ -244,6 +292,8 @@ export async function probeRuntimeModel(input: {
       status: classifyUnsupportedFailure(result.status || 0, rawErrorText) ? 'unsupported' : 'inconclusive',
       latencyMs,
       reason: rawErrorText || `probe failed with status ${result.status || 0}`,
+      responseText: rawErrorText || null,
+      httpStatus: result.status || null,
     };
   } catch (error) {
     return {

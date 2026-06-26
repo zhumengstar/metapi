@@ -217,7 +217,7 @@ function resolveGroupRatioMapping(
     for (const [key, value] of map.entries()) {
       if (!key.startsWith(lookupPrefix)) continue;
       const storedLookup = key.slice(lookupPrefix.length);
-      if (storedLookup.length < 4 || lookup.length <= storedLookup.length) continue;
+      if (!isUsefulGroupLookupPrefix(storedLookup) || lookup.length <= storedLookup.length) continue;
       if (!lookup.startsWith(storedLookup)) continue;
       if (value.ambiguous) continue;
       if (storedLookup.length > longestPrefixLength) {
@@ -237,6 +237,12 @@ function resolveGroupRatioMapping(
     }
   }
   return undefined;
+}
+
+function isUsefulGroupLookupPrefix(storedLookup: string): boolean {
+  if (storedLookup.length >= 4) return true;
+  if (storedLookup.length < 2) return false;
+  return (/[a-z]/i.test(storedLookup) || /[\u4e00-\u9fff]/.test(storedLookup)) && !/^\d+$/.test(storedLookup);
 }
 
 function isStoredPricingAvailable(value: unknown): boolean {

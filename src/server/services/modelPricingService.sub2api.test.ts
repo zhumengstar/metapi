@@ -65,12 +65,16 @@ describe('modelPricingService sub2api pricing groups', () => {
     });
 
     expect(catalog?.groupRatio).toEqual({
+      '1': 0.12,
+      '8': 0.25,
       '生图（1k）': 0.12,
       '生图（2k4k）': 0.25,
       default: 1,
     });
-    expect(catalog?.models[0]?.enableGroups).toEqual(['生图（1k）', '生图（2k4k）']);
+    expect(catalog?.models[0]?.enableGroups).toEqual(['1', '生图（1k）', '8', '生图（2k4k）']);
     expect(Object.keys(catalog?.models[0]?.groupPricing || {})).toEqual([
+      '1',
+      '8',
       '生图（1k）',
       '生图（2k4k）',
       'default',

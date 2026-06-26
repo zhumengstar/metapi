@@ -33,6 +33,7 @@ import {
   ROUTE_DECISION_REFRESH_TASK_TYPE,
 } from '../../services/routeDecisionRefreshService.js';
 import { testRouteChannelModelAvailability } from '../../services/routeChannelModelTestService.js';
+import { parseProxyLogBillingDetails } from '../../services/proxyLogStore.js';
 import {
   listOauthRouteUnitMembersByUnitIds,
   loadOauthRouteUnitSummariesByIds,
@@ -88,6 +89,22 @@ function resolveInputCostPerMillion(totalCost: number, inputTokens: number): num
     return null;
   }
   return Math.round((totalCost * 1_000_000 / inputTokens) * 1_000_000) / 1_000_000;
+}
+
+function readNonNegativeNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value;
+  if (typeof value === 'string') {
+    const parsed = Number(value.trim());
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return null;
+}
+
+function readBillingBreakdownInputCost(value: unknown): number | null {
+  const details = parseProxyLogBillingDetails(value);
+  const breakdown = details?.breakdown;
+  if (!breakdown || typeof breakdown !== 'object' || Array.isArray(breakdown)) return null;
+  return readNonNegativeNumber((breakdown as Record<string, unknown>).inputCost);
 }
 
 type RouteRow = typeof schema.tokenRoutes.$inferSelect & {
@@ -775,11 +792,29 @@ async function fetchChannelsForRouteRows(
       .groupBy(schema.proxyLogs.channelId)
       .all()
     : [];
+  const channelBillingRows = channelRows.length > 0
+    ? await db.select({
+      channelId: schema.proxyLogs.channelId,
+      billingDetails: schema.proxyLogs.billingDetails,
+    })
+      .from(schema.proxyLogs)
+      .where(inArray(schema.proxyLogs.channelId, channelRows.map((row) => row.route_channels.id)))
+      .all()
+    : [];
+  const inputCostByChannelId = new Map<number, number>();
+  for (const row of channelBillingRows) {
+    const channelId = Number(row.channelId);
+    if (!Number.isFinite(channelId) || channelId <= 0) continue;
+    const inputCost = readBillingBreakdownInputCost(row.billingDetails);
+    if (inputCost == null) continue;
+    inputCostByChannelId.set(channelId, (inputCostByChannelId.get(channelId) || 0) + inputCost);
+  }
   const usageByChannelId = new Map<number, {
     successCount: number;
     failCount: number;
     totalLatencyMs: number;
     totalCost: number;
+    pureInputCost: number | null;
     totalInputTokens: number;
     lastUsedAt: string | null;
   }>();
@@ -791,6 +826,9 @@ async function fetchChannelsForRouteRows(
       failCount: Math.max(0, Number(row.failCount || 0)),
       totalLatencyMs: Math.max(0, Number(row.totalLatencyMs || 0)),
       totalCost: Math.max(0, Number(row.totalCost || 0)),
+      pureInputCost: inputCostByChannelId.has(channelId)
+        ? Math.max(0, inputCostByChannelId.get(channelId) || 0)
+        : null,
       totalInputTokens: Math.max(0, Number(row.totalInputTokens || 0)),
       lastUsedAt: row.lastUsedAt || null,
     });
@@ -861,6 +899,10 @@ async function fetchChannelsForRouteRows(
       totalInputTokens: Math.max(Number(row.route_channels.totalInputTokens || 0), usage?.totalInputTokens ?? 0),
       inputCostPerMillion: resolveInputCostPerMillion(
         usage?.totalCost ?? Math.max(Number(row.route_channels.totalCost || 0), 0),
+        Math.max(Number(row.route_channels.totalInputTokens || 0), usage?.totalInputTokens ?? 0),
+      ),
+      pureInputCostPerMillion: resolveInputCostPerMillion(
+        usage?.pureInputCost ?? 0,
         Math.max(Number(row.route_channels.totalInputTokens || 0), usage?.totalInputTokens ?? 0),
       ),
       lastUsedAt: row.route_channels.lastUsedAt || usage?.lastUsedAt || null,
@@ -1788,6 +1830,25 @@ export async function tokensRoutes(app: FastifyInstance) {
       return reply.code(404).send({ success: false, message: '通道不存在' });
     }
     return { success: true, result };
+  });
+
+  app.post<{ Params: { channelId: string }; Body: { model?: string } }>('/api/channels/:channelId/stable-primary', async (request, reply) => {
+    const channelId = parseInt(request.params.channelId, 10);
+    if (!Number.isFinite(channelId) || channelId <= 0) {
+      return reply.code(400).send({ success: false, message: '通道 ID 无效' });
+    }
+
+    try {
+      const result = await tokenRouter.pinStableFirstChannel(channelId, request.body?.model);
+      if (!result) {
+        return reply.code(404).send({ success: false, message: '通道不存在或不允许设置主通道' });
+      }
+      await clearRouteDecisionSnapshot(result.routeId);
+      invalidateTokenRouterCache();
+      return { success: true, result };
+    } catch (error: any) {
+      return reply.code(400).send({ success: false, message: error?.message || '设置主通道失败' });
+    }
   });
 
   // Delete a channel

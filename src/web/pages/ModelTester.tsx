@@ -89,6 +89,11 @@ type ForcedChannelOption = {
   value: string;
   label: string;
   description?: string;
+  accountLabel?: string;
+  siteLabel?: string;
+  tokenLabel?: string;
+  priorityLabel?: string;
+  reason?: string;
 };
 
 const POLL_INTERVAL_MS = 1200;
@@ -702,6 +707,28 @@ const inputBaseStyle: React.CSSProperties = {
   transition: 'border-color 0.2s',
 };
 
+function buildForcedChannelOption(candidate: Record<string, unknown>): ForcedChannelOption {
+  const channelId = Number(candidate.channelId);
+  const accountLabel = String(candidate.username || `account-${candidate.accountId || 'unknown'}`);
+  const siteLabel = String(candidate.siteName || 'unknown');
+  const tokenLabel = String(candidate.tokenName || 'default');
+  const priorityLabel = `P${candidate.priority ?? 0}`;
+  const reason = typeof candidate.reason === 'string' && candidate.reason.trim().length > 0
+    ? candidate.reason.trim()
+    : '';
+
+  return {
+    value: String(channelId),
+    label: `${accountLabel} @ ${siteLabel} / ${tokenLabel} (${priorityLabel})`,
+    description: reason || `当前生效：${tokenLabel}；固定后测试只走这个通道`,
+    accountLabel,
+    siteLabel,
+    tokenLabel,
+    priorityLabel,
+    ...(reason ? { reason } : {}),
+  };
+}
+
 function ParameterRow(props: {
   title: string;
   valueText?: string;
@@ -732,6 +759,31 @@ function ParameterRow(props: {
       {children}
     </div>
   );
+}
+
+function describeForcedChannelSelection(
+  forcedChannelId: number | null,
+  options: ForcedChannelOption[],
+): string {
+  if (typeof forcedChannelId !== 'number') {
+    return '默认自动选路；如需单独排查，可固定到一个候选通道。';
+  }
+
+  const selected = options.find((option) => option.value === String(forcedChannelId));
+  if (!selected) {
+    return `已固定到通道 #${forcedChannelId}，失败不会自动切换。`;
+  }
+
+  const parts = [
+    `已固定到通道 #${forcedChannelId}`,
+    selected.accountLabel && selected.siteLabel
+      ? `账号「${selected.accountLabel}」@「${selected.siteLabel}」`
+      : '',
+    selected.tokenLabel ? `当前生效令牌「${selected.tokenLabel}」` : '',
+    selected.priorityLabel ? selected.priorityLabel : '',
+  ].filter(Boolean);
+  const reason = selected.reason || selected.description || '';
+  return `${parts.join('，')}；失败不会自动切换。${reason ? ` ${reason}` : ''}`;
 }
 
 export default function ModelTester() {
@@ -988,13 +1040,7 @@ export default function ModelTester() {
           : [];
         const nextOptions = candidates
           .filter((candidate) => candidate?.eligible === true && typeof candidate?.channelId === 'number')
-          .map((candidate) => ({
-            value: String(candidate.channelId),
-            label: `${candidate.username || `account-${candidate.accountId || 'unknown'}`} @ ${candidate.siteName || 'unknown'} / ${candidate.tokenName || 'default'} (P${candidate.priority ?? 0})`,
-            description: typeof candidate.reason === 'string' && candidate.reason.trim().length > 0
-              ? candidate.reason
-              : undefined,
-          }));
+          .map((candidate) => buildForcedChannelOption(candidate));
         setForcedChannelOptions(nextOptions);
         if (nextOptions.length === 0) {
           setForcedChannelHint('当前模型暂无可固定通道。');
@@ -2688,10 +2734,7 @@ export default function ModelTester() {
               menuMaxHeight={300}
             />
             <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 4 }}>
-              {forcedChannelHint
-                || (typeof forcedChannelId === 'number'
-                  ? `已固定到通道 #${forcedChannelId}，失败不会自动切换。`
-                  : '默认自动选路；如需单独排查，可固定到一个候选通道。')}
+              {forcedChannelHint || describeForcedChannelSelection(forcedChannelId, forcedChannelOptions)}
             </div>
           </div>
 
@@ -3228,6 +3271,19 @@ export default function ModelTester() {
                       placeholder={inputs.mode === 'videos.create' ? '输入视频生成提示词' : '输入图片提示词'}
                       style={{ ...inputBaseStyle, resize: 'vertical' }}
                     />
+                    {inputs.mode === 'images.generate' && (
+                      <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '180px 1fr', gap: 10 }}>
+                        <input
+                          value={modeState.imagesSize}
+                          onChange={(event) => setModeState((prev) => ({ ...prev, imagesSize: event.target.value }))}
+                          placeholder="4096x4096"
+                          style={inputBaseStyle}
+                        />
+                        <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', display: 'flex', alignItems: 'center' }}>
+                          4K 输出会先请求上游图片，再在本地放大到目标尺寸
+                        </div>
+                      </div>
+                    )}
                     {(inputs.mode === 'images.edit' || inputs.mode === 'videos.create') && (
                       <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : (inputs.mode === 'images.edit' ? '1fr 1fr' : '1fr'), gap: 10 }}>
                         <label style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>

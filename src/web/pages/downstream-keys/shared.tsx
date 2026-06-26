@@ -160,10 +160,46 @@ export function RangeToggle({ range, onChange }: { range: Range; onChange: (r: R
   );
 }
 
-export function StatusBadge({ enabled }: { enabled: boolean }) {
+export function StatusBadge({
+  enabled,
+  onClick,
+  loading = false,
+}: {
+  enabled: boolean;
+  onClick?: () => void;
+  loading?: boolean;
+}) {
+  const label = loading ? '处理中...' : enabled ? '启用' : '禁用';
+  const className = `badge ${enabled ? 'badge-success' : 'badge-muted'}`;
+  const style: React.CSSProperties = {
+    fontSize: 11,
+    ...(onClick
+      ? {
+        border: 'none',
+        cursor: loading ? 'wait' : 'pointer',
+        opacity: loading ? 0.72 : 1,
+      }
+      : {}),
+  };
+
+  if (!onClick) {
+    return <span className={className} style={style}>{label}</span>;
+  }
+
   return (
-    <span className={`badge ${enabled ? 'badge-success' : 'badge-muted'}`} style={{ fontSize: 11 }}>
-      {enabled ? '启用' : '禁用'}
-    </span>
+    <button
+      type="button"
+      className={className}
+      style={style}
+      title={enabled ? '点击禁用该 API 密钥' : '点击启用该 API 密钥'}
+      aria-label={enabled ? '禁用该 API 密钥' : '启用该 API 密钥'}
+      disabled={loading}
+      onClick={(event) => {
+        event.stopPropagation();
+        onClick();
+      }}
+    >
+      {label}
+    </button>
   );
 }

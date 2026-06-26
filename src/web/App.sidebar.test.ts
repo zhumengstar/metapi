@@ -29,4 +29,11 @@ describe('App sidebar config', () => {
     expect(source).toContain("const OAuthManagement = lazy(() => import('./pages/OAuthManagement.js'));");
     expect(source).toContain('<Route path="/oauth" element={<OAuthManagement />} />');
   });
+
+  it('adds standalone 模型测试 navigation entry', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/web/App.tsx'), 'utf8');
+
+    expect(source).toContain("{ to: '/playground', label: '模型测试'");
+    expect(source).toContain("<Route path=\"/playground\" element={<ModelTester />} />");
+  });
 });

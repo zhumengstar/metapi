@@ -1145,7 +1145,11 @@ export default function DownstreamKeys() {
                   title={row.name}
                   headerActions={(
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <StatusBadge enabled={row.enabled} />
+                      <StatusBadge
+                        enabled={row.enabled}
+                        loading={loadingToggle}
+                        onClick={() => void toggleEnabled(row)}
+                      />
                       <input
                         type="checkbox"
                         aria-label={`选择 ${row.name}`}
@@ -1217,7 +1221,11 @@ export default function DownstreamKeys() {
                       <td>
                         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
                           <strong style={{ color: 'var(--color-text-primary)' }}>{row.name}</strong>
-                          <StatusBadge enabled={row.enabled} />
+                          <StatusBadge
+                            enabled={row.enabled}
+                            loading={loadingToggle}
+                            onClick={() => void toggleEnabled(row)}
+                          />
                         </div>
                         <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 4 }}>
                           <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--color-text-muted)' }}>{row.keyMasked}</span>

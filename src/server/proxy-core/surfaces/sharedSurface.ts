@@ -203,7 +203,10 @@ export function bindSurfaceStickyChannel(input: {
     channel: { id: number };
     account?: { extraConfig?: string | null; oauthProvider?: string | null } | null;
   };
+  retryCount?: number | null;
 }): void {
+  const retryCount = Number(input.retryCount ?? 0);
+  if (Number.isFinite(retryCount) && retryCount > 0) return;
   proxyChannelCoordinator.bindStickyChannel(
     input.stickySessionKey,
     input.selected.channel.id,
@@ -513,6 +516,7 @@ export async function recordSurfaceSuccess(input: {
     input.modelName,
     undefined,
     resolvedUsage.usageSource === 'unknown' ? 0 : resolvedUsage.promptTokens,
+    { retryCount: input.retryCount },
   );
   input.recordDownstreamCost?.(estimatedCost);
   const logTokens = resolvedUsage.usageSource === 'unknown'
@@ -641,6 +645,7 @@ export function createSurfaceFailureToolkit(input: {
         status: args.status,
         errorText: rawErrText,
         modelName: args.modelName,
+        retryCount: args.retryCount,
       });
       await log({
         selected: args.selected,
@@ -708,6 +713,7 @@ export function createSurfaceFailureToolkit(input: {
         status: args.failure.status,
         errorText: args.failure.reason,
         modelName: args.modelName,
+        retryCount: args.retryCount,
       });
       await log({
         selected: args.selected,
@@ -760,6 +766,7 @@ export function createSurfaceFailureToolkit(input: {
       await tokenRouter.recordFailure(args.selected.channel.id, {
         errorText: args.errorMessage,
         modelName: args.modelName,
+        retryCount: args.retryCount,
       });
       await log({
         selected: args.selected,
@@ -815,11 +822,13 @@ export function createSurfaceFailureToolkit(input: {
           status: args.runtimeFailureStatus,
           errorText: errorMessage,
           modelName: args.modelName,
+          retryCount: args.retryCount,
         });
       } else {
         await tokenRouter.recordFailure(args.selected.channel.id, {
           errorText: errorMessage,
           modelName: args.modelName,
+          retryCount: args.retryCount,
         });
       }
       await log({

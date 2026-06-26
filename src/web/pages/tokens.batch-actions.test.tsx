@@ -13,6 +13,8 @@ const { apiMock } = vi.hoisted(() => ({
     getAccountTokenGroups: vi.fn(),
     batchUpdateAccountTokens: vi.fn(),
     testAccountTokenModelAvailability: vi.fn(),
+    getAccountTokenUiSettings: vi.fn(),
+    updateAccountTokenUiSettings: vi.fn(),
   },
 }));
 
@@ -28,9 +30,37 @@ async function flushMicrotasks() {
 }
 
 describe('Tokens batch actions', () => {
+  const localStorageState = new Map<string, string>();
+
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorageState.clear();
+    Object.defineProperty(globalThis, 'localStorage', {
+      value: {
+        getItem: vi.fn((key: string) => (localStorageState.has(key) ? localStorageState.get(key)! : null)),
+        setItem: vi.fn((key: string, value: string) => {
+          localStorageState.set(String(key), String(value));
+        }),
+        removeItem: vi.fn((key: string) => {
+          localStorageState.delete(String(key));
+        }),
+        clear: vi.fn(() => {
+          localStorageState.clear();
+        }),
+      },
+      configurable: true,
+      writable: true,
+    });
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        localStorage: globalThis.localStorage,
+      },
+      configurable: true,
+      writable: true,
+    });
     installAccountsSnapshotCompat(apiMock);
+    apiMock.getAccountTokenUiSettings.mockResolvedValue({ maxGroupRatioFilter: '' });
+    apiMock.updateAccountTokenUiSettings.mockImplementation(async (data: any) => ({ maxGroupRatioFilter: data?.maxGroupRatioFilter || '' }));
     apiMock.getAccountTokens.mockResolvedValue([
       {
         id: 1,
@@ -40,6 +70,8 @@ describe('Tokens batch actions', () => {
         enabled: true,
         isDefault: false,
         modelNames: ['gpt-5.5', 'claude-sonnet-4-6'],
+        groupRatioAvailable: true,
+        groupRatio: 0.04,
         account: { username: 'alpha' },
         site: { name: 'Site A', url: 'https://site-a.example.com' },
       },
@@ -51,6 +83,8 @@ describe('Tokens batch actions', () => {
         enabled: true,
         isDefault: false,
         modelNames: ['gpt-4o-mini'],
+        groupRatioAvailable: true,
+        groupRatio: 0.09,
         account: { username: 'alpha' },
         site: { name: 'Site A', url: 'https://site-a.example.com' },
       },
@@ -218,6 +252,61 @@ describe('Tokens batch actions', () => {
       expect(batchDeleteButton.props.disabled).toBe(true);
     } finally {
       root?.unmount();
+    }
+  });
+
+  it('persists and restores the max group ratio filter from local storage', async () => {
+    vi.useFakeTimers();
+    let root!: WebTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <ToastProvider>
+            <MemoryRouter initialEntries={['/accounts?segment=tokens']}>
+              <TokensPanel />
+            </MemoryRouter>
+          </ToastProvider>,
+        );
+      });
+      await flushMicrotasks();
+
+      const ratioInput = root.root.find((node) => node.type === 'input' && node.props['aria-label'] === '只展示小于该倍率的令牌');
+      await act(async () => {
+        ratioInput.props.onChange({ target: { value: '0.05' } });
+      });
+      await flushMicrotasks();
+      await act(async () => {
+        vi.advanceTimersByTime(350);
+        await Promise.resolve();
+      });
+      await flushMicrotasks();
+
+      expect(localStorage.getItem('metapi.tokens.maxGroupRatioFilter')).toBe('0.05');
+      expect(apiMock.updateAccountTokenUiSettings).toHaveBeenCalledWith({ maxGroupRatioFilter: '0.05' });
+      expect(root.root.findAll((node) => node.props['data-testid'] === 'token-row-1')).toHaveLength(1);
+      expect(root.root.findAll((node) => node.props['data-testid'] === 'token-row-2')).toHaveLength(0);
+
+      root.unmount();
+      apiMock.getAccountTokenUiSettings.mockResolvedValue({ maxGroupRatioFilter: '0.05' });
+
+      await act(async () => {
+        root = create(
+          <ToastProvider>
+            <MemoryRouter initialEntries={['/accounts?segment=tokens']}>
+              <TokensPanel />
+            </MemoryRouter>
+          </ToastProvider>,
+        );
+      });
+      await flushMicrotasks();
+
+      const restoredRatioInput = root.root.find((node) => node.type === 'input' && node.props['aria-label'] === '只展示小于该倍率的令牌');
+      expect(restoredRatioInput.props.value).toBe('0.05');
+      expect(root.root.findAll((node) => node.props['data-testid'] === 'token-row-1')).toHaveLength(1);
+      expect(root.root.findAll((node) => node.props['data-testid'] === 'token-row-2')).toHaveLength(0);
+    } finally {
+      root?.unmount();
+      vi.useRealTimers();
     }
   });
 

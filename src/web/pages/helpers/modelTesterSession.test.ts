@@ -11,6 +11,7 @@ import {
   buildEmbeddingsRequestEnvelope,
   buildFileUploadRequestEnvelope,
   buildGeminiNativeConversationProxyEnvelope,
+  buildImagesGenerationsRequestEnvelope,
   buildRawProxyRequestEnvelope,
   buildSearchRequestEnvelope,
   attachForcedChannelToEnvelope,
@@ -977,6 +978,29 @@ describe('modelTesterSession', () => {
     );
 
     expect(options.map((option) => option.name)).toEqual(['gpt-image-2']);
+  });
+
+  it('builds image generation envelope with 4k size by default', () => {
+    const payload = buildImagesGenerationsRequestEnvelope(
+      {
+        ...DEFAULT_INPUTS,
+        mode: 'images.generate',
+        model: 'gpt-image-1',
+      },
+      {
+        ...DEFAULT_MODE_STATE,
+        imagesPrompt: 'draw a poster',
+      },
+    );
+
+    expect(payload).toMatchObject({
+      path: '/v1/images/generations',
+      jsonBody: {
+        model: 'gpt-image-1',
+        prompt: 'draw a poster',
+        size: '4096x4096',
+      },
+    });
   });
 
   it('filters tester model options by selected mode', () => {

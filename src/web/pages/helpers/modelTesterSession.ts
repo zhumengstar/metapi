@@ -132,6 +132,7 @@ export type ModelTesterModeState = {
   searchAllowedDomains: string;
   searchBlockedDomains: string;
   imagesPrompt: string;
+  imagesSize: string;
   imagesMaskDataUrl: string;
   videosPrompt: string;
   videosInspectId: string;
@@ -203,6 +204,7 @@ export const DEFAULT_MODE_STATE: ModelTesterModeState = {
   searchAllowedDomains: '',
   searchBlockedDomains: '',
   imagesPrompt: '',
+  imagesSize: '4096x4096',
   imagesMaskDataUrl: '',
   videosPrompt: '',
   videosInspectId: '',
@@ -788,6 +790,7 @@ const parseModeState = (value: unknown): ModelTesterModeState => {
     searchAllowedDomains: sanitizeString(value.searchAllowedDomains),
     searchBlockedDomains: sanitizeString(value.searchBlockedDomains),
     imagesPrompt: sanitizeString(value.imagesPrompt),
+    imagesSize: sanitizeString(value.imagesSize) || DEFAULT_MODE_STATE.imagesSize,
     imagesMaskDataUrl: sanitizeString(value.imagesMaskDataUrl),
     videosPrompt: sanitizeString(value.videosPrompt),
     videosInspectId: sanitizeString(value.videosInspectId),
@@ -1387,6 +1390,7 @@ export const buildImagesGenerationsRequestEnvelope = (
   jsonBody: {
     model: inputs.model,
     prompt: modeState.imagesPrompt,
+    size: modeState.imagesSize || '4096x4096',
   },
 });
 

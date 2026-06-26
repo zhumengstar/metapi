@@ -160,6 +160,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             status: 502,
             errorText: data.message,
             modelName: upstreamModel,
+            retryCount,
           }));
           logProxy(
             selected,
@@ -206,7 +207,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           });
         });
         await recordTokenRouterEventBestEffort('record channel success', () => (
-          tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel, undefined, 0)
+          tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel, undefined, 0, { retryCount })
         ));
         await recordTokenRouterEventBestEffort('record downstream cost usage', () => (
           recordDownstreamCostUsage(request, estimatedCost)
@@ -239,6 +240,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           status,
           errorText,
           modelName: upstreamModel,
+          retryCount,
         }));
         logProxy(
           selected,
@@ -418,6 +420,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             status: 502,
             errorText: data.message,
             modelName: upstreamModel,
+            retryCount,
           }));
           logProxy(
             selected,
@@ -464,7 +467,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           });
         });
         await recordTokenRouterEventBestEffort('record channel success', () => (
-          tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel, undefined, 0)
+          tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel, undefined, 0, { retryCount })
         ));
         await recordTokenRouterEventBestEffort('record downstream cost usage', () => (
           recordDownstreamCostUsage(request, estimatedCost)
@@ -497,6 +500,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           status,
           errorText,
           modelName: upstreamModel,
+          retryCount,
         }));
         logProxy(
           selected,
@@ -704,7 +708,8 @@ async function dispatchInternalGeminiImageGeneration(input: {
   const upstreamPath = action === 'streamGenerateContent'
     ? '/v1internal:streamGenerateContent?alt=sse'
     : '/v1internal:generateContent';
-  const requestBody = buildGeminiImageGenerationBody(input.body);
+  const geminiBody = buildGeminiImageGenerationBody(input.body);
+  const requestBody = buildInternalGeminiRuntimeBody(geminiBody, isGeminiCli);
   const oauth = getOauthInfoFromAccount(selected.account);
   const requestHeaders = {
     'Content-Type': 'application/json',
@@ -772,10 +777,11 @@ async function dispatchInternalGeminiImageEdit(input: {
   const upstreamPath = action === 'streamGenerateContent'
     ? '/v1internal:streamGenerateContent?alt=sse'
     : '/v1internal:generateContent';
-  const requestBody = await buildGeminiImageEditBody({
+  const geminiBody = await buildGeminiImageEditBody({
     multipartForm: input.multipartForm,
     jsonBody: body,
   });
+  const requestBody = buildInternalGeminiRuntimeBody(geminiBody, isGeminiCli);
   const oauth = getOauthInfoFromAccount(selected.account);
   const requestHeaders = {
     'Content-Type': 'application/json',
@@ -824,6 +830,13 @@ async function dispatchInternalGeminiImageEdit(input: {
 function isInternalGeminiImagePlatform(platform: unknown): boolean {
   const normalized = String(platform || '').trim().toLowerCase();
   return normalized === 'antigravity' || normalized === 'gemini-cli';
+}
+
+function buildInternalGeminiRuntimeBody(
+  geminiBody: Record<string, unknown>,
+  isGeminiCli: boolean,
+): Record<string, unknown> {
+  return isGeminiCli ? geminiBody : { request: geminiBody };
 }
 
 function buildGeminiImageGenerationBody(body: Record<string, unknown>): Record<string, unknown> {

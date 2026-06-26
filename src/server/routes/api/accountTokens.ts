@@ -17,7 +17,8 @@ import {
   upsertAccountTokenGroupEnabledPreference,
 } from '../../services/accountTokenService.js';
 import { getAdapter } from '../../services/platforms/index.js';
-import { getCredentialModeFromExtraConfig, getProxyUrlFromExtraConfig, resolvePlatformUserId } from '../../services/accountExtraConfig.js';
+import { getAutoReloginConfig, getCredentialModeFromExtraConfig, getProxyUrlFromExtraConfig, mergeAccountExtraConfig, resolvePlatformUserId } from '../../services/accountExtraConfig.js';
+import { decryptAccountPassword } from '../../services/accountCredentialService.js';
 import {
   appendBackgroundTaskLog,
   startBackgroundTask,
@@ -59,6 +60,11 @@ type AccountWithSiteRow = {
   accounts: typeof schema.accounts.$inferSelect;
   sites: typeof schema.sites.$inferSelect;
 };
+
+type AccountActivationResult =
+  | { status: 'not-needed'; row: AccountWithSiteRow }
+  | { status: 'success'; row: AccountWithSiteRow; message: string }
+  | { status: 'failed'; message: string };
 
 type SyncExecutionResult = {
   accountId: number;
@@ -441,18 +447,124 @@ async function withTimeout<T>(fn: () => Promise<T>, timeoutMs: number, timeoutMe
   }
 }
 
+async function tryActivateAccount(row: AccountWithSiteRow): Promise<AccountActivationResult> {
+  if ((row.accounts.status || 'active') === 'active') {
+    return { status: 'not-needed', row };
+  }
+
+  const relogin = getAutoReloginConfig(row.accounts.extraConfig);
+  if (!relogin) {
+    return { status: 'failed', message: '账号未激活且缺少自动重登录配置' };
+  }
+
+  const adapter = getAdapter(row.sites.platform);
+  if (!adapter) {
+    return { status: 'failed', message: '站点平台不支持账号激活' };
+  }
+
+  const password = decryptAccountPassword(relogin.passwordCipher);
+  if (!password) {
+    return { status: 'failed', message: '登录凭证密码解密失败，无法激活账号' };
+  }
+
+  try {
+    const loginResult = await withTimeout(
+      () => withAccountProxyOverride(
+        getProxyUrlFromExtraConfig(row.accounts.extraConfig),
+        () => adapter.login(row.sites.url, relogin.username, password),
+      ),
+      TOKEN_SYNC_TIMEOUT_MS,
+      `账号激活超时（${Math.max(1, Math.round(TOKEN_SYNC_TIMEOUT_MS / 1000))}s）`,
+    );
+
+    if (!loginResult.success || !loginResult.accessToken) {
+      return { status: 'failed', message: loginResult.message || '账号激活失败' };
+    }
+
+    const nextExtraConfig = mergeAccountExtraConfig(row.accounts.extraConfig, {
+      credentialMode: 'session',
+      autoRelogin: {
+        username: relogin.username,
+        passwordCipher: relogin.passwordCipher,
+        updatedAt: new Date().toISOString(),
+      },
+      ...(loginResult.refreshToken ? {
+        sub2apiAuth: {
+          refreshToken: loginResult.refreshToken,
+          tokenExpiresAt: loginResult.tokenExpiresAt,
+        },
+      } : {}),
+    });
+
+    await db.update(schema.accounts)
+      .set({
+        accessToken: loginResult.accessToken,
+        status: 'active',
+        extraConfig: nextExtraConfig,
+        updatedAt: new Date().toISOString(),
+      })
+      .where(eq(schema.accounts.id, row.accounts.id))
+      .run();
+
+    const refreshed = await db.select()
+      .from(schema.accounts)
+      .where(eq(schema.accounts.id, row.accounts.id))
+      .get();
+
+    return {
+      status: 'success',
+      row: {
+        accounts: refreshed || {
+          ...row.accounts,
+          accessToken: loginResult.accessToken,
+          status: 'active',
+          extraConfig: nextExtraConfig,
+        },
+        sites: row.sites,
+      },
+      message: '账号已激活',
+    };
+  } catch (error: any) {
+    return {
+      status: 'failed',
+      message: `账号激活失败：${String(error?.message || 'unknown error')}`,
+    };
+  }
+}
+
 async function executeAccountTokenSync(row: AccountWithSiteRow): Promise<SyncExecutionResult> {
+  const activation = await tryActivateAccount(row);
+  if (activation.status === 'failed') {
+    return {
+      accountId: row.accounts.id,
+      accountName: row.accounts.username || `account-${row.accounts.id}`,
+      accountStatus: row.accounts.status,
+      siteId: row.sites.id,
+      siteName: row.sites.name,
+      siteStatus: row.sites.status,
+      status: 'failed',
+      reason: 'activation_failed',
+      message: activation.message,
+      synced: false,
+      created: 0,
+      updated: 0,
+      total: 0,
+      defaultTokenId: null,
+    };
+  }
+
+  const activeRow = activation.row;
   const accountId = row.accounts.id;
   const base = {
     accountId,
-    accountName: row.accounts.username || `account-${accountId}`,
-    accountStatus: row.accounts.status,
-    siteId: row.sites.id,
-    siteName: row.sites.name,
-    siteStatus: row.sites.status,
+    accountName: activeRow.accounts.username || `account-${accountId}`,
+    accountStatus: activeRow.accounts.status,
+    siteId: activeRow.sites.id,
+    siteName: activeRow.sites.name,
+    siteStatus: activeRow.sites.status,
   };
 
-  if (isSiteDisabled(row.sites.status)) {
+  if (isSiteDisabled(activeRow.sites.status)) {
     return {
       ...base,
       status: 'skipped',
@@ -466,7 +578,7 @@ async function executeAccountTokenSync(row: AccountWithSiteRow): Promise<SyncExe
     };
   }
 
-  if (isApiKeyConnection(row.accounts)) {
+  if (isApiKeyConnection(activeRow.accounts)) {
     return {
       ...base,
       status: 'skipped',
@@ -480,7 +592,7 @@ async function executeAccountTokenSync(row: AccountWithSiteRow): Promise<SyncExe
     };
   }
 
-  if (!row.accounts.accessToken) {
+  if (!activeRow.accounts.accessToken) {
     return {
       ...base,
       status: 'skipped',
@@ -493,7 +605,7 @@ async function executeAccountTokenSync(row: AccountWithSiteRow): Promise<SyncExe
     };
   }
 
-  const adapter = getAdapter(row.sites.platform);
+  const adapter = getAdapter(activeRow.sites.platform);
   if (!adapter) {
     return {
       ...base,
@@ -509,11 +621,11 @@ async function executeAccountTokenSync(row: AccountWithSiteRow): Promise<SyncExe
   }
 
   try {
-    const platformUserId = resolvePlatformUserId(row.accounts.extraConfig, row.accounts.username);
-    const accountProxyUrl = getProxyUrlFromExtraConfig(row.accounts.extraConfig);
+    const platformUserId = resolvePlatformUserId(activeRow.accounts.extraConfig, activeRow.accounts.username);
+    const accountProxyUrl = getProxyUrlFromExtraConfig(activeRow.accounts.extraConfig);
     const tokens = await withTimeout(
       () => withAccountProxyOverride(accountProxyUrl,
-        () => adapter.getApiTokens(row.sites.url, row.accounts.accessToken, platformUserId)),
+        () => adapter.getApiTokens(activeRow.sites.url, activeRow.accounts.accessToken, platformUserId)),
       TOKEN_SYNC_TIMEOUT_MS,
       `token sync timeout (${Math.round(TOKEN_SYNC_TIMEOUT_MS / 1000)}s)`,
     );
@@ -603,7 +715,6 @@ async function appendTokenSyncEvent(result: SyncExecutionResult) {
 async function executeSyncAllAccountTokens() {
   const rows = await db.select().from(schema.accounts)
     .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
-    .where(eq(schema.accounts.status, 'active'))
     .all();
 
   let pricingRefresh: Awaited<ReturnType<typeof buildTokenGroupPricingOverview>> | null = null;
@@ -679,37 +790,55 @@ async function deleteAllLocalAccountTokens(accountId: number) {
 }
 
 async function deleteAllUpstreamAccountTokens(row: AccountWithSiteRow): Promise<AccountUpstreamTokenDeleteResult> {
-  const accountId = row.accounts.id;
+  const activation = await tryActivateAccount(row);
+  if (activation.status === 'failed') {
+    return {
+      accountId: row.accounts.id,
+      accountName: row.accounts.username || `account-${row.accounts.id}`,
+      accountStatus: row.accounts.status,
+      siteId: row.sites.id,
+      siteName: row.sites.name,
+      siteStatus: row.sites.status,
+      status: 'failed',
+      reason: 'activation_failed',
+      message: activation.message,
+      total: 0,
+      deleted: 0,
+    };
+  }
+
+  const activeRow = activation.row;
+  const accountId = activeRow.accounts.id;
   const base = {
     accountId,
-    accountName: row.accounts.username || `account-${accountId}`,
-    accountStatus: row.accounts.status,
-    siteId: row.sites.id,
-    siteName: row.sites.name,
-    siteStatus: row.sites.status,
+    accountName: activeRow.accounts.username || `account-${accountId}`,
+    accountStatus: activeRow.accounts.status,
+    siteId: activeRow.sites.id,
+    siteName: activeRow.sites.name,
+    siteStatus: activeRow.sites.status,
   };
 
-  if (isSiteDisabled(row.sites.status)) {
+  if (isSiteDisabled(activeRow.sites.status)) {
     return { ...base, status: 'skipped', reason: 'site_disabled', message: 'site disabled', total: 0, deleted: 0 };
   }
-  if (isApiKeyConnection(row.accounts)) {
+  if (isApiKeyConnection(activeRow.accounts)) {
     return { ...base, status: 'skipped', reason: 'apikey_connection', message: 'apikey connection does not support account token deletion', total: 0, deleted: 0 };
   }
-  if (!row.accounts.accessToken?.trim()) {
+  if (!activeRow.accounts.accessToken?.trim()) {
     return { ...base, status: 'skipped', reason: 'missing_access_token', message: '账号缺少访问令牌', total: 0, deleted: 0 };
   }
 
-  const adapter = getAdapter(row.sites.platform);
+  const adapter = getAdapter(activeRow.sites.platform);
   if (!adapter) {
-    return { ...base, status: 'failed', reason: 'unsupported_platform', message: `不支持的平台: ${row.sites.platform}`, total: 0, deleted: 0 };
+    return { ...base, status: 'failed', reason: 'unsupported_platform', message: `不支持的平台: ${activeRow.sites.platform}`, total: 0, deleted: 0 };
   }
 
   try {
-    const platformUserId = resolvePlatformUserId(row.accounts.extraConfig, row.accounts.username);
-    const accountProxyUrl = getProxyUrlFromExtraConfig(row.accounts.extraConfig);
+    const platformUserId = resolvePlatformUserId(activeRow.accounts.extraConfig, activeRow.accounts.username);
+    const accountProxyUrl = getProxyUrlFromExtraConfig(activeRow.accounts.extraConfig);
     const upstreamTokens = await withTimeout(
       () => withAccountProxyOverride(accountProxyUrl,
-        () => adapter.getApiTokens(row.sites.url, row.accounts.accessToken, platformUserId)),
+        () => adapter.getApiTokens(activeRow.sites.url, activeRow.accounts.accessToken, platformUserId)),
       TOKEN_SYNC_TIMEOUT_MS,
       `token list timeout (${Math.round(TOKEN_SYNC_TIMEOUT_MS / 1000)}s)`,
     );
@@ -720,11 +849,11 @@ async function deleteAllUpstreamAccountTokens(row: AccountWithSiteRow): Promise<
       if (!tokenKey) continue;
       const tokenGroup = String(token.tokenGroup || '').trim() || null;
       const tokenName = String(token.name || '').trim() || null;
-      const removed = await withTimeout(
-        () => withAccountProxyOverride(accountProxyUrl,
-          () => adapter.deleteApiToken(
-            row.sites.url,
-            row.accounts.accessToken,
+        const removed = await withTimeout(
+          () => withAccountProxyOverride(accountProxyUrl,
+            () => adapter.deleteApiToken(
+            activeRow.sites.url,
+            activeRow.accounts.accessToken,
             tokenKey,
             platformUserId,
             { name: tokenName, group: tokenGroup },
@@ -1320,8 +1449,15 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     }
 
     const existing = row.account_tokens;
-    const account = row.accounts;
-    const site = row.sites;
+    const activation = await tryActivateAccount({ accounts: row.accounts, sites: row.sites });
+    if (activation.status === 'failed') {
+      appendDeleteLog(options.taskId, `令牌 #${tokenId} 删除失败：${activation.message}`);
+      const result = { ...baseResult, message: activation.message };
+      await appendTokenDeleteEvent(result);
+      return result;
+    }
+    const account = activation.row.accounts;
+    const site = activation.row.sites;
     const labeledResult = {
       ...baseResult,
       tokenName: existing.name || undefined,
@@ -1331,7 +1467,7 @@ export async function accountTokensRoutes(app: FastifyInstance) {
     const tokenLabel = buildDeleteTokenLabel(labeledResult);
     appendDeleteLog(options.taskId, `开始删除账号令牌：${tokenLabel}`);
 
-    if (isApiKeyConnection(row.accounts)) {
+    if (isApiKeyConnection(account)) {
       appendDeleteLog(options.taskId, `${tokenLabel} 删除失败：API Key 连接不支持管理账号令牌`);
       const result = { ...labeledResult, message: 'API Key 连接不支持管理账号令牌' };
       await appendTokenDeleteEvent(result);
@@ -2248,7 +2384,6 @@ export async function accountTokensRoutes(app: FastifyInstance) {
 
     const rows = await db.select().from(schema.accounts)
       .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
-      .where(eq(schema.accounts.status, 'active'))
       .all();
 
     if (parsedBody.data.wait) {

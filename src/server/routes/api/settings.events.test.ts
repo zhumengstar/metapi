@@ -965,6 +965,36 @@ describe('settings and auth events', () => {
     expect(body.message).toContain('198.51.100.0/99');
   });
 
+  it('persists account token page ui settings on the server', async () => {
+    const update = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/ui/account-tokens',
+      payload: {
+        maxGroupRatioFilter: '0.045x',
+      },
+    });
+
+    expect(update.statusCode).toBe(200);
+    expect(update.json()).toEqual({
+      maxGroupRatioFilter: '0.045',
+    });
+
+    const saved = await db.select().from(schema.settings)
+      .where(eq(schema.settings.key, 'account_token_ui_settings_v1'))
+      .get();
+    expect(saved?.value).toBe(JSON.stringify({ maxGroupRatioFilter: '0.045' }));
+
+    const loaded = await app.inject({
+      method: 'GET',
+      url: '/api/settings/ui/account-tokens',
+    });
+
+    expect(loaded.statusCode).toBe(200);
+    expect(loaded.json()).toEqual({
+      maxGroupRatioFilter: '0.045',
+    });
+  });
+
   it('appends event when admin auth token changes', async () => {
     const response = await app.inject({
       method: 'POST',

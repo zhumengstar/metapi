@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { and, eq, sql } from 'drizzle-orm';
 import { mergeAccountExtraConfig } from '../../services/accountExtraConfig.js';
+import { encryptAccountPassword } from '../../services/accountCredentialService.js';
 import { waitForBackgroundTaskToReachTerminalState } from '../../test-fixtures/backgroundTaskTestUtils.js';
 
 const getApiTokensMock = vi.fn();
@@ -12,6 +13,7 @@ const getApiTokenMock = vi.fn();
 const createApiTokenMock = vi.fn();
 const getUserGroupsMock = vi.fn();
 const deleteApiTokenMock = vi.fn();
+const loginMock = vi.fn();
 const getModelsMock = vi.fn();
 const fetchModelPricingCatalogMock = vi.fn();
 const testAccountTokenModelAvailabilityMock = vi.fn();
@@ -22,6 +24,7 @@ type HealthCheckServiceModule = typeof import('../../services/accountTokenHealth
 
 vi.mock('../../services/platforms/index.js', () => ({
   getAdapter: () => ({
+    login: (...args: unknown[]) => loginMock(...args),
     getApiTokens: (...args: unknown[]) => getApiTokensMock(...args),
     getApiToken: (...args: unknown[]) => getApiTokenMock(...args),
     createApiToken: (...args: unknown[]) => createApiTokenMock(...args),
@@ -127,7 +130,12 @@ describe('account tokens sync routes with site status', () => {
     }
   }
 
-  const seedAccount = async (input: { siteStatus?: 'active' | 'disabled'; accountStatus?: string; accessToken?: string | null }) => {
+  const seedAccount = async (input: {
+    siteStatus?: 'active' | 'disabled';
+    accountStatus?: string;
+    accessToken?: string | null;
+    accountExtraConfig?: string | null;
+  }) => {
     const id = nextSeed();
     const site = await db.insert(schema.sites).values({
       name: `site-${id}`,
@@ -143,6 +151,7 @@ describe('account tokens sync routes with site status', () => {
       username: `user-${id}`,
       accessToken: input.accessToken ?? `access-token-${id}`,
       status: input.accountStatus ?? 'active',
+      extraConfig: input.accountExtraConfig ?? null,
     }).returning().get();
 
     return { site, account };
@@ -178,6 +187,7 @@ describe('account tokens sync routes with site status', () => {
     createApiTokenMock.mockReset();
     getUserGroupsMock.mockReset();
     deleteApiTokenMock.mockReset();
+    loginMock.mockReset();
     getModelsMock.mockReset();
     getModelsMock.mockResolvedValue(['gpt-5.5']);
     fetchModelPricingCatalogMock.mockReset();
@@ -1278,10 +1288,19 @@ describe('account tokens sync routes with site status', () => {
     expect(fetchModelPricingCatalogMock).not.toHaveBeenCalled();
   });
 
-  it('sync-all skips disabled-site accounts and syncs active-site accounts', async () => {
+  it('sync-all activates expired accounts before syncing and still skips disabled-site accounts', async () => {
     const disabled = await seedAccount({ siteStatus: 'disabled' });
-    const active = await seedAccount({ siteStatus: 'active' });
+    const expired = await seedAccount({ siteStatus: 'active', accountStatus: 'expired', accountExtraConfig: JSON.stringify({
+      autoRelogin: {
+        username: 'admin',
+        passwordCipher: encryptAccountPassword('plain-password'),
+      },
+    }) });
 
+    loginMock.mockResolvedValue({
+      success: true,
+      accessToken: 'refreshed-access-token',
+    });
     getApiTokensMock.mockResolvedValue([
       { name: 'default', key: 'sk-synced-token', enabled: true },
     ]);
@@ -1314,7 +1333,7 @@ describe('account tokens sync routes with site status', () => {
     });
 
     const skipped = body.results.find((item) => item.accountId === disabled.account.id);
-    const synced = body.results.find((item) => item.accountId === active.account.id);
+    const synced = body.results.find((item) => item.accountId === expired.account.id);
 
     expect(skipped).toMatchObject({
       accountId: disabled.account.id,
@@ -1322,14 +1341,16 @@ describe('account tokens sync routes with site status', () => {
       reason: 'site_disabled',
     });
     expect(synced).toMatchObject({
-      accountId: active.account.id,
+      accountId: expired.account.id,
       status: 'synced',
       synced: true,
     });
 
+    expect(loginMock).toHaveBeenCalledTimes(1);
+
     const syncedTokens = await db.select()
       .from(schema.accountTokens)
-      .where(eq(schema.accountTokens.accountId, active.account.id))
+      .where(eq(schema.accountTokens.accountId, expired.account.id))
       .all();
     expect(syncedTokens).toHaveLength(1);
     expect(syncedTokens[0]).toMatchObject({
@@ -1339,8 +1360,17 @@ describe('account tokens sync routes with site status', () => {
     });
   });
 
-  it('deletes all upstream tokens for a single account', async () => {
-    const { account } = await seedAccount({ siteStatus: 'active' });
+  it('activates expired account before deleting all upstream tokens', async () => {
+    const { account } = await seedAccount({
+      siteStatus: 'active',
+      accountStatus: 'expired',
+      accountExtraConfig: JSON.stringify({
+        autoRelogin: {
+          username: 'admin',
+        passwordCipher: encryptAccountPassword('plain-password'),
+        },
+      }),
+    });
     await db.insert(schema.accountTokens).values([
       {
         accountId: account.id,
@@ -1361,6 +1391,10 @@ describe('account tokens sync routes with site status', () => {
       { name: 'token-a', key: 'sk-token-a', enabled: true },
       { name: 'token-b', key: 'sk-token-b', enabled: true },
     ]);
+    loginMock.mockResolvedValue({
+      success: true,
+      accessToken: 'refreshed-access-token',
+    });
     deleteApiTokenMock.mockResolvedValue(true);
 
     const response = await app.inject({
@@ -1376,6 +1410,7 @@ describe('account tokens sync routes with site status', () => {
       total: 2,
     });
 
+    expect(loginMock).toHaveBeenCalledTimes(1);
     const remaining = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.accountId, account.id)).all();
     expect(remaining).toHaveLength(0);
     expect(deleteApiTokenMock).toHaveBeenCalledTimes(2);
@@ -1737,8 +1772,17 @@ describe('account tokens sync routes with site status', () => {
     expect(listed.find((item) => item.id === tokenRows[0].id)?.tokenGroup).toBeNull();
   });
 
-  it('deletes upstream token before removing local token', async () => {
-    const { account, site } = await seedAccount({ siteStatus: 'active' });
+  it('activates expired account before deleting upstream token', async () => {
+    const { account, site } = await seedAccount({
+      siteStatus: 'active',
+      accountStatus: 'expired',
+      accountExtraConfig: JSON.stringify({
+        autoRelogin: {
+          username: 'admin',
+          passwordCipher: encryptAccountPassword('plain-password'),
+        },
+      }),
+    });
     const token = await db.insert(schema.accountTokens).values({
       accountId: account.id,
       name: 'upstream-token',
@@ -1747,6 +1791,10 @@ describe('account tokens sync routes with site status', () => {
       enabled: true,
       isDefault: false,
     }).returning().get();
+    loginMock.mockResolvedValue({
+      success: true,
+      accessToken: 'refreshed-access-token',
+    });
     deleteApiTokenMock.mockResolvedValue(true);
 
     const response = await app.inject({
@@ -1761,8 +1809,9 @@ describe('account tokens sync routes with site status', () => {
     const task = await waitForBackgroundTaskToReachTerminalState(getBackgroundTask, body.jobId);
     expect(task?.status).toBe('succeeded');
     expect(deleteApiTokenMock).toHaveBeenCalledTimes(1);
+    expect(loginMock).toHaveBeenCalledTimes(1);
     expect(deleteApiTokenMock.mock.calls[0][0]).toBe(site.url);
-    expect(deleteApiTokenMock.mock.calls[0][1]).toBe(account.accessToken);
+    expect(deleteApiTokenMock.mock.calls[0][1]).toBe('refreshed-access-token');
     expect(deleteApiTokenMock.mock.calls[0][2]).toBe('sk-upstream-token');
 
     const removed = await db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, token.id)).get();

@@ -1,6 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import cron from 'node-cron';
 import { fetch } from 'undici';
+import { eq } from 'drizzle-orm';
 import { config, normalizeTokenRouterFailureCooldownMaxSec } from '../../config.js';
 import { db, runtimeDbDialect, schema } from '../../db/index.js';
 import { upsertSetting } from '../../db/upsertSetting.js';
@@ -45,6 +46,47 @@ import { parsePayloadRulesConfigInput } from '../../services/payloadRules.js';
 import { deleteRouteChannelsPreservingStats } from '../../services/routeChannelStatsService.js';
 
 type RoutingWeights = typeof config.routingWeights;
+
+const ACCOUNT_TOKEN_UI_SETTINGS_KEY = 'account_token_ui_settings_v1';
+
+type AccountTokenUiSettings = {
+  maxGroupRatioFilter: string;
+};
+
+function normalizeMaxGroupRatioFilter(value: unknown): string {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  const normalized = raw.replace(/[^\d.]/g, '');
+  const firstDotIndex = normalized.indexOf('.');
+  const deduped = firstDotIndex < 0
+    ? normalized
+    : `${normalized.slice(0, firstDotIndex + 1)}${normalized.slice(firstDotIndex + 1).replace(/\./g, '')}`;
+  const numeric = Number(deduped);
+  if (!Number.isFinite(numeric) || numeric <= 0) return '';
+  return deduped;
+}
+
+function parseAccountTokenUiSettings(raw: unknown): AccountTokenUiSettings {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { maxGroupRatioFilter: '' };
+  }
+  return {
+    maxGroupRatioFilter: normalizeMaxGroupRatioFilter((raw as Record<string, unknown>).maxGroupRatioFilter),
+  };
+}
+
+async function loadAccountTokenUiSettings(): Promise<AccountTokenUiSettings> {
+  const row = await db.select({ value: schema.settings.value })
+    .from(schema.settings)
+    .where(eq(schema.settings.key, ACCOUNT_TOKEN_UI_SETTINGS_KEY))
+    .get();
+  if (!row?.value) return { maxGroupRatioFilter: '' };
+  try {
+    return parseAccountTokenUiSettings(JSON.parse(row.value));
+  } catch {
+    return { maxGroupRatioFilter: '' };
+  }
+}
 
 interface RuntimeSettingsBody {
   proxyToken?: string;
@@ -840,6 +882,19 @@ export async function settingsRoutes(app: FastifyInstance) {
   await app.get('/api/settings/runtime', async (request) => {
     const currentAdminIp = extractClientIp(request.ip, request.headers['x-forwarded-for']);
     return getRuntimeSettingsResponse(currentAdminIp);
+  });
+
+  app.get('/api/settings/ui/account-tokens', async () => loadAccountTokenUiSettings());
+
+  app.put<{ Body: unknown }>('/api/settings/ui/account-tokens', async (request, reply) => {
+    const body = request.body && typeof request.body === 'object' && !Array.isArray(request.body)
+      ? request.body as Record<string, unknown>
+      : {};
+    const nextSettings = {
+      maxGroupRatioFilter: normalizeMaxGroupRatioFilter(body.maxGroupRatioFilter),
+    };
+    await upsertSetting(ACCOUNT_TOKEN_UI_SETTINGS_KEY, nextSettings);
+    return nextSettings;
   });
 
   app.get('/api/settings/brand-list', async () => {

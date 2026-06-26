@@ -12,6 +12,8 @@ const { apiMock } = vi.hoisted(() => ({
     getAccountsSnapshot: vi.fn(),
     getAccountTokenGroups: vi.fn(),
     batchUpdateAccountTokens: vi.fn(),
+    getAccountTokenUiSettings: vi.fn(),
+    updateAccountTokenUiSettings: vi.fn(),
   },
 }));
 
@@ -34,6 +36,8 @@ describe('Tokens mobile actions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     installAccountsSnapshotCompat(apiMock);
+    apiMock.getAccountTokenUiSettings.mockResolvedValue({ maxGroupRatioFilter: '' });
+    apiMock.updateAccountTokenUiSettings.mockImplementation(async (data: any) => ({ maxGroupRatioFilter: data?.maxGroupRatioFilter || '' }));
     apiMock.getAccountTokens.mockResolvedValue([
       {
         id: 1,
@@ -103,6 +107,12 @@ describe('Tokens mobile actions', () => {
       });
       await flushMicrotasks();
 
+      const expandedTextBeforeDelete = root.root.findAll(() => true)
+        .flatMap((instance) => instance.children)
+        .filter((child): child is string => typeof child === 'string')
+        .join('');
+      expect(expandedTextBeforeDelete).toContain('更新时间');
+
       const selectAllButton = root.root.find((node) => node.props['data-testid'] === 'tokens-mobile-select-all');
       await act(async () => {
         selectAllButton.props.onClick();
@@ -144,11 +154,6 @@ describe('Tokens mobile actions', () => {
         action: 'delete',
       });
 
-      const expandedText = root.root.findAll(() => true)
-        .flatMap((instance) => instance.children)
-        .filter((child): child is string => typeof child === 'string')
-        .join('');
-      expect(expandedText).toContain('更新时间');
     } finally {
       root?.unmount();
     }

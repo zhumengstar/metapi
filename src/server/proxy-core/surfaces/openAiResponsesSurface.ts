@@ -1012,6 +1012,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
 	              bindSurfaceStickyChannel({
 	                stickySessionKey,
 	                selected,
+	              retryCount,
 	              });
 	              return;
 	            }
@@ -1104,6 +1105,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
 	            bindSurfaceStickyChannel({
 	              stickySessionKey,
 	              selected,
+	            retryCount,
 	            });
 	            return;
 	          }
@@ -1146,6 +1148,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                 bindSurfaceStickyChannel({
                   stickySessionKey,
                   selected,
+                retryCount,
                 });
                 return;
               } catch {
@@ -1260,6 +1263,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
 	          bindSurfaceStickyChannel({
 	            stickySessionKey,
 	            selected,
+	          retryCount,
 	          });
 	          return;
 	        }
@@ -1378,6 +1382,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
 	        bindSurfaceStickyChannel({
 	          stickySessionKey,
 	          selected,
+	        retryCount,
 	        });
 	        return reply.send(downstreamData);
 	      } catch (err: any) {

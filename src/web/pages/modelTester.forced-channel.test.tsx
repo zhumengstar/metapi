@@ -145,7 +145,11 @@ describe('ModelTester fixed channel behavior', () => {
         await flushMicrotasks();
         expect(apiMock.getRouteDecision).toHaveBeenCalledTimes(1);
         expect(apiMock.getRouteDecision).toHaveBeenCalledWith('gpt-4o-mini');
-        expect(collectText(root.root)).toContain('已固定到通道 #77，失败不会自动切换。');
+        const text = collectText(root.root);
+        expect(text).toContain('已固定到通道 #77');
+        expect(text).toContain('账号「tester」@「site-a」');
+        expect(text).toContain('当前生效令牌「default」');
+        expect(text).toContain('失败不会自动切换');
       });
     } finally {
       root?.unmount();

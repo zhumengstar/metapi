@@ -9,6 +9,8 @@ const { apiMock } = vi.hoisted(() => ({
     getAccountTokens: vi.fn().mockResolvedValue([]),
     getAccounts: vi.fn().mockResolvedValue([]),
     getAccountTokenGroups: vi.fn().mockResolvedValue({ groups: ['default'] }),
+    getAccountTokenUiSettings: vi.fn().mockResolvedValue({ maxGroupRatioFilter: '' }),
+    updateAccountTokenUiSettings: vi.fn().mockResolvedValue({ maxGroupRatioFilter: '' }),
   },
 }));
 

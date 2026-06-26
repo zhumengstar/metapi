@@ -64,6 +64,44 @@ describe('priority bucket helpers', () => {
     expect(buckets[1].channels.map((channel) => channel.id)).toEqual([3]);
   });
 
+  it('pins the selected channel before probability sorting', () => {
+    const buckets = buildPriorityBuckets(
+      [
+        buildChannel(1, 0),
+        buildChannel(2, 0),
+        buildChannel(3, 0),
+      ],
+      {
+        sortWithinBucketByProbability: true,
+        pinnedChannelId: 1,
+        probabilityByChannelId: new Map([
+          [1, 12],
+          [2, 85],
+          [3, 40],
+        ]),
+      },
+    );
+
+    expect(buckets[0].channels.map((channel) => channel.id)).toEqual([1, 2, 3]);
+  });
+
+  it('moves the selected channel bucket to the top for display only', () => {
+    const buckets = buildPriorityBuckets(
+      [
+        buildChannel(1, 0),
+        buildChannel(2, 0),
+        buildChannel(3, 2),
+      ],
+      {
+        pinnedChannelId: 3,
+      },
+    );
+
+    expect(buckets.map((bucket) => bucket.priority)).toEqual([2, 0]);
+    expect(buckets[0].channels.map((channel) => channel.id)).toEqual([3]);
+    expect(buckets[1].channels.map((channel) => channel.id)).toEqual([1, 2]);
+  });
+
   it('moves a channel across a separator and preserves duplicate priorities', () => {
     const reordered = applyPriorityBucketDrag(
       [

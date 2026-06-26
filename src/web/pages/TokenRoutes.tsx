@@ -24,6 +24,10 @@ import {
 import { buildVisibleRouteList } from './helpers/routeListVisibility.js';
 import { buildZeroChannelPlaceholderRoutes } from './helpers/zeroChannelRoutes.js';
 import {
+  buildMissingModelAvailabilityResult,
+  normalizeModelAvailabilityApiPayload,
+} from './helpers/modelAvailabilityPresentation.js';
+import {
   getRouteRoutingStrategyDescription,
   getRouteRoutingStrategyLabel,
   normalizeRouteRoutingStrategyValue,
@@ -1224,29 +1228,10 @@ export default function TokenRoutes() {
     setTestingChannelModel((prev) => ({ ...prev, [channelId]: true }));
     try {
       const res = await api.testRouteChannelModelAvailability(channelId, { model });
-      const rawResult = res?.result || null;
-      const tokenId = rawResult?.tokenId == null ? null : Number(rawResult.tokenId);
-      const nextResult: RouteChannelModelTestResult = rawResult
-        ? {
-          tokenId,
-          model: String(rawResult.model || model),
-          available: rawResult.available === true,
-          message: rawResult.message || null,
-          responseText: rawResult.responseText || null,
-          httpStatus: rawResult.httpStatus ?? null,
-          latencyMs: rawResult.latencyMs ?? null,
-          checkedAt: rawResult.checkedAt || new Date().toISOString(),
-        }
-        : {
-          tokenId: null,
-          model,
-          available: false,
-          message: '测试接口没有返回结果',
-          responseText: null,
-          httpStatus: null,
-          latencyMs: null,
-          checkedAt: new Date().toISOString(),
-        };
+      const nextResult = (
+        normalizeModelAvailabilityApiPayload(res, model)
+        || buildMissingModelAvailabilityResult(model)
+      ) as RouteChannelModelTestResult;
       setChannelModelTestResults((prev) => ({ ...prev, [channelId]: nextResult }));
       if (nextResult.available) {
         toast.success('模型测试成功');
@@ -1272,7 +1257,47 @@ export default function TokenRoutes() {
     } finally {
       setTestingChannelModel((prev) => ({ ...prev, [channelId]: false }));
     }
-  }, [channelsByRouteId, resolveRouteChannelModelName, testingChannelModel, toast]);
+	  }, [channelsByRouteId, resolveRouteChannelModelName, testingChannelModel, toast]);
+
+  const refreshSingleRouteDecision = useCallback(async (routeId: number) => {
+    const route = routeSummaries.find((item) => item.id === routeId);
+    if (!route) return;
+    if (isRouteExactModel(route)) {
+      const res = await api.getRouteDecision(route.modelPattern);
+      setDecisionByRoute((prev) => ({
+        ...prev,
+        [routeId]: (res?.decision || null) as RouteDecision | null,
+      }));
+      return;
+    }
+
+    const res = await api.getRouteWideDecisionsBatch([routeId]);
+    setDecisionByRoute((prev) => ({
+      ...prev,
+      [routeId]: (res?.decisions?.[String(routeId)] || null) as RouteDecision | null,
+    }));
+  }, [routeSummaries]);
+
+  const handlePinStableFirstChannel = useCallback(async (routeId: number, channelId: number) => {
+    if (updatingChannel[channelId]) return;
+    const channel = (channelsByRouteId[routeId] || []).find((item) => item.id === channelId);
+    if (!channel) {
+      toast.error('未找到通道');
+      return;
+    }
+
+    const model = resolveRouteChannelModelName(routeId, channel);
+    setUpdatingChannel((prev) => ({ ...prev, [channelId]: true }));
+    try {
+      await api.pinStableFirstChannel(channelId, model ? { model } : {});
+      toast.success('已设为稳定优先主通道');
+      await refreshSingleRouteDecision(routeId);
+    } catch (e: any) {
+      toast.error(e.message || '设置主通道失败');
+    } finally {
+      setUpdatingChannel((prev) => ({ ...prev, [channelId]: false }));
+    }
+  }, [channelsByRouteId, refreshSingleRouteDecision, resolveRouteChannelModelName, toast, updatingChannel]);
 
   const handleChannelTokenSave = async (routeId: number, channelId: number, accountId: number) => {
     const tokenId = channelTokenDraft[channelId];
@@ -1671,11 +1696,17 @@ export default function TokenRoutes() {
   );
   const handleTestChannelModelRef = useRef(handleTestChannelModel);
   handleTestChannelModelRef.current = handleTestChannelModel;
-  const stableTestChannelModel = useCallback(
-    (routeId: number, channelId: number) => handleTestChannelModelRef.current(routeId, channelId),
+	  const stableTestChannelModel = useCallback(
+	    (routeId: number, channelId: number) => handleTestChannelModelRef.current(routeId, channelId),
+	    [],
+	  );
+  const handlePinStableFirstChannelRef = useRef(handlePinStableFirstChannel);
+  handlePinStableFirstChannelRef.current = handlePinStableFirstChannel;
+  const stablePinStableFirstChannel = useCallback(
+    (routeId: number, channelId: number) => handlePinStableFirstChannelRef.current(routeId, channelId),
     [],
   );
-  const handleChannelDragEndRef = useRef(handleChannelDragEnd);
+	  const handleChannelDragEndRef = useRef(handleChannelDragEnd);
   handleChannelDragEndRef.current = handleChannelDragEnd;
   const stableChannelDragEnd = useCallback(
     (routeId: number, event: DragEndEvent) => handleChannelDragEndRef.current(routeId, event),
@@ -2081,10 +2112,11 @@ export default function TokenRoutes() {
                     onTokenDraftChange={stableTokenDraftChange}
                     onSaveToken={stableChannelTokenSave}
 	                    onDeleteChannel={stableDeleteChannel}
-	                    onToggleChannelEnabled={stableToggleChannelEnabled}
-	                    onToggleChannelImageUpscale={stableToggleChannelImageUpscale}
-	                    onTestChannelModel={stableTestChannelModel}
-	                    onChannelDragEnd={stableChannelDragEnd}
+		                    onToggleChannelEnabled={stableToggleChannelEnabled}
+		                    onToggleChannelImageUpscale={stableToggleChannelImageUpscale}
+		                    onTestChannelModel={stableTestChannelModel}
+		                    onPinStableFirstChannel={stablePinStableFirstChannel}
+		                    onChannelDragEnd={stableChannelDragEnd}
                     missingTokenSiteItems={getMissingTokenSiteItems(route.id)}
                     missingTokenGroupItems={getMissingTokenGroupItems(route.id)}
                     onCreateTokenForMissing={stableCreateTokenForMissing}
@@ -2125,10 +2157,11 @@ export default function TokenRoutes() {
               onTokenDraftChange={stableTokenDraftChange}
               onSaveToken={stableChannelTokenSave}
 	              onDeleteChannel={stableDeleteChannel}
-	              onToggleChannelEnabled={stableToggleChannelEnabled}
-	              onToggleChannelImageUpscale={stableToggleChannelImageUpscale}
-	              onTestChannelModel={stableTestChannelModel}
-	              onChannelDragEnd={stableChannelDragEnd}
+		              onToggleChannelEnabled={stableToggleChannelEnabled}
+		              onToggleChannelImageUpscale={stableToggleChannelImageUpscale}
+		              onTestChannelModel={stableTestChannelModel}
+		              onPinStableFirstChannel={stablePinStableFirstChannel}
+		              onChannelDragEnd={stableChannelDragEnd}
               missingTokenSiteItems={EMPTY_MISSING_ITEMS}
               missingTokenGroupItems={EMPTY_MISSING_GROUP_ITEMS}
               onCreateTokenForMissing={stableCreateTokenForMissing}
@@ -2168,10 +2201,11 @@ export default function TokenRoutes() {
                   onTokenDraftChange={stableTokenDraftChange}
                   onSaveToken={stableChannelTokenSave}
 	                  onDeleteChannel={stableDeleteChannel}
-	                  onToggleChannelEnabled={stableToggleChannelEnabled}
-	                  onToggleChannelImageUpscale={stableToggleChannelImageUpscale}
-	                  onTestChannelModel={stableTestChannelModel}
-	                  onChannelDragEnd={stableChannelDragEnd}
+		                  onToggleChannelEnabled={stableToggleChannelEnabled}
+		                  onToggleChannelImageUpscale={stableToggleChannelImageUpscale}
+		                  onTestChannelModel={stableTestChannelModel}
+		                  onPinStableFirstChannel={stablePinStableFirstChannel}
+		                  onChannelDragEnd={stableChannelDragEnd}
                   missingTokenSiteItems={getMissingTokenSiteItems(route.id)}
                   missingTokenGroupItems={getMissingTokenGroupItems(route.id)}
                   onCreateTokenForMissing={stableCreateTokenForMissing}

@@ -97,6 +97,7 @@ export async function selectProxyChannelForAttempt(input: {
       normalizedForcedChannelId,
       input.downstreamPolicy,
       input.excludeChannelIds,
+      { allowManualStableFirstOverride: true },
     );
   }
 
@@ -136,6 +137,18 @@ export async function selectProxyChannelForAttempt(input: {
           proxyChannelCoordinator.clearStickyChannel(input.stickySessionKey, preferredChannelId);
         }
       }
+    }
+  }
+
+  if (!selected && input.retryCount === 1 && input.excludeChannelIds.length > 0) {
+    const previousChannelId = input.excludeChannelIds[input.excludeChannelIds.length - 1];
+    if (Number.isSafeInteger(previousChannelId) && previousChannelId > 0) {
+      selected = await tokenRouter.selectPreferredChannel(
+        input.requestedModel,
+        previousChannelId,
+        input.downstreamPolicy,
+        input.excludeChannelIds.slice(0, -1),
+      );
     }
   }
 

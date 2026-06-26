@@ -349,6 +349,7 @@ describe("stats proxy logs routes", () => {
       items: Array<Record<string, unknown>>;
     };
     expect(body.items[0]).toMatchObject({
+      promptTokens: 1000,
       cacheReadTokens: 500,
       cacheHitRate: 33.33,
     });

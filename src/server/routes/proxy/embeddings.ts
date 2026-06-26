@@ -149,7 +149,7 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
         });
 
         await recordTokenRouterEventBestEffort('record channel success', () => (
-          tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel, undefined, resolvedUsage.promptTokens)
+          tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel, undefined, resolvedUsage.promptTokens, { retryCount })
         ));
         recordDownstreamCostUsage(request, estimatedCost);
         logProxy(
@@ -166,6 +166,7 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
           status,
           errorText,
           modelName: upstreamModel,
+          retryCount,
         }));
         logProxy(
           selected,

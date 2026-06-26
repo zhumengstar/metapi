@@ -1,9 +1,12 @@
 import { useEffect, useState, type CSSProperties, type MouseEvent } from 'react';
 import { createPortal } from 'react-dom';
 import ModernSelect from '../../components/ModernSelect.js';
-import { formatDateTimeLocal } from '../helpers/checkinLogTime.js';
 import { isImageGenerationModel } from '../../utils/modelType.js';
-import type { RouteChannelModelTestResult, SortableChannelRowProps } from './types.js';
+import type { RouteChannel, RouteChannelModelTestResult, SortableChannelRowProps } from './types.js';
+import {
+  buildModelAvailabilityTooltipRows,
+  type ModelAvailabilityTooltipRow,
+} from '../helpers/modelAvailabilityPresentation.js';
 import {
   buildFixedTokenOptionDescription,
   buildFixedTokenOptionLabel,
@@ -23,6 +26,43 @@ function formatRouteUnitMemberLabel(member: { accountId: number; username: strin
   return siteLabel ? `${accountLabel} @ ${siteLabel}` : accountLabel;
 }
 
+function normalizeExternalSiteUrl(value: string | null | undefined): string | null {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  try {
+    const url = /^https?:\/\//i.test(raw) ? new URL(raw) : new URL(`https://${raw}`);
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function SiteBadge({ site, fontSize = 10 }: { site: RouteChannel['site']; fontSize?: number }) {
+  const label = site?.name?.trim() || 'unknown';
+  const href = normalizeExternalSiteUrl(site?.url);
+  const badge = (
+    <span className="badge badge-muted" style={{ fontSize }}>
+      {label}
+    </span>
+  );
+
+  if (!href) return badge;
+
+  return (
+    <a
+      className="badge-link"
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={`打开 ${label}`}
+      onClick={(event) => event.stopPropagation()}
+      onMouseDown={(event) => event.stopPropagation()}
+    >
+      {badge}
+    </a>
+  );
+}
+
 function formatCompactCost(value: number | null | undefined): string {
   const amount = Number(value);
   if (!Number.isFinite(amount) || amount <= 0) return '0';
@@ -38,44 +78,16 @@ function formatInputCostPerMillion(value: number | null | undefined): string {
   return formatCompactCost(amount);
 }
 
-type ModelTestTooltipRow = {
-  label: string;
-  value: string | number | null | undefined;
-  tone?: 'success' | 'warning' | 'error' | 'muted';
-};
-
 type ModelTestTooltipState = {
   left: number;
   top: number;
-  rows: ModelTestTooltipRow[];
+  rows: ModelAvailabilityTooltipRow[];
 };
 
 const MODEL_TEST_TOOLTIP_WIDTH = 300;
 const MODEL_TEST_TOOLTIP_OFFSET = 12;
 
-function buildModelTestRows(
-  modelName: string,
-  result: RouteChannelModelTestResult | null | undefined,
-): ModelTestTooltipRow[] {
-  if (!result) {
-    return [
-      { label: '模型', value: modelName || '-', tone: 'muted' },
-      { label: '结果', value: '未测试', tone: 'muted' },
-    ];
-  }
-  const checkedAt = result.checkedAt ? formatDateTimeLocal(result.checkedAt) : '';
-  return [
-    { label: '模型', value: result.model || modelName || '-' },
-    { label: '结果', value: result.available ? '可用' : '不可用', tone: result.available ? 'success' : 'error' },
-    { label: result.available ? '说明' : '上游报错', value: result.message || '', tone: result.available ? undefined : 'error' },
-    { label: '模型答复', value: result.responseText || '' },
-    { label: 'HTTP', value: result.httpStatus == null ? '' : result.httpStatus },
-    { label: '耗时', value: Number.isFinite(Number(result.latencyMs)) ? `${result.latencyMs}ms` : '' },
-    { label: '检测时间', value: checkedAt },
-  ];
-}
-
-function getTooltipRowColor(tone: ModelTestTooltipRow['tone']): string {
+function getTooltipRowColor(tone: ModelAvailabilityTooltipRow['tone']): string {
   if (tone === 'success') return 'var(--color-success)';
   if (tone === 'warning') return 'var(--color-warning)';
   if (tone === 'error') return 'var(--color-danger)';
@@ -114,6 +126,8 @@ export function SortableChannelRow({
   dragHandleProps,
   dragHandleRef,
   decisionCandidate,
+  isSelectedStableFirstChannel = false,
+  isManualStableFirstChannel = false,
   isExactRoute,
   loadingDecision,
   isSavingPriority,
@@ -133,6 +147,7 @@ export function SortableChannelRow({
   onToggleEnabled,
   onToggleImageUpscale,
   onTestModel,
+  onPinStableFirstChannel,
   onSiteBlockModel,
 }: SortableChannelRowProps) {
   const resolvedPriority = displayPriority ?? channel.priority ?? 0;
@@ -190,9 +205,10 @@ export function SortableChannelRow({
     : buildFallbackDecisionBreakdown(decisionReasonText);
   const actualTotalCost = channel.actualTotalCost ?? channel.totalCost ?? 0;
   const inputCostPerMillion = channel.inputCostPerMillion ?? null;
+  const pureInputCostPerMillion = channel.pureInputCostPerMillion ?? null;
   const costStatsTooltip = suppressTooltips
     ? undefined
-    : `余额实际消耗：${formatCompactCost(actualTotalCost)}；输入 token：${channel.totalInputTokens || 0}；每 M 输入成本：${formatInputCostPerMillion(inputCostPerMillion)}`;
+    : `余额实际消耗：${formatCompactCost(actualTotalCost)}；输入 token：${channel.totalInputTokens || 0}；摊销/M：${formatInputCostPerMillion(inputCostPerMillion)}；纯输入/M：${formatInputCostPerMillion(pureInputCostPerMillion)}`;
   const tokenBinding = describeTokenBinding(
     tokenOptions,
     activeTokenId,
@@ -244,6 +260,7 @@ export function SortableChannelRow({
   const imageUpscaleEnabled = channel.imageUpscaleEnabled === true;
   const canToggleImageUpscale = imageRouteModel && Boolean(onToggleImageUpscale) && !managementLocked && !isUpdatingToken;
   const canTestModel = Boolean(onTestModel && resolvedModelName && Number(channel.accountId || 0) > 0);
+  const canPinStableFirstChannel = Boolean(onPinStableFirstChannel) && !managementLocked && !isUpdatingToken;
   const testModelBadgeClass = testingModel
     ? 'badge badge-info'
     : modelTestResult
@@ -262,7 +279,7 @@ export function SortableChannelRow({
     setModelTestTooltip({
       left,
       top: rect.bottom + MODEL_TEST_TOOLTIP_OFFSET,
-      rows: buildModelTestRows(resolvedModelName, modelTestResult),
+      rows: buildModelAvailabilityTooltipRows(resolvedModelName, modelTestResult),
     });
   };
   const hideModelTestTooltip = () => setModelTestTooltip(null);
@@ -325,11 +342,55 @@ export function SortableChannelRow({
       </button>
     );
   };
+  const renderPinStableFirstButton = () => {
+    if (!onPinStableFirstChannel) return null;
+    const pinBadgeClass = isManualStableFirstChannel
+      ? 'badge badge-success'
+      : isSelectedStableFirstChannel
+        ? 'badge badge-info'
+        : 'badge badge-muted';
+    const pinText = isManualStableFirstChannel
+      ? '手动主'
+      : isSelectedStableFirstChannel
+        ? '当前主'
+        : '设主';
+    const pinTooltip = isManualStableFirstChannel
+      ? '这是手动指定的稳定优先主通道。后续请求会持续先打此通道，连续失败 5 次后才正式切换。'
+      : isSelectedStableFirstChannel
+        ? '这是当前稳定优先主通道。后续请求会持续先打此通道，连续失败 5 次后才正式切换。'
+        : '设为稳定优先主通道。后续请求会持续先打此通道，连续失败 5 次后才正式切换。';
+    return (
+      <button
+        type="button"
+        className={pinBadgeClass}
+        style={{
+          fontSize: 8.5,
+          border: 0,
+          appearance: 'none',
+          lineHeight: 1.2,
+          padding: '2px 6px',
+          cursor: canPinStableFirstChannel ? 'pointer' : 'not-allowed',
+          opacity: canPinStableFirstChannel ? 1 : 0.68,
+        }}
+        disabled={!canPinStableFirstChannel}
+        onClick={(event) => {
+          event.stopPropagation();
+          if (!canPinStableFirstChannel) return;
+          onPinStableFirstChannel();
+        }}
+        data-tooltip={suppressTooltips ? undefined : pinTooltip}
+        aria-label={pinTooltip}
+      >
+        {pinText}
+      </button>
+    );
+  };
   const renderChannelStatusActions = () => (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
       {renderChannelStatusToggle()}
       {renderModelTestButton()}
       {renderImageUpscaleToggle()}
+      {renderPinStableFirstButton()}
     </span>
   );
 
@@ -547,9 +608,7 @@ export function SortableChannelRow({
                 {channel.account?.username || `account-${channel.accountId}`}
               </span>
 
-              <span className="badge badge-muted" style={{ fontSize: 10 }}>
-                {channel.site?.name || 'unknown'}
-              </span>
+              <SiteBadge site={channel.site} />
 
               <span
                 style={{ fontSize: 11, color: 'var(--color-text-muted)', marginLeft: 'auto' }}
@@ -557,7 +616,9 @@ export function SortableChannelRow({
               >
                 消耗 <span style={{ color: 'var(--color-text-primary)', fontWeight: 600 }}>{formatCompactCost(actualTotalCost)}</span>
                 <span style={{ color: 'var(--color-text-muted)', margin: '0 5px' }}>·</span>
-                输入/M <span style={{ color: 'var(--color-text-primary)', fontWeight: 600 }}>{formatInputCostPerMillion(inputCostPerMillion)}</span>
+                摊销/M <span style={{ color: 'var(--color-text-primary)', fontWeight: 600 }}>{formatInputCostPerMillion(inputCostPerMillion)}</span>
+                <span style={{ color: 'var(--color-text-muted)', margin: '0 5px' }}>·</span>
+                纯输入/M <span style={{ color: 'var(--color-text-primary)', fontWeight: 600 }}>{formatInputCostPerMillion(pureInputCostPerMillion)}</span>
                 <span style={{ color: 'var(--color-text-muted)', margin: '0 5px' }}>·</span>
                 成功/失败 <span style={{ color: 'var(--color-success)', fontWeight: 600 }}>{channel.successCount || 0}</span>
                 <span style={{ color: 'var(--color-text-muted)', margin: '0 2px' }}>/</span>
@@ -796,9 +857,7 @@ export function SortableChannelRow({
           {channel.account?.username || `account-${channel.accountId}`}
         </span>
 
-        <span className="badge badge-muted" style={{ fontSize: 10 }}>
-          {channel.site?.name || 'unknown'}
-        </span>
+        <SiteBadge site={channel.site} />
 
         <span
           className="badge"
@@ -925,10 +984,19 @@ export function SortableChannelRow({
             style={{ fontSize: 11, color: 'var(--color-text-muted)' }}
             data-tooltip={costStatsTooltip}
           >
-            输入/M
+            摊销/M
           </span>
           <span style={{ fontSize: 11, color: 'var(--color-text-primary)', fontWeight: 600 }}>
             {formatInputCostPerMillion(inputCostPerMillion)}
+          </span>
+          <span
+            style={{ fontSize: 11, color: 'var(--color-text-muted)' }}
+            data-tooltip={costStatsTooltip}
+          >
+            纯输入/M
+          </span>
+          <span style={{ fontSize: 11, color: 'var(--color-text-primary)', fontWeight: 600 }}>
+            {formatInputCostPerMillion(pureInputCostPerMillion)}
           </span>
           <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>成功/失败</span>
           <span style={{ fontSize: 11 }}>

@@ -359,13 +359,14 @@ function renamePricingDataGroups(data: PricingData, groupEntries: GroupEntry[]):
   const groupRatio: Record<string, number> = {};
   for (const [group, ratio] of Object.entries(data.groupRatio)) {
     const renamed = renameGroupLabel(group, groupNameById);
+    if (!(group in groupRatio)) groupRatio[group] = ratio;
     if (!(renamed in groupRatio)) groupRatio[renamed] = ratio;
   }
 
   const models = new Map<string, PricingModel>();
   for (const [name, model] of data.models.entries()) {
     const enableGroups = Array.from(new Set(
-      model.enableGroups.map((group) => renameGroupLabel(group, groupNameById)),
+      model.enableGroups.flatMap((group) => [group, renameGroupLabel(group, groupNameById)]),
     ));
     models.set(name, { ...model, enableGroups });
   }

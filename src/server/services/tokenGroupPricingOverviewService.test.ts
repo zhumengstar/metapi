@@ -13,13 +13,13 @@ vi.mock('./platforms/index.js', () => ({
 }));
 
 vi.mock('./modelPricingService.js', () => ({
-  fetchModelPricingCatalog: vi.fn(async () => ({
+  fetchModelPricingCatalog: vi.fn(async (input: any) => ({
     models: [],
-    groupRatio: mockCatalogGroupRatio,
+    groupRatio: mockCatalogGroupRatioByAccountId[input?.account?.id] || mockCatalogGroupRatio,
   })),
-  refreshModelPricingCatalog: vi.fn(async () => ({
+  refreshModelPricingCatalog: vi.fn(async (input: any) => ({
     models: [],
-    groupRatio: mockCatalogGroupRatio,
+    groupRatio: mockCatalogGroupRatioByAccountId[input?.account?.id] || mockCatalogGroupRatio,
   })),
   listCatalogModelsForGroup: vi.fn(() => []),
 }));
@@ -27,6 +27,7 @@ vi.mock('./modelPricingService.js', () => ({
 type DbModule = typeof import('../db/index.js');
 type OverviewModule = typeof import('./tokenGroupPricingOverviewService.js');
 let mockCatalogGroupRatio: Record<string, number> = {};
+let mockCatalogGroupRatioByAccountId: Record<number, Record<string, number>> = {};
 
 describe('tokenGroupPricingOverviewService', () => {
   let db: DbModule['db'];
@@ -52,6 +53,7 @@ describe('tokenGroupPricingOverviewService', () => {
   beforeEach(async () => {
     getUserGroupDetailsMock.mockReset();
     mockCatalogGroupRatio = {};
+    mockCatalogGroupRatioByAccountId = {};
     await db.delete(schema.accountTokens).run();
     await db.delete(schema.tokenGroupPricing).run();
     await db.delete(schema.accounts).run();
@@ -189,5 +191,123 @@ describe('tokenGroupPricingOverviewService', () => {
       pricingAvailable: true,
       groupName: '纯pro倍率',
     });
+
+    const storedAliasRow = await db.select()
+      .from(schema.tokenGroupPricing)
+      .where(and(
+        eq(schema.tokenGroupPricing.siteId, site.id),
+        eq(schema.tokenGroupPricing.sourceKey, `account:${account.id}`),
+        eq(schema.tokenGroupPricing.group, '2'),
+      ))
+      .get();
+    expect(storedAliasRow).toMatchObject({
+      group: '2',
+      groupName: '纯pro倍率',
+      ratio: 2.5,
+      pricingAvailable: true,
+    });
+    expect(overview.groupRows.some((item) => item.account?.id === account.id && item.group === '2')).toBe(false);
+  });
+
+  it('stores local numeric token group aliases from the pricing catalog when upstream group details omit ids', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'sub2api',
+      url: 'https://sub2api.example.com',
+      platform: 'sub2api',
+    }).returning().get();
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'mikoto',
+      accessToken: 'access-token',
+      status: 'active',
+    }).returning().get();
+    await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'team渠道',
+      token: 'sk-team-token',
+      source: 'sync',
+      enabled: true,
+      isDefault: true,
+      tokenGroup: '2',
+      valueStatus: 'ready' as any,
+    }).run();
+    mockCatalogGroupRatio = { default: 1, '2': 2.5, '纯pro倍率': 2.5 };
+    getUserGroupDetailsMock.mockResolvedValue([
+      { group: '纯pro倍率', name: '纯pro倍率' },
+    ]);
+
+    const overview = await buildTokenGroupPricingOverview({ refresh: true });
+
+    const storedAliasRow = await db.select()
+      .from(schema.tokenGroupPricing)
+      .where(and(
+        eq(schema.tokenGroupPricing.siteId, site.id),
+        eq(schema.tokenGroupPricing.sourceKey, `account:${account.id}`),
+        eq(schema.tokenGroupPricing.group, '2'),
+      ))
+      .get();
+    expect(storedAliasRow).toMatchObject({
+      group: '2',
+      groupName: '纯pro倍率',
+      ratio: 2.5,
+      pricingAvailable: true,
+    });
+    expect(overview.groupRows.some((item) => item.account?.id === account.id && item.group === '2')).toBe(false);
+  });
+
+  it('refreshes pricing with each logged-in account instead of reusing the first site catalog', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'shared-sub2api',
+      url: 'https://shared-sub2api.example.com',
+      platform: 'sub2api',
+    }).returning().get();
+    const firstAccount = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'first@example.com',
+      accessToken: 'first-access-token',
+      status: 'active',
+    }).returning().get();
+    const secondAccount = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'second@example.com',
+      accessToken: 'second-access-token',
+      status: 'active',
+    }).returning().get();
+
+    mockCatalogGroupRatioByAccountId = {
+      [firstAccount.id]: { default: 1, vip: 0.2 },
+      [secondAccount.id]: { default: 1, vip: 0.7 },
+    };
+    getUserGroupDetailsMock.mockResolvedValue([
+      { group: 'vip', name: 'vip' },
+    ]);
+
+    const overview = await buildTokenGroupPricingOverview({ refresh: true });
+    const firstRow = overview.groupRows.find((item) => item.account?.id === firstAccount.id && item.group === 'vip');
+    const secondRow = overview.groupRows.find((item) => item.account?.id === secondAccount.id && item.group === 'vip');
+
+    expect(firstRow).toMatchObject({ ratio: 0.2, pricingAvailable: true });
+    expect(secondRow).toMatchObject({ ratio: 0.7, pricingAvailable: true });
+
+    const storedRows = await db.select()
+      .from(schema.tokenGroupPricing)
+      .where(eq(schema.tokenGroupPricing.siteId, site.id))
+      .all();
+    expect(storedRows).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        accountId: firstAccount.id,
+        sourceKey: `account:${firstAccount.id}`,
+        group: 'vip',
+        ratio: 0.2,
+        pricingAvailable: true,
+      }),
+      expect.objectContaining({
+        accountId: secondAccount.id,
+        sourceKey: `account:${secondAccount.id}`,
+        group: 'vip',
+        ratio: 0.7,
+        pricingAvailable: true,
+      }),
+    ]));
   });
 });
