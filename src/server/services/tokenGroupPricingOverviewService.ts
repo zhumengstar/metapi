@@ -886,6 +886,119 @@ export async function syncTokenGroupPricingCache() {
   };
 }
 
+export async function refreshTokenGroupPricingForAccount(accountId: number) {
+  const row = await db.select()
+    .from(schema.accounts)
+    .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+    .where(eq(schema.accounts.id, accountId))
+    .get();
+  if (!row) return null;
+
+  const { tokensByAccountId } = await loadTokenGroupsContext();
+  const accountTokens = tokensByAccountId.get(accountId) || [];
+  const localTokenGroups = accountTokens.map((token) => token.group);
+  const groupResult = await fetchAccountGroups({
+    ...row,
+    localTokenGroups,
+  }, true);
+  const upstreamGroups = filterGroupsForPlatform(uniqueGroups(groupResult.groups), row.sites.platform);
+  const groups = filterGroupsForPlatform(
+    upstreamGroups.length > 0
+      ? upstreamGroups
+      : uniqueGroups([...groupResult.groups, ...localTokenGroups]),
+    row.sites.platform,
+  );
+
+  if (groups.length === 0) {
+    return {
+      accountId,
+      refreshed: false,
+      reason: groupResult.error || 'no groups',
+      pricingAvailableCount: 0,
+    };
+  }
+
+  let catalog: ModelPricingCatalog | null = null;
+  try {
+    catalog = await refreshModelPricingCatalog({
+      site: {
+        id: row.sites.id,
+        url: row.sites.url,
+        platform: row.sites.platform,
+        apiKey: row.sites.apiKey,
+      },
+      account: {
+        id: row.accounts.id,
+        accessToken: row.accounts.accessToken,
+        apiToken: row.accounts.apiToken,
+      },
+      modelName: '',
+    });
+  } catch {
+    catalog = null;
+  }
+
+  const groupDetailsByGroup = new Map(groupResult.details.map((item) => [normalizeGroup(item.group), item]));
+  const accountOverview: TokenGroupPricingOverviewAccount = {
+    account: {
+      id: row.accounts.id,
+      username: row.accounts.username,
+      status: row.accounts.status,
+    },
+    site: {
+      id: row.sites.id,
+      name: row.sites.name,
+      url: row.sites.url,
+      platform: row.sites.platform,
+      status: row.sites.status,
+    },
+    groups,
+    groupSource: groupResult.source,
+    groupError: groupResult.error,
+    pricing: summarizePricing(
+      catalog || null,
+      groups,
+      buildRatioOverride(groupResult.details),
+      buildGroupAliases(groupResult.details),
+    ),
+    tokens: accountTokens.sort((a, b) => Number(b.isDefault) - Number(a.isDefault) || a.name.localeCompare(b.name)),
+  };
+
+  const accountGroupRows = createGroupRowsFromAccount(accountOverview).map((item) => {
+    const detail = groupDetailsByGroup.get(item.group);
+    return withCatalogGroupModels({
+      ...item,
+      groupName: detail?.name,
+      description: detail?.description,
+    }, catalog || null);
+  });
+  const aliasGroupRows = buildGroupAliasRows(
+    accountGroupRows,
+    groupResult.details,
+    catalog || null,
+    localTokenGroups,
+  );
+
+  if (upstreamGroups.length > 0) {
+    await deleteStoredRowsMissingFromUpstream({
+      siteId: row.sites.id,
+      accountId,
+      sourceKey: `account:${accountId}`,
+      groups: [...upstreamGroups, ...aliasGroupRows.map((item) => item.group)],
+    });
+  }
+  await Promise.all([...accountGroupRows, ...aliasGroupRows].map((item) => upsertStoredGroupRow({
+    row: item,
+    sourceKey: `account:${accountId}`,
+  })));
+
+  return {
+    accountId,
+    refreshed: true,
+    pricingAvailableCount: [...accountGroupRows, ...aliasGroupRows].filter((item) => item.pricingAvailable).length,
+  };
+}
+
 export async function listTokenGroupPricingGroups(options: TokenGroupPricingGroupsOptions = {}) {
   const { tokenRows, tokensByAccountId } = await loadTokenGroupsContext();
   const storedRows = await applyCatalogModelNamesToStoredRows(await loadStoredGroupRows(tokensByAccountId));

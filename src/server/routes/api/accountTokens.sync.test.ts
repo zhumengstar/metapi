@@ -12,10 +12,12 @@ const getApiTokensMock = vi.fn();
 const getApiTokenMock = vi.fn();
 const createApiTokenMock = vi.fn();
 const getUserGroupsMock = vi.fn();
+const getUserGroupDetailsMock = vi.fn();
 const deleteApiTokenMock = vi.fn();
 const loginMock = vi.fn();
 const getModelsMock = vi.fn();
 const fetchModelPricingCatalogMock = vi.fn();
+const refreshModelPricingCatalogMock = vi.fn();
 const testAccountTokenModelAvailabilityMock = vi.fn();
 
 type AccountTokenServiceModule = typeof import('../../services/accountTokenService.js');
@@ -29,6 +31,7 @@ vi.mock('../../services/platforms/index.js', () => ({
     getApiToken: (...args: unknown[]) => getApiTokenMock(...args),
     createApiToken: (...args: unknown[]) => createApiTokenMock(...args),
     getUserGroups: (...args: unknown[]) => getUserGroupsMock(...args),
+    getUserGroupDetails: (...args: unknown[]) => getUserGroupDetailsMock(...args),
     deleteApiToken: (...args: unknown[]) => deleteApiTokenMock(...args),
     getModels: (...args: unknown[]) => getModelsMock(...args),
   }),
@@ -39,6 +42,7 @@ vi.mock('../../services/modelPricingService.js', async () => {
   return {
     ...actual,
     fetchModelPricingCatalog: (...args: unknown[]) => fetchModelPricingCatalogMock(...args),
+    refreshModelPricingCatalog: (...args: unknown[]) => refreshModelPricingCatalogMock(...args),
   };
 });
 
@@ -186,12 +190,16 @@ describe('account tokens sync routes with site status', () => {
     getApiTokenMock.mockReset();
     createApiTokenMock.mockReset();
     getUserGroupsMock.mockReset();
+    getUserGroupDetailsMock.mockReset();
+    getUserGroupDetailsMock.mockResolvedValue([]);
     deleteApiTokenMock.mockReset();
     loginMock.mockReset();
     getModelsMock.mockReset();
     getModelsMock.mockResolvedValue(['gpt-5.5']);
     fetchModelPricingCatalogMock.mockReset();
     fetchModelPricingCatalogMock.mockResolvedValue(null);
+    refreshModelPricingCatalogMock.mockReset();
+    refreshModelPricingCatalogMock.mockResolvedValue(null);
     testAccountTokenModelAvailabilityMock.mockReset();
     testAccountTokenModelAvailabilityMock.mockImplementation(async (options: { model: string; tokenIds: number[] }) => ({
       model: options.model,
@@ -381,6 +389,56 @@ describe('account tokens sync routes with site status', () => {
       expect.objectContaining({
         id: tokenRows[0].id,
         valueStatus: 'masked_pending',
+      }),
+    ]);
+  });
+
+  it('refreshes group pricing after single-account sync so new token groups show ratios', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    getApiTokensMock.mockResolvedValue([
+      { name: 'vip-token', key: 'sk-vip-token', enabled: true, tokenGroup: 'vip' },
+    ]);
+    getApiTokenMock.mockResolvedValue(null);
+    getUserGroupDetailsMock.mockResolvedValue([
+      { group: 'vip', ratio: 0.25 },
+    ]);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/account-tokens/sync/${account.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      synced: true,
+      status: 'synced',
+      created: 1,
+    });
+
+    const pricingRows = await db.select()
+      .from(schema.tokenGroupPricing)
+      .where(eq(schema.tokenGroupPricing.accountId, account.id))
+      .all();
+    expect(pricingRows).toEqual([
+      expect.objectContaining({
+        group: 'vip',
+        ratio: 0.25,
+        pricingAvailable: true,
+      }),
+    ]);
+
+    const listResponse = await app.inject({
+      method: 'GET',
+      url: '/api/account-tokens',
+    });
+    expect(listResponse.statusCode).toBe(200);
+    expect(listResponse.json()).toMatchObject([
+      expect.objectContaining({
+        name: 'vip-token',
+        tokenGroup: 'vip',
+        groupRatio: 0.25,
+        groupRatioAvailable: true,
       }),
     ]);
   });

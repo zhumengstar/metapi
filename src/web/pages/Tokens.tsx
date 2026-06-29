@@ -1368,7 +1368,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       const res = await api.updateAccountToken(editingToken.id, {
         name: editForm.name.trim() || editingToken.name,
         token: editForm.token.trim() || undefined,
-        group: editForm.group.trim() || undefined,
+        group: editForm.group.trim(),
         enabled: editForm.enabled,
         isDefault: editForm.isDefault,
       });
@@ -1392,6 +1392,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         markTokenAsDefault({ ...editingToken, id: editingToken.id, accountId: editingToken.accountId });
       }
       toast.success('令牌已更新');
+      await load();
       closeEditPanel();
     } catch (e: any) {
       toast.error(e.message || '更新令牌失败');
@@ -2806,10 +2807,13 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
                   <ModernSelect
                     value={editForm.group || ''}
                     onChange={(nextValue) => setEditForm((prev) => ({ ...prev, group: nextValue }))}
-                    options={editGroupOptions.map((group) => ({
-                      value: group,
-                      label: group,
-                    }))}
+                    options={[
+                      { value: '', label: '无分组' },
+                      ...editGroupOptions.map((group) => ({
+                        value: group,
+                        label: group,
+                      })),
+                    ]}
                     placeholder={editGroupLoading ? '分组加载中...' : '无分组'}
                     disabled={editGroupLoading}
                   />
@@ -3017,10 +3021,13 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
             <ModernSelect
               value={form.group || ''}
               onChange={(nextValue) => setForm((prev) => ({ ...prev, group: nextValue }))}
-              options={groupOptions.map((group) => ({
-                value: group,
-                label: group,
-              }))}
+              options={[
+                { value: '', label: '无分组' },
+                ...groupOptions.map((group) => ({
+                  value: group,
+                  label: group,
+                })),
+              ]}
               placeholder={groupLoading ? '分组加载中...' : '无分组'}
               disabled={!form.accountId || groupLoading}
             />

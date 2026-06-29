@@ -199,6 +199,103 @@ describe('Tokens edit modal and row selection', () => {
     }
   });
 
+  it('can clear a token group from the edit modal and reloads token rows after saving', async () => {
+    apiMock.getAccountTokens.mockReset();
+    apiMock.getAccountTokens
+      .mockResolvedValueOnce([
+        {
+          id: 22,
+          name: 'focus-token',
+          tokenMasked: 'sk-focus****',
+          valueStatus: 'ready',
+          enabled: true,
+          isDefault: false,
+          tokenGroup: 'default',
+          groupRatioAvailable: true,
+          groupRatio: 1,
+          updatedAt: '2026-03-07 10:00:00',
+          accountId: 1,
+          account: { username: 'session-user' },
+          site: { name: 'Session Site', url: 'https://session.example.com' },
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          id: 22,
+          name: 'focus-token',
+          tokenMasked: 'sk-focus****',
+          valueStatus: 'ready',
+          enabled: true,
+          isDefault: false,
+          tokenGroup: null,
+          groupRatioAvailable: false,
+          groupRatio: null,
+          updatedAt: '2026-03-07 10:05:00',
+          accountId: 1,
+          account: { username: 'session-user' },
+          site: { name: 'Session Site', url: 'https://session.example.com' },
+        },
+      ]);
+    apiMock.updateAccountToken.mockResolvedValue({
+      success: true,
+      token: {
+        id: 22,
+        name: 'focus-token',
+        tokenGroup: null,
+        enabled: true,
+        isDefault: false,
+        valueStatus: 'ready',
+      },
+    });
+
+    let root!: WebTestRenderer;
+    try {
+      await act(async () => {
+        root = buildTokensRoot();
+      });
+      await flushMicrotasks();
+
+      const editButton = root.root
+        .findAll((node) => node.type === 'button')
+        .find((node) => collectText(node).includes('编辑'));
+      expect(editButton).toBeTruthy();
+
+      await act(async () => {
+        editButton!.props.onClick({ stopPropagation: () => undefined });
+      });
+      await flushMicrotasks();
+
+      const groupSelect = root.root.findAllByType(ModernSelect)
+        .find((node) => (
+          node.props.value === 'default'
+          && Array.isArray(node.props.options)
+          && node.props.options.some((option: any) => option.value === '')
+          && node.props.options.some((option: any) => option.value === 'vip')
+        ));
+      expect(groupSelect).toBeTruthy();
+
+      await act(async () => {
+        groupSelect!.props.onChange('');
+      });
+
+      const saveButton = root.root
+        .findAll((node) => node.type === 'button')
+        .find((node) => collectText(node).includes('保存修改'));
+      expect(saveButton).toBeTruthy();
+
+      await act(async () => {
+        saveButton!.props.onClick();
+      });
+      await flushMicrotasks();
+
+      expect(apiMock.updateAccountToken).toHaveBeenCalledWith(22, expect.objectContaining({ group: '' }));
+      expect(apiMock.getAccountTokens).toHaveBeenCalledTimes(2);
+      expect(collectText(root.root)).toContain('未分组');
+    } finally {
+      root?.unmount();
+    }
+  });
+
   it('selects a token when clicking the row body, but not when clicking an action button', async () => {
     let root!: WebTestRenderer;
     try {

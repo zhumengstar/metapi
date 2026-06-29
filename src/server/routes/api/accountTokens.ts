@@ -42,6 +42,7 @@ import {
 import {
   buildTokenGroupPricingOverview,
   listTokenGroupPricingGroups,
+  refreshTokenGroupPricingForAccount,
   syncTokenGroupPricingCache,
 } from '../../services/tokenGroupPricingOverviewService.js';
 import { getAccountTokenModels } from '../../services/accountTokenModelService.js';
@@ -655,6 +656,11 @@ async function executeAccountTokenSync(row: AccountWithSiteRow): Promise<SyncExe
     const synced = convergence.tokenSync!;
     const deleted = await deleteMissingUpstreamTokens(accountId, tokens);
     await removeRouteChannelsForDisabledAccountTokens(accountId);
+    try {
+      await refreshTokenGroupPricingForAccount(accountId);
+    } catch (error: any) {
+      console.warn(`[account-tokens] group pricing refresh failed after sync ${accountId}: ${error?.message || error}`);
+    }
     if ((synced.maskedPending || 0) > 0) {
       return {
         ...base,
