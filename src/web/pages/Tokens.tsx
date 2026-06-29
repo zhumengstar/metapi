@@ -113,11 +113,19 @@ type TokenSortKey =
 type TokenSortRule = { key: TokenSortKey; order: 'asc' | 'desc' };
 type TokenStatusFilter = 'all' | 'enabled' | 'disabled' | 'pending' | 'autoDisabled';
 type TokenAvailabilityFilter = 'all' | 'available' | 'unavailable';
+type TokenModelSearchMode = 'exact' | 'fuzzy';
 
 const ACCOUNT_SELECT_SEARCH_PLACEHOLDER = '筛选账号（名称 / 站点）';
 const DEFAULT_BATCH_TEST_MODEL = 'gpt-5.5';
 const IMAGE_MODEL_TEST_SKIPPED_MESSAGE = '只有图片模型，未进行聊天可用性测试';
 const TOKEN_RATIO_FILTER_STORAGE_KEY = 'metapi.tokens.maxGroupRatioFilter';
+
+const matchesTokenModelSearch = (modelName: string, normalizedSearch: string, mode: TokenModelSearchMode) => {
+  const normalizedModelName = modelName.trim().toLowerCase();
+  return mode === 'fuzzy'
+    ? normalizedModelName.includes(normalizedSearch)
+    : normalizedModelName === normalizedSearch;
+};
 const UNGROUPED_TOKEN_LABEL = '未分组';
 const DEFAULT_TOKEN_SORT_RULES: TokenSortRule[] = [
   { key: 'status', order: 'desc' },
@@ -449,6 +457,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
   }>(null);
   const [tokenSortRules, setTokenSortRules] = useState<TokenSortRule[]>(DEFAULT_TOKEN_SORT_RULES);
   const [modelSearch, setModelSearch] = useState('');
+  const [modelSearchMode, setModelSearchMode] = useState<TokenModelSearchMode>('exact');
   const [tokenStatusFilter, setTokenStatusFilter] = useState<TokenStatusFilter>('all');
   const [tokenAvailabilityFilter, setTokenAvailabilityFilter] = useState<TokenAvailabilityFilter>('all');
   const [maxGroupRatioFilter, setMaxGroupRatioFilter] = useState(readStoredTokenRatioFilter);
@@ -720,7 +729,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         if (tokenAvailabilityFilter === 'unavailable' && result?.available === true) return false;
       }
       if (!normalizedModelSearch) return true;
-      return tokenModelNames(token).some((modelName) => modelName.trim().toLowerCase() === normalizedModelSearch);
+      return tokenModelNames(token).some((modelName) => matchesTokenModelSearch(modelName, normalizedModelSearch, modelSearchMode));
     }).sort((left, right) => {
       for (const rule of tokenSortRules) {
         let result = 0;
@@ -755,7 +764,7 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
       if (nameCmp !== 0) return nameCmp;
       return Number(left?.id || 0) - Number(right?.id || 0);
     });
-  }, [maxGroupRatioFilter, modelSearch, syncingAccountId, tokenAvailabilityById, tokenAvailabilityFilter, tokenSortRules, tokenStatusFilter, tokens]);
+  }, [maxGroupRatioFilter, modelSearch, modelSearchMode, syncingAccountId, tokenAvailabilityById, tokenAvailabilityFilter, tokenSortRules, tokenStatusFilter, tokens]);
   const allVisibleTokensSelected = accountClusteredTokens.length > 0
     && accountClusteredTokens.every((token) => selectedTokenIds.includes(token.id));
   const hasSelectedTokens = selectedTokenIds.length > 0;
@@ -2096,6 +2105,11 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     { value: 'unavailable', label: '可用：否' },
   ]), []);
 
+  const modelSearchModeOptions = useMemo(() => ([
+    { value: 'exact', label: '精准查询' },
+    { value: 'fuzzy', label: '模糊查询' },
+  ]), []);
+
   const inputStyle: React.CSSProperties = {
     width: '100%',
     padding: '10px 14px',
@@ -2118,10 +2132,23 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
         width: '100%',
       }}
     >
+      <div style={{ minWidth: compact ? undefined : 116, flex: compact ? undefined : '0 0 116px', position: 'relative', zIndex: 21 }}>
+        <ModernSelect
+          size="sm"
+          data-testid="token-model-search-mode"
+          value={modelSearchMode}
+          onChange={(nextValue) => {
+            setModelSearchMode((nextValue === 'fuzzy' ? 'fuzzy' : 'exact') as TokenModelSearchMode);
+            setSelectedTokenIds([]);
+          }}
+          options={modelSearchModeOptions}
+          placeholder="查询方式"
+        />
+      </div>
       <input
         value={modelSearch}
         onChange={(event) => setModelSearch(event.target.value)}
-        placeholder="输入完整模型名称精准筛选"
+        placeholder={modelSearchMode === 'fuzzy' ? '输入模型名称关键词模糊筛选' : '输入完整模型名称精准筛选'}
         style={{ ...inputStyle, flex: compact ? undefined : '1 1 260px', minWidth: compact ? undefined : 220 }}
       />
       <button
@@ -2177,6 +2204,8 @@ export function TokensPanel({ embedded = false, onEmbeddedActionsChange }: Token
     handleTestFilteredModelTokens,
     inputStyle,
     modelSearch,
+    modelSearchMode,
+    modelSearchModeOptions,
     modelTestTokenIds.length,
     statusFilterOptions,
     syncingAccountId,

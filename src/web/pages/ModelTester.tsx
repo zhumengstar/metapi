@@ -1078,6 +1078,7 @@ export default function ModelTester() {
         searchAllowedDomains,
         searchBlockedDomains,
         imagesPrompt: inputs.mode === 'images.generate' || inputs.mode === 'images.edit' ? assetPrompt : '',
+        imagesSize: modeState.imagesSize,
         imagesMaskDataUrl: imageMaskFile?.dataUrl || '',
         videosPrompt: inputs.mode === 'videos.create' ? assetPrompt : '',
         videosInspectId: videoInspectId,

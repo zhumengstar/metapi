@@ -5,6 +5,16 @@ import { ToastProvider } from '../components/Toast.js';
 import { TokensPanel } from './Tokens.js';
 import { installAccountsSnapshotCompat } from './testApiCompat.js';
 
+function collectText(node: any): string {
+  return node.children
+    .map((child: any) => {
+      if (typeof child === 'string' || typeof child === 'number') return String(child);
+      if (child && typeof child === 'object' && Array.isArray(child.children)) return collectText(child);
+      return '';
+    })
+    .join('');
+}
+
 const { apiMock } = vi.hoisted(() => ({
   apiMock: {
     getAccountTokens: vi.fn(),
@@ -218,6 +228,50 @@ describe('Tokens batch actions', () => {
       const checkboxA = root.root.find((node) => node.props['data-testid'] === 'token-select-1');
       expect(checkboxA.props.checked).toBe(false);
       expect(root.root.findAll((node) => node.props['data-testid'] === 'token-select-2')).toHaveLength(0);
+    } finally {
+      root?.unmount();
+    }
+  });
+
+  it('filters model names by keyword in fuzzy search mode', async () => {
+    let root!: WebTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <ToastProvider>
+            <MemoryRouter initialEntries={['/accounts?segment=tokens']}>
+              <TokensPanel />
+            </MemoryRouter>
+          </ToastProvider>,
+        );
+      });
+      await flushMicrotasks();
+
+      const modeSelect = root.root.find((node) => node.props['data-testid'] === 'token-model-search-mode');
+      const modeTrigger = modeSelect.findAll((node) => node.type === 'button')[0];
+      await act(async () => {
+        modeTrigger.props.onClick();
+      });
+      const fuzzyOption = modeSelect
+        .findAll((node) => node.type === 'button')
+        .find((node) => collectText(node).includes('模糊查询'));
+      expect(fuzzyOption).toBeTruthy();
+      await act(async () => {
+        fuzzyOption!.props.onClick();
+      });
+
+      const modelInput = root.root.find((node) => node.type === 'input' && node.props.placeholder === '输入模型名称关键词模糊筛选');
+      await act(async () => {
+        modelInput.props.onChange({ target: { value: 'gpt' } });
+      });
+      await flushMicrotasks();
+
+      expect(root.root.findAll((node) => node.props['data-testid'] === 'token-row-1')).toHaveLength(1);
+      expect(root.root.findAll((node) => node.props['data-testid'] === 'token-row-2')).toHaveLength(1);
+      const testFilteredButton = root.root
+        .findAll((node) => node.type === 'button')
+        .find((node) => collectText(node).includes('测试筛选令牌 (2)'));
+      expect(testFilteredButton).toBeTruthy();
     } finally {
       root?.unmount();
     }
