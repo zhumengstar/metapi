@@ -719,16 +719,16 @@ async function appendTokenSyncEvent(result: SyncExecutionResult) {
 }
 
 async function executeSyncAllAccountTokens() {
-  const rows = await db.select().from(schema.accounts)
-    .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
-    .all();
-
   let pricingRefresh: Awaited<ReturnType<typeof buildTokenGroupPricingOverview>> | null = null;
   try {
     pricingRefresh = await buildTokenGroupPricingOverview({ refresh: true });
   } catch (error: any) {
     console.warn(`[account-tokens] group pricing refresh failed before sync-all: ${error?.message || error}`);
   }
+
+  const rows = await db.select().from(schema.accounts)
+    .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+    .all();
 
   const results: SyncExecutionResult[] = [];
   for (let offset = 0; offset < rows.length; offset += SYNC_ALL_BATCH_SIZE) {

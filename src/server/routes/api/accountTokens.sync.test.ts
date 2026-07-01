@@ -1418,6 +1418,75 @@ describe('account tokens sync routes with site status', () => {
     });
   });
 
+  it('sync-all deletes local tokens that are no longer present upstream', async () => {
+    const { account } = await seedAccount({ siteStatus: 'active' });
+    const staleToken = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'stale',
+      token: 'sk-stale-token',
+      source: 'sync',
+      enabled: true,
+      isDefault: false,
+      tokenGroup: 'stale',
+      valueStatus: 'ready' as any,
+    }).returning().get();
+    await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'kept',
+      token: 'sk-kept-token',
+      source: 'sync',
+      enabled: true,
+      isDefault: true,
+      tokenGroup: 'kept',
+      valueStatus: 'ready' as any,
+    }).run();
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.5',
+      enabled: true,
+    }).returning().get();
+    await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: account.id,
+      tokenId: staleToken.id,
+      enabled: true,
+    }).run();
+
+    getApiTokensMock.mockResolvedValue([
+      { name: 'kept', key: 'sk-kept-token', enabled: true, tokenGroup: 'kept' },
+    ]);
+    getApiTokenMock.mockResolvedValue(null);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/account-tokens/sync-all',
+      payload: { wait: true },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      summary: expect.objectContaining({
+        synced: 1,
+        deleted: 1,
+      }),
+      results: [
+        expect.objectContaining({
+          accountId: account.id,
+          status: 'synced',
+          deleted: 1,
+        }),
+      ],
+    });
+
+    const tokenRows = await db.select()
+      .from(schema.accountTokens)
+      .where(eq(schema.accountTokens.accountId, account.id))
+      .all();
+    expect(tokenRows.map((row) => row.name)).toEqual(['kept']);
+    const routeChannels = await db.select().from(schema.routeChannels).all();
+    expect(routeChannels.some((row) => row.tokenId === staleToken.id)).toBe(false);
+  });
+
   it('activates expired account before deleting all upstream tokens', async () => {
     const { account } = await seedAccount({
       siteStatus: 'active',
