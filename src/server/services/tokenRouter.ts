@@ -1872,7 +1872,7 @@ async function loadRouteMatch(route: RouteRow, nowMs = Date.now()): Promise<Rout
       : [];
     for (const row of tokenGroupPricingRows) {
       const ratio = Number(row.ratio);
-      if (!Number.isFinite(ratio) || ratio <= 0) continue;
+      if (!Number.isFinite(ratio) || ratio < 0 || row.pricingAvailable !== true) continue;
       const group = row.group?.trim();
       if (!group) continue;
       if (typeof row.accountId === 'number' && Number.isFinite(row.accountId) && row.accountId > 0) {
@@ -2420,7 +2420,7 @@ function resolveEffectiveUnitCost(candidate: RouteChannelCandidate, modelName: s
     };
   }
 
-  if (typeof groupRatio === 'number' && Number.isFinite(groupRatio) && groupRatio > 0) {
+  if (typeof groupRatio === 'number' && Number.isFinite(groupRatio) && groupRatio >= 0) {
     return {
       unitCost: Math.max(groupRatio, MIN_EFFECTIVE_UNIT_COST),
       source: 'configured',
@@ -2462,7 +2462,7 @@ function resolveStableFirstSelectionCost(
 ): number {
   const groupRatio = candidate?.tokenGroupPricingRatio
     ?? parseRatioFromTokenGroupName(candidate?.token?.tokenGroup);
-  if (typeof groupRatio === 'number' && Number.isFinite(groupRatio) && groupRatio > 0) {
+  if (typeof groupRatio === 'number' && Number.isFinite(groupRatio) && groupRatio >= 0) {
     return Math.max(groupRatio, MIN_EFFECTIVE_UNIT_COST);
   }
   return 1;
@@ -2474,7 +2474,7 @@ function resolveStableFirstSelectionCostSource(
 ): string {
   const groupRatio = candidate?.tokenGroupPricingRatio
     ?? parseRatioFromTokenGroupName(candidate?.token?.tokenGroup);
-  if (typeof groupRatio === 'number' && Number.isFinite(groupRatio) && groupRatio > 0) {
+  if (typeof groupRatio === 'number' && Number.isFinite(groupRatio) && groupRatio >= 0) {
     return '分组倍率';
   }
   return '无分组倍率';

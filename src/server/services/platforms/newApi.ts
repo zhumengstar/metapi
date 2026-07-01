@@ -329,7 +329,7 @@ export class NewApiAdapter extends BasePlatformAdapter {
         name: detail.name ?? existing?.name ?? null,
         description: detail.description ?? existing?.description ?? null,
       };
-      if (Number.isFinite(ratio) && ratio > 0) normalized.ratio = ratio;
+      if (detail.ratio != null && Number.isFinite(ratio) && ratio >= 0) normalized.ratio = ratio;
       else if (existing?.ratio !== undefined) normalized.ratio = existing.ratio;
       byGroup.set(group, normalized);
     }
@@ -342,13 +342,18 @@ export class NewApiAdapter extends BasePlatformAdapter {
     }
 
     const readRatio = (source: any): number | undefined => {
-      const value = Number(
-        source?.ratio
-        ?? source?.group_ratio
-        ?? source?.groupRatio
-        ?? source?.倍率
-      );
-      return Number.isFinite(value) && value > 0 ? value : undefined;
+      if (typeof source === 'boolean') return undefined;
+      const rawValue = [
+        source?.ratio,
+        source?.group_ratio,
+        source?.groupRatio,
+        source?.rate_multiplier,
+        source?.rateMultiplier,
+        source?.multiplier,
+        source?.倍率,
+      ].find((candidate) => candidate != null && typeof candidate !== 'boolean');
+      const value = Number(rawValue);
+      return Number.isFinite(value) && value >= 0 ? value : undefined;
     };
     const readDescription = (source: any): string | null => {
       const value = source?.desc ?? source?.description ?? source?.remark ?? source?.备注;
@@ -359,7 +364,7 @@ export class NewApiAdapter extends BasePlatformAdapter {
       if (!group) return;
       const normalized: UserGroupInfo = { group };
       const ratio = Number(detail.ratio);
-      if (Number.isFinite(ratio) && ratio > 0) normalized.ratio = ratio;
+      if (detail.ratio != null && Number.isFinite(ratio) && ratio >= 0) normalized.ratio = ratio;
       if (detail.name) normalized.name = detail.name;
       if (detail.description) normalized.description = detail.description;
       details.push(normalized);
@@ -413,17 +418,36 @@ export class NewApiAdapter extends BasePlatformAdapter {
 
   private mergeUserGroupDetails(primary: UserGroupInfo[], fallback: UserGroupInfo[]): UserGroupInfo[] {
     const merged: UserGroupInfo[] = [];
-    const seen = new Set<string>();
+    const byGroup = new Map<string, UserGroupInfo>();
     const push = (detail: UserGroupInfo) => {
       const group = String(detail?.group || '').trim();
-      if (!group || seen.has(group)) return;
-      seen.add(group);
-      merged.push(detail);
+      if (!group) return;
+      const existing = byGroup.get(group);
+      if (!existing) {
+        const next = { ...detail, group };
+        byGroup.set(group, next);
+        merged.push(next);
+        return;
+      }
+      const ratio = Number(detail.ratio);
+      if (detail.ratio != null && Number.isFinite(ratio) && ratio >= 0 && existing.ratio === undefined) {
+        existing.ratio = ratio;
+      }
+      if (!existing.name && detail.name) existing.name = detail.name;
+      if (!existing.description && detail.description) existing.description = detail.description;
+      if (!existing.groupKey && detail.groupKey) existing.groupKey = detail.groupKey;
     };
 
     primary.forEach(push);
     fallback.forEach(push);
     return this.normalizeUserGroupDetails(merged);
+  }
+
+  private hasCompleteUserGroupRatios(details: UserGroupInfo[]): boolean {
+    return details.length > 0 && details.every((detail) => {
+      const ratio = Number(detail.ratio);
+      return detail.ratio != null && Number.isFinite(ratio) && ratio >= 0;
+    });
   }
 
   private resolveGroupFetchErrorMessage(payload: any): string {
@@ -1543,8 +1567,7 @@ export class NewApiAdapter extends BasePlatformAdapter {
       publicDetails = this.parseUserGroupDetails(res);
     } catch {}
 
-    const mergedAuthDetails = this.mergeUserGroupDetails(selfDetails, publicDetails);
-    if (mergedAuthDetails.length > 0) return mergedAuthDetails;
+    let bestDetails = this.mergeUserGroupDetails(selfDetails, publicDetails);
 
     try {
       const res = await this.fetchJson<any>(`${baseUrl}/api/user_group_map`, {
@@ -1554,7 +1577,8 @@ export class NewApiAdapter extends BasePlatformAdapter {
         terminalError = this.resolveGroupFetchErrorMessage(res);
       }
       const parsed = this.parseUserGroupDetails(res);
-      if (parsed.length > 0) return parsed;
+      bestDetails = this.mergeUserGroupDetails(bestDetails, parsed);
+      if (this.hasCompleteUserGroupRatios(bestDetails)) return bestDetails;
     } catch {}
 
     const cookieUserId = resolvedUserId || await this.probeUserIdByCookie(baseUrl, accessToken);
@@ -1581,7 +1605,8 @@ export class NewApiAdapter extends BasePlatformAdapter {
       } catch {}
 
       const mergedCookieDetails = this.mergeUserGroupDetails(cookieSelfDetails, cookiePublicDetails);
-      if (mergedCookieDetails.length > 0) return mergedCookieDetails;
+      bestDetails = this.mergeUserGroupDetails(bestDetails, mergedCookieDetails);
+      if (this.hasCompleteUserGroupRatios(bestDetails)) return bestDetails;
 
       try {
         const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/user_group_map`, { headers });
@@ -1589,9 +1614,12 @@ export class NewApiAdapter extends BasePlatformAdapter {
           terminalError = this.resolveGroupFetchErrorMessage(res);
         }
         const parsed = this.parseUserGroupDetails(res);
-        if (parsed.length > 0) return parsed;
+        bestDetails = this.mergeUserGroupDetails(bestDetails, parsed);
+        if (this.hasCompleteUserGroupRatios(bestDetails)) return bestDetails;
       } catch {}
     }
+
+    if (bestDetails.length > 0) return bestDetails;
 
     if (terminalError) {
       throw new Error(terminalError);

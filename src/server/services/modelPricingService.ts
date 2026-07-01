@@ -207,7 +207,7 @@ function normalizeGroupRatio(raw: unknown): Record<string, number> {
   if (raw && typeof raw === 'object') {
     for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
       const ratio = toNumber(value, Number.NaN);
-      if (ratio > 0) result[key] = ratio;
+      if (ratio >= 0) result[key] = ratio;
     }
   }
 
@@ -887,16 +887,16 @@ function resolveModel(modelName: string, data: PricingData): PricingModel | null
 }
 
 function resolveGroupMultiplier(model: PricingModel, groupRatio: Record<string, number>): number {
-  if (model.enableGroups.includes(DEFAULT_GROUP) && groupRatio[DEFAULT_GROUP]) {
+  if (model.enableGroups.includes(DEFAULT_GROUP) && Number.isFinite(groupRatio[DEFAULT_GROUP])) {
     return groupRatio[DEFAULT_GROUP];
   }
 
   for (const group of model.enableGroups) {
-    if (groupRatio[group]) return groupRatio[group];
+    if (Number.isFinite(groupRatio[group])) return groupRatio[group];
   }
 
-  const first = Object.values(groupRatio).find((ratio) => ratio > 0);
-  return first || 1;
+  const first = Object.values(groupRatio).find((ratio) => ratio >= 0);
+  return first ?? 1;
 }
 
 function calculatePerCallCost(
@@ -1069,7 +1069,7 @@ export function calculateModelUsageCost(
 
 function buildModelPricingCatalogFromData(pricingData: PricingData): ModelPricingCatalog {
   const groups = Array.from(new Set([DEFAULT_GROUP, ...Object.keys(pricingData.groupRatio)]));
-  const defaultMultiplier = pricingData.groupRatio[DEFAULT_GROUP] || 1;
+  const defaultMultiplier = pricingData.groupRatio[DEFAULT_GROUP] ?? 1;
   const groupRatioByLookupKey = new Map<string, number>();
   const groupLabelByLookupKey = new Map<string, string>();
   for (const [group, ratio] of Object.entries(pricingData.groupRatio)) {
@@ -1097,8 +1097,8 @@ function buildModelPricingCatalogFromData(pricingData: PricingData): ModelPricin
 
       const groupPricing = effectiveGroups.reduce<Record<string, ModelGroupPricing>>((acc, group) => {
         const multiplier = pricingData.groupRatio[group]
-          || groupRatioByLookupKey.get(normalizeTokenGroupLookupKey(group))
-          || defaultMultiplier;
+          ?? groupRatioByLookupKey.get(normalizeTokenGroupLookupKey(group))
+          ?? defaultMultiplier;
         if (model.quotaType === 1) {
           const perCall = calculatePerCallPricing(model.modelPrice, multiplier);
           acc[group] = {

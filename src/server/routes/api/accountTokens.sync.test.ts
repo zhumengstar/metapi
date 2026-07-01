@@ -393,14 +393,14 @@ describe('account tokens sync routes with site status', () => {
     ]);
   });
 
-  it('refreshes group pricing after single-account sync so new token groups show ratios', async () => {
+  it('refreshes group pricing after single-account sync and preserves a zero ratio', async () => {
     const { account } = await seedAccount({ siteStatus: 'active' });
     getApiTokensMock.mockResolvedValue([
       { name: 'vip-token', key: 'sk-vip-token', enabled: true, tokenGroup: 'vip' },
     ]);
     getApiTokenMock.mockResolvedValue(null);
     getUserGroupDetailsMock.mockResolvedValue([
-      { group: 'vip', ratio: 0.25 },
+      { group: 'vip', ratio: 0 },
     ]);
 
     const response = await app.inject({
@@ -423,7 +423,7 @@ describe('account tokens sync routes with site status', () => {
     expect(pricingRows).toEqual([
       expect.objectContaining({
         group: 'vip',
-        ratio: 0.25,
+        ratio: 0,
         pricingAvailable: true,
       }),
     ]);
@@ -437,7 +437,7 @@ describe('account tokens sync routes with site status', () => {
       expect.objectContaining({
         name: 'vip-token',
         tokenGroup: 'vip',
-        groupRatio: 0.25,
+        groupRatio: 0,
         groupRatioAvailable: true,
       }),
     ]);

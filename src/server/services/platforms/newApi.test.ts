@@ -22,6 +22,7 @@ const CHECKIN_CLOUDFLARE_530_TOKEN = 'checkin-cloudflare-530-token';
 const BALANCE_FAIL_TOKEN = 'balance-fail-token';
 const BALANCE_SHIELD_FAILURE_TOKEN = 'balance-shield-failure-token';
 const GROUP_EXPIRED_TOKEN = 'group-expired-token';
+const GROUP_PARTIAL_RATIO_TOKEN = 'group-partial-ratio-token';
 const SHIELD_LOGIN_USERNAME = 'shield-user';
 const SHIELD_LOGIN_PASSWORD = 'shield-pass';
 const SHIELD_LOGIN_TOKEN = 'login-session-token';
@@ -486,7 +487,37 @@ describe('NewApiAdapter', () => {
         }
         if (typeof req.headers.authorization === 'string' && req.headers.authorization === 'Bearer session-token') {
           res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, data: { default: true, gemini: true, free: true } }));
+          return;
+        }
+        if (typeof req.headers.authorization === 'string' && req.headers.authorization === `Bearer ${GROUP_PARTIAL_RATIO_TOKEN}`) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: true, data: { default: true, gemini: true } }));
+          return;
+        }
+        if (typeof req.headers.cookie === 'string' && req.headers.cookie.includes(`session=${GROUP_PARTIAL_RATIO_TOKEN}`)) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, data: { gemini: { ratio: 0.25 } } }));
+          return;
+        }
+      }
+
+      if (req.url === '/api/user_group_map') {
+        if (typeof req.headers.authorization === 'string' && req.headers.authorization === 'Bearer session-token') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: true,
+            data: {
+              default: { ratio: 1 },
+              gemini: { rate_multiplier: 0.25 },
+              free: { ratio: 0 },
+            },
+          }));
+          return;
+        }
+        if (typeof req.headers.authorization === 'string' && req.headers.authorization === `Bearer ${GROUP_PARTIAL_RATIO_TOKEN}`) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, data: { default: { ratio: 1 } } }));
           return;
         }
       }
@@ -743,9 +774,30 @@ describe('NewApiAdapter', () => {
     const adapter = new NewApiAdapter();
     const groups = await adapter.getUserGroups(baseUrl, 'session-token', 11494);
 
-    expect(groups).toEqual(['default', 'gemini']);
+    expect(groups).toEqual(['default', 'gemini', 'free']);
     expect(groups).not.toContain('success');
     expect(groups).not.toContain('message');
+  });
+
+  it('continues to user_group_map when auth group endpoints omit ratios', async () => {
+    const adapter = new NewApiAdapter();
+    const groups = await adapter.getUserGroupDetails(baseUrl, 'session-token', 11494);
+
+    expect(groups).toEqual([
+      expect.objectContaining({ group: 'default', ratio: 1 }),
+      expect.objectContaining({ group: 'gemini', ratio: 0.25 }),
+      expect.objectContaining({ group: 'free', ratio: 0 }),
+    ]);
+  });
+
+  it('continues through cookie fallbacks until every discovered group has a ratio', async () => {
+    const adapter = new NewApiAdapter();
+    const groups = await adapter.getUserGroupDetails(baseUrl, GROUP_PARTIAL_RATIO_TOKEN, 11494);
+
+    expect(groups).toEqual([
+      expect.objectContaining({ group: 'default', ratio: 1 }),
+      expect.objectContaining({ group: 'gemini', ratio: 0.25 }),
+    ]);
   });
 
   it('throws expired-session error when group endpoint reports invalid access token', async () => {

@@ -199,7 +199,9 @@ function normalizeGroupDetails(details: GroupDetail[]): GroupDetail[] {
     byGroup.set(group, {
       group,
       groupKey: typeof item?.groupKey === 'string' && item.groupKey.trim() ? item.groupKey.trim() : existing.groupKey,
-      ratio: Number.isFinite(ratio) && ratio > 0 ? Math.round(ratio * 1_000_000) / 1_000_000 : existing.ratio,
+      ratio: item?.ratio != null && Number.isFinite(ratio) && ratio >= 0
+        ? Math.round(ratio * 1_000_000) / 1_000_000
+        : existing.ratio,
       name: typeof item?.name === 'string' && item.name.trim() ? item.name.trim() : existing.name,
       description: typeof item?.description === 'string' && item.description.trim() ? item.description.trim() : existing.description,
     });
@@ -211,7 +213,7 @@ function buildRatioOverride(details: GroupDetail[]): Record<string, number> {
   const ratio: Record<string, number> = {};
   for (const item of details) {
     const value = Number(item.ratio);
-    if (Number.isFinite(value) && value > 0) {
+    if (item.ratio != null && Number.isFinite(value) && value >= 0) {
       ratio[normalizeGroup(item.group)] = value;
       if (item.groupKey) ratio[normalizeGroup(item.groupKey)] = value;
       if (item.name) ratio[normalizeGroup(item.name)] = value;
@@ -287,7 +289,7 @@ function summarizePricing(
     const candidates = [group, ...(groupAliases[group] || [])].map(normalizeGroup);
     const value: number | undefined = candidates
       .map((candidate) => ratio[candidate])
-      .find((candidateRatio): candidateRatio is number => Number.isFinite(candidateRatio) && candidateRatio > 0);
+      .find((candidateRatio): candidateRatio is number => Number.isFinite(candidateRatio) && candidateRatio >= 0);
     acc[group] = value ?? null;
     return acc;
   }, {});
@@ -397,7 +399,7 @@ function buildGroupAliasRows(
   const rowByRatio = new Map<number, TokenGroupPricingOverviewGroupRow[]>();
   for (const row of rows) {
     const ratio = Number(row.ratio);
-    if (!Number.isFinite(ratio) || ratio <= 0) continue;
+    if (!Number.isFinite(ratio) || ratio < 0) continue;
     const list = rowByRatio.get(ratio) || [];
     list.push(row);
     rowByRatio.set(ratio, list);
@@ -424,7 +426,7 @@ function buildGroupAliasRows(
   for (const group of uniqueGroups(localTokenGroups)) {
     if (rows.some((row) => row.group === group) || aliasRows.some((row) => row.group === group)) continue;
     const ratio = Number(catalog?.groupRatio?.[group]);
-    if (!Number.isFinite(ratio) || ratio <= 0) continue;
+    if (!Number.isFinite(ratio) || ratio < 0) continue;
     const targets = rowByRatio.get(ratio) || [];
     if (targets.length !== 1) continue;
     const row = targets[0];
@@ -630,12 +632,12 @@ async function upsertStoredGroupRow(input: {
     ))
     .get();
   const incomingRatio = Number(input.row.ratio);
-  const hasIncomingRatio = input.row.pricingAvailable && Number.isFinite(incomingRatio) && incomingRatio > 0;
+  const hasIncomingRatio = input.row.pricingAvailable && Number.isFinite(incomingRatio) && incomingRatio >= 0;
   const existingRatio = Number(existing?.ratio);
   const canPreserveExistingRatio = existing
     && isStoredPricingAvailable(existing.pricingAvailable)
     && Number.isFinite(existingRatio)
-    && existingRatio > 0;
+    && existingRatio >= 0;
   const values = {
     siteId: input.row.site.id,
     accountId: input.row.account?.id ?? null,
@@ -732,7 +734,7 @@ async function loadStoredGroupRows(
       group: stored.group,
       groupName: stored.groupName,
       description: stored.description,
-      ratio: isStoredPricingAvailable(stored.pricingAvailable) && Number(stored.ratio) > 0 ? Number(stored.ratio) : null,
+      ratio: isStoredPricingAvailable(stored.pricingAvailable) && Number(stored.ratio) >= 0 ? Number(stored.ratio) : null,
       groupSource: normalizeStoredSource(stored.source),
       groupError: stored.lastError || undefined,
       pricingAvailable: isStoredPricingAvailable(stored.pricingAvailable),

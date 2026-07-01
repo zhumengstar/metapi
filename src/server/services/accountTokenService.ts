@@ -250,8 +250,9 @@ function isStoredPricingAvailable(value: unknown): boolean {
 }
 
 export function normalizeAccountTokenGroupRatioKey(ratio: number | null | undefined): string {
+  if (ratio == null) return '';
   const value = Number(ratio);
-  if (!Number.isFinite(value) || value <= 0) return '';
+  if (!Number.isFinite(value) || value < 0) return '';
   return Number(value.toFixed(12)).toString();
 }
 
@@ -277,7 +278,7 @@ async function loadStoredGroupRatioMappings(accountId?: number): Promise<Map<str
     const group = normalizeTokenGroup(row.group);
     const groupName = normalizeTokenGroup(row.groupName);
     const ratio = Number(row.ratio);
-    if (!row.accountId || !group || !Number.isFinite(ratio) || ratio <= 0) continue;
+    if (!row.accountId || !group || !Number.isFinite(ratio) || ratio < 0) continue;
     const displayGroup = groupName || group;
     setGroupRatioMapping(ratioByAccountAndGroup, row.accountId, group, ratio, displayGroup);
     if (groupName) setGroupRatioMapping(ratioByAccountAndGroup, row.accountId, groupName, ratio, displayGroup);
@@ -295,7 +296,7 @@ async function loadAccountTokenGroupPreferences(accountId?: number): Promise<Map
   for (const row of rows) {
     const group = normalizeTokenGroup(row.tokenGroup) || 'default';
     const ratio = Number(row.groupRatio);
-    const normalizedRatio = Number.isFinite(ratio) && ratio > 0 ? ratio : null;
+    const normalizedRatio = row.groupRatio != null && Number.isFinite(ratio) && ratio >= 0 ? ratio : null;
     const ratioKey = row.groupRatioKey || normalizeAccountTokenGroupRatioKey(normalizedRatio);
     preferences.set(`${row.accountId}:${group}:${ratioKey}`, {
       enabled: row.enabled === true,
