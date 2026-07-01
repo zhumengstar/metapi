@@ -2,6 +2,7 @@ import { and, eq, isNull } from 'drizzle-orm';
 import { fetch } from 'undici';
 import { db, schema } from '../db/index.js';
 import { getProxyUrlFromExtraConfig, resolvePlatformUserId } from './accountExtraConfig.js';
+import { autoReloginAccount, isUpstreamAuthenticationError } from './accountAutoReloginService.js';
 import { maskToken, resolveAccountTokenValueStatus } from './accountTokenService.js';
 import { convergeAccountMutation } from './accountMutationWorkflow.js';
 import {
@@ -154,24 +155,45 @@ async function fetchAccountGroups(row: AccountWithSite, refresh: boolean): Promi
   if (isSiteDisabled(row.sites.status)) {
     return { groups: fallbackGroups, details: fallbackDetails, source: localGroups.length > 0 ? 'local' : 'default', error: '站点已禁用' };
   }
-  if (!row.accounts.accessToken?.trim()) {
+  let activeRow = row;
+  if ((row.accounts.status || 'active') !== 'active' || !row.accounts.accessToken?.trim()) {
+    const relogin = await autoReloginAccount(row, { force: true, timeoutMs: GROUP_FETCH_TIMEOUT_MS });
+    if (relogin.status === 'success' || relogin.status === 'not-needed') {
+      activeRow = { ...relogin.row, localTokenGroups: row.localTokenGroups };
+    } else {
+      return { groups: fallbackGroups, details: fallbackDetails, source: localGroups.length > 0 ? 'local' : 'default', error: relogin.message };
+    }
+  }
+  if (!activeRow.accounts.accessToken?.trim()) {
     return { groups: fallbackGroups, details: fallbackDetails, source: localGroups.length > 0 ? 'local' : 'default', error: '账号缺少访问令牌' };
   }
 
-  const adapter = getAdapter(row.sites.platform);
+  const adapter = getAdapter(activeRow.sites.platform);
   if (!adapter) {
     return { groups: fallbackGroups, details: fallbackDetails, source: localGroups.length > 0 ? 'local' : 'default', error: `不支持的平台: ${row.sites.platform}` };
   }
 
   try {
-    const platformUserId = resolvePlatformUserId(row.accounts.extraConfig, row.accounts.username);
-    const accountProxyUrl = getProxyUrlFromExtraConfig(row.accounts.extraConfig);
-    const upstreamDetails = await withTimeout(
+    const requestGroups = (requestRow: AccountWithSite) => withTimeout(
       () => withAccountProxyOverride(accountProxyUrl,
-        () => adapter.getUserGroupDetails(row.sites.url, row.accounts.accessToken, platformUserId)),
+        () => adapter.getUserGroupDetails(requestRow.sites.url, requestRow.accounts.accessToken!, platformUserId)),
       GROUP_FETCH_TIMEOUT_MS,
       `group fetch timeout (${Math.round(GROUP_FETCH_TIMEOUT_MS / 1000)}s)`,
     );
+    let platformUserId = resolvePlatformUserId(activeRow.accounts.extraConfig, activeRow.accounts.username);
+    let accountProxyUrl = getProxyUrlFromExtraConfig(activeRow.accounts.extraConfig);
+    let upstreamDetails;
+    try {
+      upstreamDetails = await requestGroups(activeRow);
+    } catch (error) {
+      if (!isUpstreamAuthenticationError(error)) throw error;
+      const relogin = await autoReloginAccount(activeRow, { force: true, timeoutMs: GROUP_FETCH_TIMEOUT_MS });
+      if (relogin.status !== 'success' && relogin.status !== 'not-needed') throw new Error(relogin.message);
+      activeRow = { ...relogin.row, localTokenGroups: row.localTokenGroups };
+      platformUserId = resolvePlatformUserId(activeRow.accounts.extraConfig, activeRow.accounts.username);
+      accountProxyUrl = getProxyUrlFromExtraConfig(activeRow.accounts.extraConfig);
+      upstreamDetails = await requestGroups(activeRow);
+    }
     const details = normalizeGroupDetails(upstreamDetails);
     const groups = uniqueGroups(details.map((item) => item.group));
     return {

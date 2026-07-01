@@ -5,11 +5,18 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { and, eq } from 'drizzle-orm';
 
 const getUserGroupDetailsMock = vi.fn();
+const loginMock = vi.fn();
+const decryptAccountPasswordMock = vi.fn();
 
 vi.mock('./platforms/index.js', () => ({
   getAdapter: () => ({
     getUserGroupDetails: (...args: unknown[]) => getUserGroupDetailsMock(...args),
+    login: (...args: unknown[]) => loginMock(...args),
   }),
+}));
+
+vi.mock('./accountCredentialService.js', () => ({
+  decryptAccountPassword: (...args: unknown[]) => decryptAccountPasswordMock(...args),
 }));
 
 vi.mock('./modelPricingService.js', () => ({
@@ -52,12 +59,73 @@ describe('tokenGroupPricingOverviewService', () => {
 
   beforeEach(async () => {
     getUserGroupDetailsMock.mockReset();
+    loginMock.mockReset();
+    decryptAccountPasswordMock.mockReset();
     mockCatalogGroupRatio = {};
     mockCatalogGroupRatioByAccountId = {};
     await db.delete(schema.accountTokens).run();
     await db.delete(schema.tokenGroupPricing).run();
     await db.delete(schema.accounts).run();
     await db.delete(schema.sites).run();
+  });
+
+  it('relogs an expired account before refreshing upstream group ratios', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'expired-sub2api',
+      url: 'https://sub2api.example.com',
+      platform: 'sub2api',
+    }).returning().get();
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'expired-user',
+      accessToken: 'expired-token',
+      status: 'expired',
+      extraConfig: JSON.stringify({
+        autoRelogin: { username: 'expired-user', passwordCipher: 'encrypted-password' },
+      }),
+    }).returning().get();
+    decryptAccountPasswordMock.mockReturnValue('plain-password');
+    loginMock.mockResolvedValue({ success: true, accessToken: 'fresh-token' });
+    getUserGroupDetailsMock.mockResolvedValue([{ group: 'pro', ratio: 2 }]);
+
+    const overview = await buildTokenGroupPricingOverview({ refresh: true });
+
+    expect(loginMock).toHaveBeenCalledWith(site.url, 'expired-user', 'plain-password');
+    expect(getUserGroupDetailsMock).toHaveBeenCalledWith(site.url, 'fresh-token', undefined);
+    expect(overview.groupRows.find((row) => row.account?.id === account.id && row.group === 'pro')).toMatchObject({ ratio: 2 });
+    expect(await db.select().from(schema.accounts).where(eq(schema.accounts.id, account.id)).get()).toMatchObject({
+      accessToken: 'fresh-token',
+      status: 'active',
+    });
+  });
+
+  it('relogs and retries once when an active session is rejected upstream', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'stale-session',
+      url: 'https://new-api.example.com',
+      platform: 'new-api',
+    }).returning().get();
+    await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'active-user',
+      accessToken: 'stale-token',
+      status: 'active',
+      extraConfig: JSON.stringify({
+        autoRelogin: { username: 'active-user', passwordCipher: 'encrypted-password' },
+      }),
+    }).run();
+    decryptAccountPasswordMock.mockReturnValue('plain-password');
+    loginMock.mockResolvedValue({ success: true, accessToken: 'renewed-token' });
+    getUserGroupDetailsMock
+      .mockRejectedValueOnce(new Error('401 token expired'))
+      .mockResolvedValueOnce([{ group: 'default', ratio: 1 }]);
+
+    const overview = await buildTokenGroupPricingOverview({ refresh: true });
+
+    expect(loginMock).toHaveBeenCalledTimes(1);
+    expect(getUserGroupDetailsMock).toHaveBeenNthCalledWith(1, site.url, 'stale-token', undefined);
+    expect(getUserGroupDetailsMock).toHaveBeenNthCalledWith(2, site.url, 'renewed-token', undefined);
+    expect(overview.groupRows.find((row) => row.group === 'default')).toMatchObject({ ratio: 1 });
   });
 
   afterAll(() => {
