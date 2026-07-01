@@ -3177,6 +3177,7 @@ export default function Accounts() {
                                 <SiteBadgeLink
                                   siteId={a.site?.id}
                                   siteName={a.site?.name}
+                                  siteUrl={a.site?.url}
                                   badgeStyle={{ fontSize: 11 }}
                                 />
                               }
@@ -3427,6 +3428,7 @@ export default function Accounts() {
                             <SiteBadgeLink
                               siteId={a.site?.id}
                               siteName={a.site?.name}
+                              siteUrl={a.site?.url}
                               badgeStyle={{ fontSize: 11 }}
                             />
                           </td>

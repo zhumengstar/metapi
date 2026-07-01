@@ -4,6 +4,21 @@ import { MemoryRouter } from 'react-router-dom';
 import SiteBadgeLink from './SiteBadgeLink.js';
 
 describe('SiteBadgeLink', () => {
+  it('opens the upstream site when a site URL is provided', () => {
+    const root = create(
+      <MemoryRouter>
+        <SiteBadgeLink siteId={7} siteName="Demo Site" siteUrl="https://example.com" />
+      </MemoryRouter>,
+    );
+
+    const link = root.root.findByType('a');
+    expect(link.props.href).toBe('https://example.com');
+    expect(link.props.target).toBe('_blank');
+    expect(link.props.rel).toBe('noopener noreferrer');
+
+    root.unmount();
+  });
+
   it('renders a focus-navigation link when site id is valid', () => {
     const root = create(
       <MemoryRouter>
