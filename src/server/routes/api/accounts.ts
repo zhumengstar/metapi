@@ -64,6 +64,7 @@ import {
 import { createManualAccount } from "../../services/manualAccountCreationService.js";
 import { config } from "../../config.js";
 import { probeRuntimeModel } from "../../services/runtimeModelProbe.js";
+import { buildAccountSiteLoginUrl } from "../../services/accountSiteLoginUrlService.js";
 
 type AccountWithSiteRow = {
   accounts: typeof schema.accounts.$inferSelect;
@@ -674,6 +675,31 @@ export async function accountsRoutes(app: FastifyInstance) {
         accounts: snapshot.payload.accounts,
         sites: snapshot.payload.sites,
       };
+    },
+  );
+
+  app.get<{ Params: { id: string } }>(
+    "/api/accounts/:id/site-login-url",
+    async (request, reply) => {
+      const id = parseInt(request.params.id);
+      if (!Number.isFinite(id) || id <= 0) {
+        return reply.code(400).send({ message: "invalid account id" });
+      }
+
+      const row = await db
+        .select()
+        .from(schema.accounts)
+        .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+        .where(eq(schema.accounts.id, id))
+        .get();
+      if (!row) {
+        return reply.code(404).send({ message: "account not found" });
+      }
+
+      return buildAccountSiteLoginUrl({
+        account: row.accounts,
+        site: row.sites,
+      });
     },
   );
 

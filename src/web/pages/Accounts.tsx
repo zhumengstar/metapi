@@ -3175,6 +3175,7 @@ export default function Accounts() {
                               label="站点"
                               value={
                                 <SiteBadgeLink
+                                  accountId={a.id}
                                   siteId={a.site?.id}
                                   siteName={a.site?.name}
                                   siteUrl={a.site?.url}
@@ -3426,6 +3427,7 @@ export default function Accounts() {
                           </td>
                           <td>
                             <SiteBadgeLink
+                              accountId={a.id}
                               siteId={a.site?.id}
                               siteName={a.site?.name}
                               siteUrl={a.site?.url}
