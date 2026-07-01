@@ -1487,6 +1487,106 @@ describe('account tokens sync routes with site status', () => {
     expect(routeChannels.some((row) => row.tokenId === staleToken.id)).toBe(false);
   });
 
+  it('sync-all deletes tokens whose upstream pricing group was removed', async () => {
+    const { site, account } = await seedAccount({ siteStatus: 'active' });
+    const staleToken = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'stale-group',
+      token: 'sk-stale-group-token',
+      source: 'sync',
+      enabled: true,
+      isDefault: false,
+      tokenGroup: 'stale-group',
+      valueStatus: 'ready' as any,
+    }).returning().get();
+    await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'kept-group',
+      token: 'sk-kept-group-token',
+      source: 'sync',
+      enabled: true,
+      isDefault: true,
+      tokenGroup: 'kept-group',
+      valueStatus: 'ready' as any,
+    }).run();
+    await db.insert(schema.tokenGroupPricing).values([
+      {
+        siteId: site.id,
+        accountId: account.id,
+        sourceKey: `account:${account.id}`,
+        group: 'stale-group',
+        groupName: 'stale-group',
+        ratio: 9,
+        source: 'upstream',
+        pricingAvailable: true,
+      },
+      {
+        siteId: site.id,
+        accountId: account.id,
+        sourceKey: `account:${account.id}`,
+        group: 'kept-group',
+        groupName: 'kept-group',
+        ratio: 1,
+        source: 'upstream',
+        pricingAvailable: true,
+      },
+    ]).run();
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.5',
+      enabled: true,
+    }).returning().get();
+    await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: account.id,
+      tokenId: staleToken.id,
+      enabled: true,
+    }).run();
+
+    getUserGroupDetailsMock.mockResolvedValue([
+      { group: 'kept-group', name: 'kept-group', ratio: 1 },
+    ]);
+    getApiTokensMock.mockResolvedValue([
+      { name: 'stale-group', key: 'sk-stale-group-token', enabled: true, tokenGroup: 'stale-group' },
+      { name: 'kept-group', key: 'sk-kept-group-token', enabled: true, tokenGroup: 'kept-group' },
+    ]);
+    getApiTokenMock.mockResolvedValue(null);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/account-tokens/sync-all',
+      payload: { wait: true },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      summary: expect.objectContaining({
+        synced: 1,
+        deleted: 1,
+      }),
+      results: [
+        expect.objectContaining({
+          accountId: account.id,
+          status: 'synced',
+          deleted: 1,
+        }),
+      ],
+    });
+
+    const tokenRows = await db.select()
+      .from(schema.accountTokens)
+      .where(eq(schema.accountTokens.accountId, account.id))
+      .all();
+    expect(tokenRows.map((row) => row.name)).toEqual(['kept-group']);
+    const pricingRows = await db.select()
+      .from(schema.tokenGroupPricing)
+      .where(eq(schema.tokenGroupPricing.accountId, account.id))
+      .all();
+    expect(pricingRows.map((row) => row.group)).toEqual(['kept-group']);
+    const routeChannels = await db.select().from(schema.routeChannels).all();
+    expect(routeChannels.some((row) => row.tokenId === staleToken.id)).toBe(false);
+  });
+
   it('activates expired account before deleting all upstream tokens', async () => {
     const { account } = await seedAccount({
       siteStatus: 'active',

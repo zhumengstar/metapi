@@ -403,6 +403,46 @@ async function removeRouteChannelsForDisabledAccountTokens(accountId: number): P
   return removeRouteChannelsForAccountTokens(disabledTokens.map((token) => token.id));
 }
 
+async function deleteTokensMissingStoredPricingGroups(accountId: number): Promise<number> {
+  const storedGroups = await db.select({
+    group: schema.tokenGroupPricing.group,
+    groupName: schema.tokenGroupPricing.groupName,
+  })
+    .from(schema.tokenGroupPricing)
+    .where(eq(schema.tokenGroupPricing.accountId, accountId))
+    .all();
+  const allowedGroups = new Set<string>();
+  for (const row of storedGroups) {
+    const group = normalizeTokenGroupKey(row.group);
+    const groupName = normalizeTokenGroupKey(row.groupName);
+    if (group) allowedGroups.add(group);
+    if (groupName) allowedGroups.add(groupName);
+  }
+  if (allowedGroups.size === 0) return 0;
+
+  const localTokens = await db.select()
+    .from(schema.accountTokens)
+    .where(eq(schema.accountTokens.accountId, accountId))
+    .all();
+  const tokensToDelete = localTokens.filter((token) => {
+    const group = normalizeTokenGroupKey(token.tokenGroup || token.name);
+    return group && !allowedGroups.has(group);
+  });
+  if (tokensToDelete.length === 0) return 0;
+
+  await removeRouteChannelsForAccountTokens(tokensToDelete.map((token) => token.id));
+  const defaultDeleted = tokensToDelete.some((token) => token.isDefault === true);
+  for (const token of tokensToDelete) {
+    await db.delete(schema.accountTokens)
+      .where(eq(schema.accountTokens.id, token.id))
+      .run();
+  }
+  if (defaultDeleted) {
+    await repairDefaultToken(accountId);
+  }
+  return tokensToDelete.length;
+}
+
 function normalizeGeneratedTokenName(group: string, index: number): string {
   const collapsed = group.replace(/\s+/g, '');
   const sanitized = collapsed.replace(/[^\p{L}\p{N}_-]+/gu, '-').replace(/^-+|-+$/g, '');
@@ -654,10 +694,13 @@ async function executeAccountTokenSync(row: AccountWithSiteRow): Promise<SyncExe
       upstreamTokens: tokens,
     });
     const synced = convergence.tokenSync!;
-    const deleted = await deleteMissingUpstreamTokens(accountId, tokens);
+    let deleted = await deleteMissingUpstreamTokens(accountId, tokens);
     await removeRouteChannelsForDisabledAccountTokens(accountId);
     try {
-      await refreshTokenGroupPricingForAccount(accountId);
+      const pricingRefresh = await refreshTokenGroupPricingForAccount(accountId);
+      if (pricingRefresh?.refreshed === true) {
+        deleted += await deleteTokensMissingStoredPricingGroups(accountId);
+      }
     } catch (error: any) {
       console.warn(`[account-tokens] group pricing refresh failed after sync ${accountId}: ${error?.message || error}`);
     }
